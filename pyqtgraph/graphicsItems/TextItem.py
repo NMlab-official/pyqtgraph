@@ -142,6 +142,8 @@ class TextItem(GraphicsObject):
     def setAnchor(self, anchor):
         self.anchor = Point(anchor)
         self.updateTextPos()
+        # the anchor enters dataBounds, which the view may have cached
+        self.informViewBoundsChanged()
 
     def setColor(self, color):
         """
