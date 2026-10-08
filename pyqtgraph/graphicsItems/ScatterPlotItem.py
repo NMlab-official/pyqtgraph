@@ -884,8 +884,11 @@ class ScatterPlotItem(GraphicsObject):
                 return (None, None)
 
         if frac >= 1.0:
-            self.bounds[ax] = (np.nanmin(d) - self._maxSpotWidth*0.7072, np.nanmax(d) + self._maxSpotWidth*0.7072)
-            return self.bounds[ax]
+            bounds = (np.nanmin(d) - self._maxSpotWidth*0.7072, np.nanmax(d) + self._maxSpotWidth*0.7072)
+            if orthoRange is None:
+                # only the full-range bounds are cached
+                self.bounds[ax] = bounds
+            return bounds
         elif frac <= 0.0:
             raise Exception("Value for parameter 'frac' must be > 0. (got %s)" % str(frac))
         else:
@@ -926,9 +929,10 @@ class ScatterPlotItem(GraphicsObject):
         return QtCore.QRectF(xmn-px, ymn-py, (2*px)+xmx-xmn, (2*py)+ymx-ymn)
 
     def viewTransformChanged(self):
+        # The cached data bounds do not depend on the view (pixel padding is applied
+        # in boundingRect), so they are kept: recomputing them is O(N).
         self.prepareGeometryChange()
         GraphicsObject.viewTransformChanged(self)
-        self.bounds = [None, None]
 
     def setExportMode(self, *args, **kwargs):
         GraphicsObject.setExportMode(self, *args, **kwargs)
