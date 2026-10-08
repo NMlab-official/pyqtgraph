@@ -16,6 +16,10 @@ from .ScatterPlotItem import ScatterPlotItem
 
 __all__ = ['PlotDataItem']
 
+# Options that a containing PlotItem sets on its data items, unless they were set
+# explicitly on the item itself.
+_PLOT_DEFAULT_OPTS = ('downsample', 'autoDownsample', 'downsampleMethod', 'clipToView')
+
 
 # For type-hints, but cannot be utilized with setData or __init__ until
 # typing.Unpack is available in the library
@@ -591,6 +595,8 @@ class PlotDataItem(GraphicsObject):
         self._drlClipActive = False
         # x and y arrays last forwarded to the curve and scatter plot items
         self._sentDisplayData: tuple[np.ndarray, np.ndarray] | None = None
+        # names of the _PLOT_DEFAULT_OPTS options set explicitly on this item
+        self._explicitOpts: set[str] = set()
         self._adsLastValue = 1
         # self.clear()
         self.opts = {
@@ -1029,12 +1035,16 @@ class PlotDataItem(GraphicsObject):
         self,
         ds: int | None = None,
         auto: bool | None = None,
-        method: str = 'peak'
-    ):
+        method: str | None = 'peak'
+    ) -> None:
         """
         Set the downsampling mode.
         
         Downsampling reduces the number of samples drawn to increase performance.
+
+        The values set here are kept when the item is added to a
+        :class:`~pyqtgraph.PlotItem`; otherwise, the item takes the downsampling
+        settings of the plot.
 
         Parameters
         ----------
@@ -1052,6 +1062,33 @@ class PlotDataItem(GraphicsObject):
             * `peak` - Downsample by drawing a saw wave that follows the min and max of
               the original data. This method produces the best visual representation of
               the data but is slower.
+
+            ``None`` keeps the current method.
+        """
+        for key, value in (
+            ('downsample', ds), ('autoDownsample', auto), ('downsampleMethod', method)
+        ):
+            if value is not None:
+                self._explicitOpts.add(key)
+        self._setDownsampling(ds, auto, method)
+
+    def _setDownsampling(
+        self,
+        ds: int | None,
+        auto: bool | None,
+        method: str | None
+    ) -> None:
+        """
+        Set the downsampling mode without marking the options as explicitly set.
+
+        Parameters
+        ----------
+        ds : int or None
+            Downsampling factor, ``None`` to keep the current one.
+        auto : bool or None
+            Automatic downsampling, ``None`` to keep the current setting.
+        method : str or None
+            Downsampling method, ``None`` to keep the current one.
         """
         changed = False
         if ds is not None and self.opts['downsample'] != ds:
@@ -1072,7 +1109,7 @@ class PlotDataItem(GraphicsObject):
             self._adsLastValue   = 1     # reset auto-downsample value
             self.updateItems(styleUpdate=False)
 
-    def setClipToView(self, state: bool):
+    def setClipToView(self, state: bool) -> None:
         """
         Clip the displayed data to the visible range of the x-axis.
 
@@ -1080,6 +1117,22 @@ class PlotDataItem(GraphicsObject):
 
         The X data must be sorted in ascending order. Otherwise, the behaviour
         is erratic.
+
+        The value set here is kept when the item is added to a
+        :class:`~pyqtgraph.PlotItem`; otherwise, the item takes the setting of the
+        plot.
+
+        Parameters
+        ----------
+        state : bool
+            Enable clipping the displayed data set to the visible x-axis range.
+        """
+        self._explicitOpts.add('clipToView')
+        self._setClipToView(state)
+
+    def _setClipToView(self, state: bool) -> None:
+        """
+        Set the clip-to-view mode without marking it as explicitly set.
 
         Parameters
         ----------
@@ -1091,6 +1144,40 @@ class PlotDataItem(GraphicsObject):
         self.opts['clipToView'] = state
         self._datasetDisplay = None  # invalidate display data
         self.updateItems(styleUpdate=False)
+
+    def _applyPlotDefaults(
+        self,
+        ds: int,
+        auto: bool,
+        method: str,
+        clipToView: bool
+    ) -> None:
+        """
+        Apply the downsampling and clipping settings of a containing PlotItem.
+
+        Called by :meth:`PlotItem.addItem <pyqtgraph.PlotItem.addItem>`. Options set
+        explicitly on this item, through the constructor, :meth:`setData`,
+        :meth:`setDownsampling` or :meth:`setClipToView`, are kept.
+
+        Parameters
+        ----------
+        ds : int
+            Downsampling factor of the plot.
+        auto : bool
+            Automatic downsampling setting of the plot.
+        method : str
+            Downsampling method of the plot.
+        clipToView : bool
+            Clip-to-view setting of the plot.
+        """
+        explicit = self._explicitOpts
+        self._setDownsampling(
+            None if 'downsample' in explicit else ds,
+            None if 'autoDownsample' in explicit else auto,
+            None if 'downsampleMethod' in explicit else method
+        )
+        if 'clipToView' not in explicit:
+            self._setClipToView(clipToView)
 
     def setDynamicRangeLimit(self, limit: float | None = 1e06, hysteresis: float = 3.):
         """
@@ -1273,6 +1360,9 @@ class PlotDataItem(GraphicsObject):
 
         if 'brush' in kwargs:
             kwargs['fillBrush'] = kwargs['brush']
+
+        # remember the options that a containing PlotItem must not overwrite
+        self._explicitOpts.update(k for k in _PLOT_DEFAULT_OPTS if k in kwargs)
 
         for k in list(self.opts.keys()):
             if k in kwargs:
@@ -1543,7 +1633,12 @@ class PlotDataItem(GraphicsObject):
         # indices of the first visible point and of the first point right of the view
         visible = None
         if self.opts['clipToView']:
-            if view is None or view.autoRangeEnabled()[0]:
+            if (
+                view is None
+                # while the item is being parented, the view can be the GraphicsView
+                or not (hasattr(view, 'implements') and view.implements('ViewBox'))
+                or view.autoRangeEnabled()[0]
+            ):
                 pass  # no ViewBox to clip to, or view will autoscale to data range.
             elif view_range is not None and len(x) > 1:
                 # clip-to-view always presumes that x-values are in increasing order
@@ -1863,7 +1958,7 @@ class PlotDataItem(GraphicsObject):
                 min(
                     (i for i in [bounds2[0], bounds[0]] if i is not None), default=None
                 ),
-                min(
+                max(
                     (i for i in [bounds2[1], bounds[1]] if i is not None), default=None
                 )
             )
