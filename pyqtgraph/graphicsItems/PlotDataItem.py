@@ -1540,30 +1540,23 @@ class PlotDataItem(GraphicsObject):
         if not isinstance(ds, int):
             ds = 1
 
-        if self.opts['autoDownsample']:
-            # this option presumes that x-values have uniform spacing
-            if xAllFinite:
-                finite_x = x
-            else:
-                # False: (we checked and found non-finites)
-                # None : (we haven't performed a check for non-finites yet)
-                finite_x = x[np.isfinite(x)]  # ignore infinite and nan values
-            if view_range is not None and len(finite_x) > 1:
-                dx = float(finite_x[-1]-finite_x[0]) / (len(finite_x)-1)
-                if dx != 0.0:
-                    width = self.getViewBox().width()
-                    if width != 0.0:  # autoDownsampleFactor _should_ be > 1.0
-                        ds_float = max(
-                            1.0,
-                            abs(
-                                view_range.width() /
-                                dx /
-                                (width * self.opts['autoDownsampleFactor'])
-                            )
-                        )
-                        if math.isfinite(ds_float):
-                            ds = int(ds_float)
+        # indices of the first visible point and of the first point right of the view
+        visible = None
+        if self.opts['clipToView']:
+            if view is None or view.autoRangeEnabled()[0]:
+                pass  # no ViewBox to clip to, or view will autoscale to data range.
+            elif view_range is not None and len(x) > 1:
+                # clip-to-view always presumes that x-values are in increasing order
+                # np.searchsorted performs poorly when the array.dtype does not
+                # match the type of the value (float) being searched.
+                # see: https://github.com/pyqtgraph/pyqtgraph/pull/2719
+                visible = (
+                    bisect.bisect_left(x, view_range.left()),
+                    bisect.bisect_left(x, view_range.right())
+                )
 
+        if self.opts['autoDownsample']:
+            ds = self._autoDownsampleFactor(x, view_range, visible, ds)
             # use the last computed value if our new value is not too different.
             # this guards against an infinite cycle where the plot never stabilizes.
             if math.isclose(ds, self._adsLastValue, rel_tol=0.01):
@@ -1572,34 +1565,16 @@ class PlotDataItem(GraphicsObject):
             # downsampling is expensive; delay until after clipping.
 
         connect = self.opts['connect'] if isinstance(self.opts['connect'], np.ndarray) else None
-        if self.opts['clipToView']:
-            if view is None or view.autoRangeEnabled()[0]:
-                pass  # no ViewBox to clip to, or view will autoscale to data range.
-            else:
-                # clip-to-view always presumes that x-values are in increasing order
-                if view_range is not None and len(x) > 1:
-                    # find first in-view value (left edge) and first out-of-view value
-                    # (right edge) since we want the curve to go to the edge of the
-                    # screen, we need to preserve one down-sampled point on the left and
-                    # one of the right, so we extend the interval
-
-                    # np.searchsorted performs poorly when the array.dtype does not
-                    # match the type of the value (float) being searched.
-                    # see: https://github.com/pyqtgraph/pyqtgraph/pull/2719
-                    # x0 = np.searchsorted(x, view_range.left()) - ds
-                    x0 = bisect.bisect_left(x, view_range.left()) - ds
-                    # x0 = np.clip(x0, 0, len(x))
-                    x0 = fn.clip_scalar(x0, 0, len(x))  # workaround
-
-                    # x1 = np.searchsorted(x, view_range.right()) + ds
-                    x1 = bisect.bisect_left(x, view_range.right()) + ds
-                    # x1 = np.clip(x1, 0, len(x))
-                    x1 = fn.clip_scalar(x1, x0, len(x))
-                    x = x[x0:x1]
-                    y = y[x0:x1]
-                    if connect is not None:
-                        connect = connect[x0:x1]
-
+        if visible is not None:
+            # since we want the curve to go to the edge of the screen, we need to
+            # preserve one down-sampled point on the left and one of the right, so we
+            # extend the interval
+            x0 = fn.clip_scalar(visible[0] - ds, 0, len(x))
+            x1 = fn.clip_scalar(visible[1] + ds, x0, len(x))
+            x = x[x0:x1]
+            y = y[x0:x1]
+            if connect is not None:
+                connect = connect[x0:x1]
 
         if ds > 1:
             if self.opts['downsampleMethod'] == 'subsample':
@@ -1669,6 +1644,65 @@ class PlotDataItem(GraphicsObject):
         self.setProperty('yViewRangeWasChanged', False)
 
         return self._datasetDisplay
+
+    def _autoDownsampleFactor(
+        self,
+        x: np.ndarray,
+        view_range: QtCore.QRectF | None,
+        visible: tuple[int, int] | None,
+        default: int
+    ) -> int:
+        """
+        Compute the automatic downsampling factor for the current view.
+
+        The factor is chosen such that about ``autoDownsampleFactor`` samples are drawn
+        per pixel. The sample spacing is estimated from the visible points when the
+        data is clipped to the view, which stays accurate for data with gaps (e.g.
+        market data without nights and week-ends). Otherwise, it is estimated from the
+        first and last finite `x` values, without copying the data.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Mapped `x` data, before clipping.
+        view_range : :class:`QRectF` or None
+            Visible range, see :meth:`_displayViewRange`.
+        visible : tuple of int or None
+            Index of the first visible point and of the first point right of the view,
+            or ``None`` if the data is not clipped to the view.
+        default : int
+            Factor returned when no estimate is possible.
+
+        Returns
+        -------
+        int
+            The downsampling factor, at least 1.
+        """
+        view = self.getViewBox()
+        if view_range is None or view is None:
+            return default
+        width = view.width()
+        if width == 0.0:
+            return default
+        dx = 0.0
+        if visible is not None and visible[1] - visible[0] > 1:
+            # mean spacing of the visible points
+            first, last = visible[0], visible[1] - 1
+            dx = (float(x[last]) - float(x[first])) / (last - first)
+        if dx == 0.0 or not math.isfinite(dx):
+            ends = _finiteIndexRange(x)
+            if ends is None:
+                return default
+            first, last = ends
+            dx = (float(x[last]) - float(x[first])) / (last - first)
+        if dx == 0.0:
+            return default
+        # autoDownsampleFactor _should_ be > 1.0
+        ds_float = max(
+            1.0,
+            abs(view_range.width() / dx / (width * self.opts['autoDownsampleFactor']))
+        )
+        return int(ds_float) if math.isfinite(ds_float) else default
 
     def _displayViewRange(self) -> QtCore.QRectF | None:
         """
@@ -1965,6 +1999,50 @@ class PlotDataItem(GraphicsObject):
         x = np.fft.rfftfreq(n, d)
         y = np.abs(f)
         return x, y
+
+
+def _finiteIndexRange(arr: np.ndarray) -> tuple[int, int] | None:
+    """
+    Find the indices of the first and the last finite values of an array.
+
+    The ends of the array are tested first. The search then extends over windows of
+    growing size, so that no full-size temporary array is created when only a few
+    values at the ends are non-finite.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        One-dimensional numeric array.
+
+    Returns
+    -------
+    tuple of int or None
+        ``(first, last)`` with ``first < last``, or ``None`` if the array holds less
+        than two finite values.
+    """
+    n = len(arr)
+    if n < 2:
+        return None
+
+    def search(reverse: bool) -> int | None:
+        start, size = 0, 64
+        while start < n:
+            stop = min(n, start + size)
+            window = arr[n - stop:n - start][::-1] if reverse else arr[start:stop]
+            finite = np.isfinite(window)
+            if finite.any():
+                offset = start + int(np.argmax(finite))
+                return n - 1 - offset if reverse else offset
+            start, size = stop, size * 4
+        return None
+
+    first = 0 if math.isfinite(arr[0]) else search(reverse=False)
+    if first is None:
+        return None
+    last = n - 1 if math.isfinite(arr[-1]) else search(reverse=True)
+    if last is None or last <= first:
+        return None
+    return first, last
 
 
 def dataType(obj) -> str:
