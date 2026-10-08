@@ -696,3 +696,79 @@ def test_paint_all_inside_skips_culling():
         assert lengths.count == 1
     assert len(scatter._pixmapFragments) == 2
 
+
+# --------------------------------------------------------------------------------------
+# T4.1: opt-in DeviceCoordinateCache
+# --------------------------------------------------------------------------------------
+
+def _scatterUnderCrosshair(**kwargs):
+    rng = np.random.default_rng(0)
+    pw = pg.PlotWidget()
+    pw.resize(400, 300)
+    scatter = pg.ScatterPlotItem(x=rng.normal(size=2000), y=rng.normal(size=2000), size=7,
+                                 pen=None, brush=(255, 0, 0, 120), **kwargs)
+    pw.addItem(scatter)
+    line = pg.InfiniteLine(angle=90)
+    pw.addItem(line, ignoreBounds=True)
+    return pw, scatter, line
+
+
+def test_device_cache_off_by_default():
+    scatter = pg.ScatterPlotItem(x=[0], y=[0])
+    assert scatter.opts['useDeviceCache'] is False
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.NoCache
+    scatter.setUseDeviceCache(True)
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache
+    scatter.setData(x=[1], y=[1], useDeviceCache=False)
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.NoCache
+
+
+def test_device_cache_not_used_with_other_composition_modes():
+    plus = QtGui.QPainter.CompositionMode.CompositionMode_Plus
+    sourceOver = QtGui.QPainter.CompositionMode.CompositionMode_SourceOver
+    scatter = pg.ScatterPlotItem(x=[0], y=[0], useDeviceCache=True, compositionMode=plus)
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.NoCache
+    scatter.setData(x=[0], y=[0], compositionMode=sourceOver)
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache
+
+
+def _scatterRepaintsPerUpdate(pw, update, n=10, warmup=3):
+    # Count the Python-level fragment preparation done by each scatter paint rather
+    # than wrapping the paint virtual, which is unreliable with PySide6.
+    pw.show()
+    process_events(5)
+    for i in range(warmup):
+        update(i)
+        process_events()
+    with count_calls(pg.ScatterPlotItem, '_prepareFragments') as repaints:
+        for i in range(warmup, warmup + n):
+            update(i)
+            process_events()
+    return repaints.count / n
+
+
+def test_device_cache_spares_repaints_under_crosshair():
+    rates = {}
+    images = {}
+    for cached in (False, True):
+        pw, scatter, line = _scatterUnderCrosshair(useDeviceCache=cached)
+        rates[cached] = _scatterRepaintsPerUpdate(pw, lambda i: line.setValue(-1 + 0.1 * i))
+        line.setValue(0.0)
+        process_events()
+        images[cached] = pw.grab().toImage()
+        pw.close()
+    assert rates[False] >= 1
+    assert rates[True] == 0
+    assert images[True] == images[False]
+
+
+def test_device_cache_repaints_on_data_change():
+    pw, scatter, line = _scatterUnderCrosshair(useDeviceCache=True)
+    rng = np.random.default_rng(1)
+
+    def update(i):
+        scatter.setData(x=rng.normal(size=100), y=rng.normal(size=100), size=7)
+
+    assert _scatterRepaintsPerUpdate(pw, update, n=5) >= 1
+    pw.close()
+

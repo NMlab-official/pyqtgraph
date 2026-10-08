@@ -811,3 +811,47 @@ def test_pan_without_factor_change_does_not_update(plot_widget):
             vb.translateBy(x=1000)
             process_events()
     assert updates.count == 0
+
+
+# --------------------------------------------------------------------------------------
+# T4.6: the index used as x when it is omitted is cached
+# --------------------------------------------------------------------------------------
+
+@pytest.fixture
+def arange_calls(monkeypatch):
+    """Record the lengths of the arrays created by ``np.arange``."""
+    lengths = []
+    original = np.arange
+
+    def recording(*args, **kwargs):
+        result = original(*args, **kwargs)
+        lengths.append(len(result))
+        return result
+
+    monkeypatch.setattr(np, 'arange', recording)
+    return lengths
+
+
+@pytest.mark.parametrize('cls', [pg.PlotDataItem, pg.PlotCurveItem])
+def test_implicit_x_is_cached(cls, arange_calls):
+    item = cls()
+    rng = np.random.default_rng(0)
+    item.setData(rng.normal(size=10_000))
+    arange_calls.clear()
+    # streaming without x values, growing and shrinking
+    for n in list(range(10_001, 10_101)) + [5000, 10_050]:
+        item.setData(rng.normal(size=n))
+        x, _ = item.getData() if cls is pg.PlotCurveItem else item.getOriginalDataset()
+        assert len(x) == n and x[0] == 0 and np.all(np.diff(x) == 1)
+    # the capacity grows geometrically: at most one new index here
+    assert len([size for size in arange_calls if size > 1000]) <= 1
+
+
+def test_implicit_x_cannot_be_modified_in_place():
+    item = pg.PlotDataItem(np.zeros(100))
+    x = item.getOriginalDataset()[0]
+    assert x.dtype == np.arange(1).dtype
+    with pytest.raises(ValueError):
+        x[0] = 5
+    item.setData(np.zeros(50))
+    np.testing.assert_array_equal(item.getOriginalDataset()[0], np.arange(50))
