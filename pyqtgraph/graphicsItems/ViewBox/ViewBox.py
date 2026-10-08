@@ -718,9 +718,11 @@ class ViewBox(GraphicsWidget):
 
             # If ortho axes have auto-visible-only, update them now
             # Note that aspect ratio constraints and auto-visible probably do not work together..
-            if changed[0] and self.state['autoVisibleOnly'][1] and (self.state['autoRange'][0] is not False):
+            # (the auto-range of the *ortho* axis must be enabled: a manual pan or zoom
+            # disables the auto-range of the axis it changes)
+            if changed[0] and self.state['autoVisibleOnly'][1] and (self.state['autoRange'][1] is not False):
                 self._autoRangeNeedsUpdate = True
-            elif changed[1] and self.state['autoVisibleOnly'][0] and (self.state['autoRange'][1] is not False):
+            elif changed[1] and self.state['autoVisibleOnly'][0] and (self.state['autoRange'][0] is not False):
                 self._autoRangeNeedsUpdate = True
             self.sigStateChanged.emit(self)
 
