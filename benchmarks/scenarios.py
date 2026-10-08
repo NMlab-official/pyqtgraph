@@ -161,6 +161,10 @@ def _median_ms(fn: Callable[[], object], repeat: int = 5, warmup: int = 2,
     return _timed(fn, repeat, warmup, budget_s)[0]
 
 
+# Wrappers of the exited CallCounters, kept alive on purpose, see CallCounter.__exit__.
+_retired_wrappers: list[Callable] = []
+
+
 class CallCounter:
     """
     Count calls of a method on a class while active.
@@ -196,10 +200,15 @@ class CallCounter:
             counter._count += 1
             return orig(*args, **kwargs)
 
+        self._wrapper = wrapper
         setattr(self._cls, self._name, wrapper)
         return self
 
     def __exit__(self, *exc) -> None:
+        # PySide6 caches, per object, the Python override of a C++ virtual method
+        # (e.g. paint) found at its first call: objects first called while counting
+        # keep calling the wrapper, and freeing it then crashed PySide6.
+        _retired_wrappers.append(self._wrapper)
         if self._orig is None:
             delattr(self._cls, self._name)
         else:

@@ -14,6 +14,12 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 __all__ = ['CallCounter', 'count_calls', 'process_events', 'paints_per_update']
 
+# Wrappers of the restored counters, kept alive on purpose. PySide6 caches, per object,
+# the Python override of a C++ virtual method (e.g. ``paint``) found at its first call
+# from Qt: an object first called while a counter was active keeps calling the wrapper
+# after the counter is restored, and freeing the wrapper then crashed PySide6.
+_retired_wrappers: list[Callable] = []
+
 
 class CallCounter:
     """
@@ -43,6 +49,7 @@ class CallCounter:
             counter._count += 1
             return bound_or_function(*args, **kwargs)
 
+        self._wrapper = wrapper
         setattr(target, name, wrapper)
 
     @property
@@ -55,7 +62,13 @@ class CallCounter:
         self._count = 0
 
     def restore(self) -> None:
-        """Restore the original attribute on the target."""
+        """
+        Restore the original attribute on the target.
+
+        The wrapper is kept alive, as objects may still call it with PySide6 (see
+        :func:`count_calls`).
+        """
+        _retired_wrappers.append(self._wrapper)
         if self._had_own_attr:
             setattr(self._target, self._name, self._original)
         else:
@@ -71,7 +84,8 @@ def count_calls(target: object, name: str) -> Iterator[CallCounter]:
     ----------
     target : type or object
         Class or instance whose method is wrapped. Wrapping a class counts the calls of
-        all its instances, including calls made by Qt through virtual methods.
+        all its instances, including calls made by Qt through virtual methods (but see
+        the notes for PySide6).
     name : str
         Name of the method.
 
@@ -79,6 +93,15 @@ def count_calls(target: object, name: str) -> Iterator[CallCounter]:
     ------
     CallCounter
         The active counter.
+
+    Notes
+    -----
+    With PySide6, the calls that Qt makes to a C++ virtual method (e.g. ``paint``)
+    reach the wrapper only for objects whose first such call happens while counting:
+    PySide6 caches the Python override of each object at its first call. Such objects
+    keep calling the wrapper after the ``with`` block, which therefore stays alive.
+    Count paints with the paint events of the viewport instead, see
+    :func:`paints_per_update`.
     """
     counter = CallCounter(target, name)
     try:
