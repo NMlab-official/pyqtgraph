@@ -1,9 +1,10 @@
 """
-Reproducible end-to-end performance scenarios (S01 to S12).
+Reproducible end-to-end performance scenarios (S01 to S13).
 
-The scenario identifiers match ``PERFORMANCE_PLAN.md`` at the root of the repository.
-Every scenario prints one line per variant with the median duration and, where
-relevant, call counters (paints per update, ``setData`` calls, ...).
+The scenario identifiers S01 to S12 match ``PERFORMANCE_PLAN.md`` at the root of the
+repository; S13 covers the CandlestickItem added by its task T3.2. Every scenario
+prints one line per variant with the median duration and, where relevant, call
+counters (paints per update, ``setData`` calls, ...).
 
 Usage::
 
@@ -12,7 +13,10 @@ Usage::
     QT_QPA_PLATFORM=offscreen python benchmarks/scenarios.py --full     # include 1e7 sizes
 
 The numbers are wall-clock medians and depend on the machine, the Qt binding and the
-Qt platform plugin. Compare runs made on the same machine only.
+Qt platform plugin. Compare runs made on the same machine only. The call counters
+patch class methods; PySide6 looks up the Python override of a virtual method such as
+``paint`` once per object, so with PySide6 the paint counters stay at 0 for items
+painted before the counting starts.
 """
 from __future__ import annotations
 
@@ -255,6 +259,37 @@ def _plot_widget(width: int = 1000, height: int = 600) -> pg.PlotWidget:
     return pw
 
 
+def _image_painter(rect: QtCore.QRectF, size: tuple[int, int] = (1600, 900)
+                   ) -> Callable[[QtWidgets.QGraphicsItem], None]:
+    """
+    Build a function painting a given item into an image, mapping ``rect`` to the image.
+
+    Parameters
+    ----------
+    rect : QRectF
+        Item-coordinate rectangle mapped onto the full image.
+    size : tuple of int, default (1600, 900)
+        Image size.
+
+    Returns
+    -------
+    callable
+        Function taking the item to paint (its ``paint`` method is called directly)
+        and performing one paint into the same image.
+    """
+    img = QtGui.QImage(size[0], size[1], QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+
+    def paint(item: QtWidgets.QGraphicsItem) -> None:
+        img.fill(0)
+        p = QtGui.QPainter(img)
+        p.scale(size[0] / rect.width(), size[1] / rect.height())
+        p.translate(-rect.left(), -rect.top())
+        item.paint(p, QtWidgets.QStyleOptionGraphicsItem(), None)
+        p.end()
+
+    return paint
+
+
 def _render_item(item: QtWidgets.QGraphicsItem, rect: QtCore.QRectF,
                  size: tuple[int, int] = (1600, 900)) -> Callable[[], None]:
     """
@@ -274,17 +309,8 @@ def _render_item(item: QtWidgets.QGraphicsItem, rect: QtCore.QRectF,
     callable
         Function performing one paint.
     """
-    img = QtGui.QImage(size[0], size[1], QtGui.QImage.Format.Format_ARGB32_Premultiplied)
-
-    def paint() -> None:
-        img.fill(0)
-        p = QtGui.QPainter(img)
-        p.scale(size[0] / rect.width(), size[1] / rect.height())
-        p.translate(-rect.left(), -rect.top())
-        item.paint(p, QtWidgets.QStyleOptionGraphicsItem(), None)
-        p.end()
-
-    return paint
+    paint = _image_painter(rect, size)
+    return lambda: paint(item)
 
 
 # --------------------------------------------------------------------------------------
@@ -818,6 +844,11 @@ def s12_non_uniform(full: bool) -> list[Result]:
     """
     S12: NonUniformImage and PColorMeshItem update and paint.
 
+    For NonUniformImage, ``update`` creates the item and computes its rendering
+    (``generatePicture``), ``paint`` repaints the same item and view, and
+    ``update + paint`` does both: as the image of the cells may only be built by the
+    first paint of an item, this is the cost of displaying new data.
+
     Parameters
     ----------
     full : bool
@@ -845,10 +876,19 @@ def s12_non_uniform(full: bool) -> list[Result]:
 
     ms_update = _median_ms(update, repeat=3, warmup=0, budget_s=30)
     item = holder['item']
-    paint = _render_item(item, item.boundingRect())
+    paint = _image_painter(item.boundingRect())
     results.append(Result(f'S12[NonUniformImage {nx}x{ny} update]', ms_update, 'ms'))
     results.append(Result(f'S12[NonUniformImage {nx}x{ny} paint]',
-                          _median_ms(paint, repeat=3, warmup=1, budget_s=30), 'ms'))
+                          _median_ms(lambda: paint(item), repeat=3, warmup=1, budget_s=30),
+                          'ms'))
+
+    def update_and_paint() -> None:
+        update()
+        paint(holder['item'])
+
+    results.append(Result(f'S12[NonUniformImage {nx}x{ny} update + paint]',
+                          _median_ms(update_and_paint, repeat=3, warmup=0, budget_s=30),
+                          'ms'))
     xm, ym = np.meshgrid(np.arange(401.0), np.arange(201.0), indexing='ij')
     zm = rng.random((400, 200))
     mesh = pg.PColorMeshItem()
@@ -856,6 +896,259 @@ def s12_non_uniform(full: bool) -> list[Result]:
                           _median_ms(lambda: mesh.setData(xm, ym, zm), repeat=3, warmup=1),
                           'ms'))
     return results
+
+
+def _candles(n: int, seed: int = 0) -> dict[str, np.ndarray]:
+    """
+    Random walk of one-minute OHLC candles, as in the CandlestickItem example.
+
+    Parameters
+    ----------
+    n : int
+        Number of candles.
+    seed : int, default 0
+        Random seed.
+
+    Returns
+    -------
+    dict of numpy.ndarray
+        ``x`` (epoch timestamps, 60 s apart), ``open``, ``high``, ``low`` and
+        ``close``.
+    """
+    rng = np.random.default_rng(seed)
+    close = 100 * np.exp(np.cumsum(rng.normal(0, 1e-3, n)))
+    open_ = np.r_[close[0], close[:-1]] * np.exp(rng.normal(0, 2e-4, n))
+    high = np.maximum(open_, close) * np.exp(np.abs(rng.normal(0, 5e-4, n)))
+    low = np.minimum(open_, close) * np.exp(-np.abs(rng.normal(0, 5e-4, n)))
+    return {'x': _T0 + 60.0 * np.arange(n), 'open': open_, 'high': high, 'low': low,
+            'close': close}
+
+
+def _candle_rect(data: dict[str, np.ndarray], start: int, stop: int) -> QtCore.QRectF:
+    """
+    Item rectangle showing a range of candles and their whole price range.
+
+    Parameters
+    ----------
+    data : dict of numpy.ndarray
+        Candles, as returned by :func:`_candles`.
+    start, stop : int
+        Candles ``start`` to ``stop - 1`` are shown.
+
+    Returns
+    -------
+    QRectF
+        Rectangle in item coordinates, one candle spacing wider on each side.
+    """
+    x = data['x']
+    low, high = data['low'][start:stop].min(), data['high'][start:stop].max()
+    left, right = x[start] - 60.0, x[stop - 1] + 60.0
+    return QtCore.QRectF(left, low, right - left, high - low)
+
+
+def _one_candle(data: dict[str, np.ndarray], k: int) -> dict[str, np.ndarray]:
+    """
+    One candle of a series, as keyword arguments of ``CandlestickItem.appendData``.
+
+    Parameters
+    ----------
+    data : dict of numpy.ndarray
+        Candles, as returned by :func:`_candles`.
+    k : int
+        Index of the candle.
+
+    Returns
+    -------
+    dict of numpy.ndarray
+        Arrays of length 1.
+    """
+    return {key: values[k:k + 1] for key, values in data.items()}
+
+
+def _candle_item_results(data: dict[str, np.ndarray], n: int) -> list[Result]:
+    """
+    S13, item part: CandlestickItem with ``n`` candles painted into an image.
+
+    Parameters
+    ----------
+    data : dict of numpy.ndarray
+        Candles, as returned by :func:`_candles`, at least ``n + 20`` of them.
+    n : int
+        Number of candles set; the following ones are appended.
+
+    Returns
+    -------
+    list of Result
+        setData, setData + first full view paint, full view paint, paint of 200
+        visible candles, appendData of one candle + full view paint, and one tick
+        (``appendData(..., replaceLast=True)`` updating the last candle) + paint of
+        the last 200 candles or of the full view.
+    """
+    results = []
+    head = {key: values[:n] for key, values in data.items()}
+    item = pg.CandlestickItem()
+    results.append(Result(f'S13[{n:.0e} candles setData]',
+                          _median_ms(lambda: item.setData(**head), repeat=5, warmup=1), 'ms'))
+    full_view = _render_item(item, _candle_rect(data, 0, len(data['x'])))
+
+    def set_and_paint() -> None:
+        item.setData(**head)
+        full_view()
+
+    results.append(Result(f'S13[{n:.0e} candles setData + full view paint]',
+                          _median_ms(set_and_paint, repeat=3, warmup=1), 'ms'))
+    results.append(Result(f'S13[{n:.0e} candles full view paint]',
+                          _median_ms(full_view, repeat=7), 'ms/paint'))
+    zoomed = _render_item(item, _candle_rect(data, n - 200, n))
+    results.append(Result(f'S13[{n:.0e} candles 200 visible paint]',
+                          _median_ms(zoomed, repeat=7), 'ms/paint'))
+    state = {'k': n}
+
+    def append_and_paint() -> None:
+        k = state['k']
+        state['k'] = k + 1
+        item.appendData(**_one_candle(data, k))
+        full_view()
+
+    results.append(Result(f'S13[{n:.0e} candles appendData 1 + full view paint]',
+                          _median_ms(append_and_paint, repeat=18), 'ms'))
+    rng = np.random.default_rng(2)
+
+    def tick(paint: Callable[[], None]) -> Callable[[], None]:
+        def update() -> None:
+            # a trade updates the current candle: high, low and close; open fixed
+            x, o, h, lo, c = (values[-1:] for values in item.ohlc)
+            price = c + 0.05 * rng.standard_normal()
+            item.appendData(x=x, open=o, high=np.maximum(h, price),
+                            low=np.minimum(lo, price), close=price, replaceLast=True)
+            paint()
+        return update
+
+    last = state['k']
+    last_200 = _render_item(item, _candle_rect(data, last - 200, last))
+    for view, paint in (('200 visible', last_200), ('full view', full_view)):
+        label = f'S13[{n:.0e} candles tick: replace last candle + paint, {view}]'
+        results.append(Result(label, _median_ms(tick(paint), repeat=18), 'ms'))
+    return results
+
+
+def _candle_layout_results(data: dict[str, np.ndarray], n: int,
+                           nvol: int) -> list[Result]:
+    """
+    S13, layout part: candles above a linked volume plot, both auto-visible in y.
+
+    Parameters
+    ----------
+    data : dict of numpy.ndarray
+        Candles, as returned by :func:`_candles`, at least ``n + 24`` of them.
+    n : int
+        Number of candles shown at first; the following ones are streamed.
+    nvol : int
+        Number of volume bars, for the last ``nvol`` candles.
+
+    Returns
+    -------
+    list of Result
+        Pan step of a 200-candle window, and streaming frame with the new volume bar
+        appended (``BarGraphItem.appendData``) or all volume bars set again
+        (``setOpts``), with paints per step.
+    """
+    results = []
+    w = pg.GraphicsLayoutWidget(size=(1400, 900))
+    price = w.addPlot(row=0, col=0, axisItems={'bottom': pg.DateAxisItem()})
+    volume = w.addPlot(row=1, col=0, axisItems={'bottom': pg.DateAxisItem()})
+    volume.setXLink(price)
+    candles = pg.CandlestickItem(**{key: values[:n] for key, values in data.items()})
+    price.addItem(candles)
+    x = data['x']
+    heights = np.random.default_rng(1).gamma(2.0, 50.0, len(x))
+    palette = [pg.mkBrush(38, 166, 154), pg.mkBrush(239, 83, 80)]
+    falling = (data['close'] < data['open']).astype(np.intp).tolist()
+    brushes = [palette[i] for i in falling]
+
+    def volume_opts(stop: int) -> dict:
+        span = slice(stop - nvol, stop)
+        return {'x': x[span], 'height': heights[span], 'brushes': brushes[span]}
+
+    bars = pg.BarGraphItem(width=0.8 * 60.0, pen=None, **volume_opts(n))
+    volume.addItem(bars)
+    for plot in (price, volume):
+        plot.setAutoVisible(y=True)
+    w.show()
+    _process(5)
+    mid = n - nvol // 2
+    price.setXRange(x[mid], x[mid + 200], padding=0)
+    _process(5)
+
+    def pan() -> None:
+        price.vb.translateBy(x=50 * 60.0)
+        _process(2)
+
+    label = f'S13[{n:.0e} candles + {nvol:.0e} volume bars'
+    with _counters((pg.CandlestickItem, 'paint'), (pg.BarGraphItem, 'paint')) as (cp, bp):
+        ms, steps = _timed(pan, repeat=10)
+    results.append(Result(f'{label}, pan 200 visible]', ms, 'ms/step',
+                          {'candle paints/step': cp.count / steps,
+                           'bar paints/step': bp.count / steps}))
+    state = {'k': n}
+
+    def append_volume(k: int) -> None:
+        bars.appendData(x=x[k:k + 1], height=heights[k:k + 1], brushes=brushes[k:k + 1])
+
+    def set_volume(k: int) -> None:
+        bars.setOpts(**volume_opts(k + 1))
+
+    def streaming(update_volume: Callable[[int], None]) -> Callable[[], None]:
+        def stream() -> None:
+            k = state['k']
+            state['k'] = k + 1
+            candles.appendData(**_one_candle(data, k))
+            update_volume(k)
+            price.setXRange(x[k - 199] - 30.0, x[k] + 30.0, padding=0)
+            _process(2)
+        return stream
+
+    variants = (('stream 1 candle', append_volume),
+                ('stream 1 candle, volume setOpts', set_volume))
+    for variant, update_volume in variants:
+        with _counters((pg.CandlestickItem, 'paint'),
+                       (pg.BarGraphItem, 'paint')) as (cp, bp):
+            ms, frames = _timed(streaming(update_volume), repeat=10)
+        results.append(Result(f'{label}, {variant}]', ms, 'ms/frame',
+                              {'candle paints/frame': cp.count / frames,
+                               'bar paints/frame': bp.count / frames}))
+    w.close()
+    return results
+
+
+def s13_candlesticks(full: bool) -> list[Result]:
+    """
+    S13: OHLC candlesticks (CandlestickItem) with 1e6 candles and a volume plot.
+
+    The item is first painted directly into an image, as in S08: ``setData``, paint
+    of the full view (aggregated candles) and of 200 visible candles,
+    ``appendData`` of one candle followed by a full view paint, and a tick updating
+    the last candle in place (``replaceLast=True``) followed by a paint. Then, as in a
+    trading UI, the candles are shown above a volume BarGraphItem holding the last
+    5e5 candles (one brush per direction), with linked x, DateAxisItems and
+    ``setAutoVisible(y=True)`` on both plots: one pan step of a 200-candle window,
+    and one streaming frame (one candle and its volume bar appended, and the view
+    following the last candle). For comparison, the ``volume setOpts`` variant sets
+    the volume bars of the last 5e5 candles again instead of appending one.
+
+    Parameters
+    ----------
+    full : bool
+        Unused, kept for a uniform signature.
+
+    Returns
+    -------
+    list of Result
+        One result per variant, with paints per step for the layout.
+    """
+    n = 1_000_000
+    data = _candles(n + 100)
+    return _candle_item_results(data, n) + _candle_layout_results(data, n, 500_000)
 
 
 SCENARIOS: dict[str, Callable[[bool], list[Result]]] = {
@@ -871,6 +1164,7 @@ SCENARIOS: dict[str, Callable[[bool], list[Result]]] = {
     'S10': s10_heatmap,
     'S11': s11_legend,
     'S12': s12_non_uniform,
+    'S13': s13_candlesticks,
 }
 
 
@@ -917,7 +1211,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('scenarios', nargs='*', help='scenario ids (S01 ... S12)')
+    parser.add_argument('scenarios', nargs='*', help='scenario ids (S01 ... S13)')
     parser.add_argument('--full', action='store_true', help='include the largest sizes')
     args = parser.parse_args(argv)
     unknown = [s for s in args.scenarios if s.upper() not in SCENARIOS]

@@ -27,6 +27,7 @@ Contents:
     textitem
     errorbaritem
     bargraphitem
+    candlestickitem
     arrowitem
     fillbetweenitem
     curvepoint

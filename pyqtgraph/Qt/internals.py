@@ -207,7 +207,27 @@ class PrimitiveArray:
             # this is a shallow copy
             return self._objs[:self._size]
 
-    def drawargs(self):
+    def drawargs(self, start: int | None = None, stop: int | None = None) -> tuple:
+        """
+        Arguments to pass to the respective ``QPainter.drawPrimitives()`` method.
+
+        Parameters
+        ----------
+        start : int or None, default None
+            Index of the first primitive to draw. ``None`` draws from the first one.
+        stop : int or None, default None
+            Index after the last primitive to draw. ``None`` draws up to the last one.
+            Negative indices and out-of-range values follow Python slicing rules.
+
+        Returns
+        -------
+        tuple
+            Arguments for e.g. ``QPainter.drawRects(*args)``. No copy of the primitives
+            is made, except with ``sip`` older than 6.7.8 when a sub-range is requested.
+        """
+        if start is not None or stop is not None:
+            return self._sliced_drawargs(*slice(start, stop).indices(self._size)[:2])
+
         # returns arguments to apply to the respective drawPrimitives() functions
         if self.use_ptr_to_array:
             if self._capa > 0:
@@ -221,6 +241,51 @@ class PrimitiveArray:
 
         else:
             return self.instances(),
+
+    def _sliced_drawargs(self, start: int, stop: int) -> tuple:
+        """
+        Arguments to draw the primitives ``start`` to ``stop - 1`` only.
+
+        Parameters
+        ----------
+        start : int
+            Index of the first primitive, ``0 <= start <= len(self)``.
+        stop : int
+            Index after the last primitive, ``stop <= len(self)``.
+
+        Returns
+        -------
+        tuple
+            Arguments for the respective ``QPainter.drawPrimitives()`` method.
+        """
+        count = max(stop - start, 0)
+        if start == 0 and count == self._size:
+            return self.drawargs()
+
+        if self.use_ptr_to_array:
+            if count > 0:
+                address = self._ndarray.ctypes.data + start * self._ndarray.strides[0]
+                ptr = compat.wrapinstance(address, self._Klass)
+            else:
+                ptr = None
+            return ptr, count
+
+        if self.use_sip_array:
+            if sip.SIP_VERSION >= 0x60708:
+                # slicing a sip.array returns a view
+                return self._siparray[start:start + count],
+            # sip.array prior to SIP_VERSION 6.7.8 had a buggy slicing
+            # implementation: copy the requested primitives instead.
+            arr = sip.array(self._Klass, count)
+            if count > 0:
+                nbytes = count * self._nfields * 8
+                dst = np.frombuffer(sip.voidptr(arr, nbytes), dtype=np.float64)
+                dst[:] = self.ndarray()[start:start + count].ravel()
+            return arr,
+
+        if self._objs is None:
+            self._objs = self._wrap_instances(self._ndarray)
+        return self._objs[start:start + count],
 
 
 _qbytearray_leaks = None
