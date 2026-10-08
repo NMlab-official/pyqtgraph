@@ -321,13 +321,105 @@ class PlotCurveItem(GraphicsObject):
     def getData(self):
         return self.xData, self.yData
 
-    def dataBounds(self, ax, frac=1.0, orthoRange=None):
+    def dataBounds(
+        self,
+        ax: int,
+        frac: float = 1.0,
+        orthoRange: tuple[float, float] | None = None
+    ) -> tuple[float, float] | tuple[None, None]:
+        """
+        Get the range occupied by the data along an axis.
+
+        The result is cached. The full range of the finite data (``frac >= 1`` and
+        no `orthoRange`) is taken from the bounds passed by
+        :class:`~pyqtgraph.PlotDataItem` when available, without scanning the data.
+
+        Parameters
+        ----------
+        ax : { 0, 1 }
+            The axis, 0 for `x` and 1 for `y`.
+        frac : float, default 1.0
+            Fraction of the data to include, centered on the median. Values of 1.0 and
+            above include the full range of the finite data.
+        orthoRange : tuple of float or None, default None
+            Only include the data whose coordinate along the other axis lies within
+            this ``(min, max)`` range.
+
+        Returns
+        -------
+        tuple of float or tuple of None
+            ``(min, max)``, including the fill level and the width of non-cosmetic
+            pens, or ``(None, None)`` if there is no data.
+
+        Raises
+        ------
+        ValueError
+            Raised for an invalid `ax`.
+        Exception
+            Raised if `frac` is not positive.
+        """
         ## Need this to run as fast as possible.
         ## check cache first:
         cache = self._boundsCache[ax]
         if cache is not None and cache[0] == (frac, orthoRange):
             return cache[1]
 
+        if frac >= 1.0 and orthoRange is None and self._dataBoundsHint is not None:
+            b = self._dataBoundsHint[ax]
+        else:
+            b = self._computeDataBounds(ax, frac, orthoRange)
+            if b[0] is None:  # no data, not cached
+                return b
+
+        ## adjust for fill level
+        if ax == 1 and self.opts['fillLevel'] not in [None, 'enclosed']:
+            b = ( 
+                float( min(b[0], self.opts['fillLevel']) ), 
+                float( max(b[1], self.opts['fillLevel']) )
+            ) # enforce float format for bounds, even if data format is different
+
+        ## Add pen width only if it is non-cosmetic.
+        pen = self.opts['pen']
+        spen = self.opts['shadowPen']
+        if pen is not None and not pen.isCosmetic() and pen.style() != QtCore.Qt.PenStyle.NoPen:
+            b = (b[0] - pen.widthF()*0.7072, b[1] + pen.widthF()*0.7072)
+        if spen is not None and not spen.isCosmetic() and spen.style() != QtCore.Qt.PenStyle.NoPen:
+            b = (b[0] - spen.widthF()*0.7072, b[1] + spen.widthF()*0.7072)
+
+        self._boundsCache[ax] = [(frac, orthoRange), b]
+        return b
+
+    def _computeDataBounds(
+        self,
+        ax: int,
+        frac: float,
+        orthoRange: tuple[float, float] | None
+    ) -> tuple[float, float] | tuple[None, None]:
+        """
+        Scan the data for the range occupied along an axis.
+
+        Parameters
+        ----------
+        ax : { 0, 1 }
+            The axis, 0 for `x` and 1 for `y`.
+        frac : float
+            Fraction of the data to include, see :meth:`dataBounds`.
+        orthoRange : tuple of float or None
+            Range along the other axis, see :meth:`dataBounds`.
+
+        Returns
+        -------
+        tuple of float or tuple of None
+            ``(min, max)`` of the data, without fill level or pen width, or
+            ``(None, None)`` if there is no data.
+
+        Raises
+        ------
+        ValueError
+            Raised for an invalid `ax`.
+        Exception
+            Raised if `frac` is not positive.
+        """
         (x, y) = self.getData()
         if x is None or len(x) == 0:
             return (None, None)
@@ -379,23 +471,6 @@ class PlotCurveItem(GraphicsObject):
             if len(d) == 0:
                 return (None, None)
             b = np.percentile(d, [50 * (1 - frac), 50 * (1 + frac)]) # percentile result is always float64 or larger
-
-        ## adjust for fill level
-        if ax == 1 and self.opts['fillLevel'] not in [None, 'enclosed']:
-            b = ( 
-                float( min(b[0], self.opts['fillLevel']) ), 
-                float( max(b[1], self.opts['fillLevel']) )
-            ) # enforce float format for bounds, even if data format is different
-
-        ## Add pen width only if it is non-cosmetic.
-        pen = self.opts['pen']
-        spen = self.opts['shadowPen']
-        if pen is not None and not pen.isCosmetic() and pen.style() != QtCore.Qt.PenStyle.NoPen:
-            b = (b[0] - pen.widthF()*0.7072, b[1] + pen.widthF()*0.7072)
-        if spen is not None and not spen.isCosmetic() and spen.style() != QtCore.Qt.PenStyle.NoPen:
-            b = (b[0] - spen.widthF()*0.7072, b[1] + spen.widthF()*0.7072)
-
-        self._boundsCache[ax] = [(frac, orthoRange), b]
         return b
 
     def pixelPadding(self):
@@ -609,8 +684,28 @@ class PlotCurveItem(GraphicsObject):
         """
         self.updateData(*args, **kwargs)
 
-    def updateData(self, *args, **kwargs):
+    def updateData(self, *args, **kwargs) -> None:
+        """
+        Set the data and options of the curve.
+
+        Parameters
+        ----------
+        *args
+            ``(y,)`` or ``(x, y)``, see :meth:`setData`.
+        **kwargs
+            Data and options, see :meth:`setData`. The private keyword
+            ``_dataBounds``, ``((xmin, xmax), (ymin, ymax))`` of the finite data or
+            ``None``, is used by :class:`~pyqtgraph.PlotDataItem` to pass bounds it
+            has already computed; it is not part of the public API.
+
+        Raises
+        ------
+        Exception
+            Raised if the data is not one-dimensional, is complex, or if the lengths
+            of `x` and `y` do not match.
+        """
         profiler = debug.Profiler()
+        dataBounds = kwargs.pop('_dataBounds', None)
 
         if 'compositionMode' in kwargs:
             self.setCompositionMode(kwargs['compositionMode'])
@@ -644,6 +739,8 @@ class PlotCurveItem(GraphicsObject):
         
         self.prepareGeometryChange()
         self.invalidateBounds()
+        # bounds of the finite data, known in advance or computed on demand
+        self._dataBoundsHint = dataBounds
         self.informViewBoundsChanged()
 
         profiler('copy')
@@ -1273,9 +1370,14 @@ class PlotCurveItem(GraphicsObject):
 
         glstate.m_vao.release()
 
-    def clear(self):
+    def clear(self) -> None:
+        """
+        Remove the data and all derived caches (paths, segments, bounds).
+        """
         self.xData = None  ## raw values
         self.yData = None
+        # ((xmin, xmax), (ymin, ymax)) of the finite data, passed by PlotDataItem
+        self._dataBoundsHint = None
         self._lineSegments = None
         self._lineSegmentsRendered = False
         self.path = None
