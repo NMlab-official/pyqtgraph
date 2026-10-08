@@ -20,7 +20,7 @@ from pyqtgraph.graphicsItems.ScatterPlotItem import (
     renderSymbol,
 )
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from tests.perf_helpers import count_calls, paints_per_update, process_events
+from tests.perf_helpers import count_calls, process_events
 
 app = pg.mkQApp()
 
@@ -732,13 +732,27 @@ def test_device_cache_not_used_with_other_composition_modes():
     assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache
 
 
+def _scatterRepaintsPerUpdate(pw, update, n=10, warmup=3):
+    # Count the Python-level fragment preparation done by each scatter paint rather
+    # than wrapping the paint virtual, which is unreliable with PySide6.
+    pw.show()
+    process_events(5)
+    for i in range(warmup):
+        update(i)
+        process_events()
+    with count_calls(pg.ScatterPlotItem, '_prepareFragments') as repaints:
+        for i in range(warmup, warmup + n):
+            update(i)
+            process_events()
+    return repaints.count / n
+
+
 def test_device_cache_spares_repaints_under_crosshair():
     rates = {}
     images = {}
     for cached in (False, True):
         pw, scatter, line = _scatterUnderCrosshair(useDeviceCache=cached)
-        rates[cached] = paints_per_update(pw, pg.ScatterPlotItem,
-                                          lambda i: line.setValue(-1 + 0.1 * i), n=10)
+        rates[cached] = _scatterRepaintsPerUpdate(pw, lambda i: line.setValue(-1 + 0.1 * i))
         line.setValue(0.0)
         process_events()
         images[cached] = pw.grab().toImage()
@@ -755,6 +769,6 @@ def test_device_cache_repaints_on_data_change():
     def update(i):
         scatter.setData(x=rng.normal(size=100), y=rng.normal(size=100), size=7)
 
-    assert paints_per_update(pw, pg.ScatterPlotItem, update, n=5) >= 1
+    assert _scatterRepaintsPerUpdate(pw, update, n=5) >= 1
     pw.close()
 
