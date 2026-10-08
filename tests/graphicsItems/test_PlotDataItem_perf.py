@@ -132,6 +132,7 @@ def test_auto_downsample_does_not_copy_full_x(plot_widget, isfinite_sizes):
     process_events()
     isfinite_sizes.clear()
     item.setData(x, y)
+    item.getData()  # the display update may be deferred to the next paint
     assert item._adsLastValue > 1
     assert all(size < n for size in isfinite_sizes)
 
@@ -467,3 +468,125 @@ def test_peak_blocks_do_not_move_with_the_view(plot_widget):
     process_events()
     item.getData()
     assert item._peakCache.computedBlocks - computed <= 11
+
+
+# --------------------------------------------------------------------------------------
+# T2.4: the displayed data is computed once per frame
+# --------------------------------------------------------------------------------------
+
+def _streaming_data(n: int = 100_000):
+    rng = np.random.default_rng(0)
+    return np.arange(n + 100, dtype=float), np.cumsum(rng.standard_normal(n + 100))
+
+
+def test_streaming_with_clip_to_view_updates_once_per_frame(plot_widget):
+    x, y = _streaming_data()
+    item = plot_widget.plot(clipToView=True, autoDownsample=True)
+    plot_widget.getPlotItem().enableAutoRange(x=False, y=True)
+
+    def frame(k):
+        item.setData(x[:k], y[:k])
+        plot_widget.setXRange(x[k - 5000], x[k - 1], padding=0)
+        process_events()
+
+    for k in range(100_000, 100_003):
+        frame(k)
+    with count_calls(pg.PlotDataItem, 'updateItems') as updates:
+        for k in range(100_003, 100_023):
+            frame(k)
+    assert updates.count == 20
+    # the displayed data follows the view
+    assert item.getData()[0][-1] == x[100_022 - 1]
+
+
+def test_streaming_with_auto_range_updates_once_per_frame(plot_widget):
+    x, y = _streaming_data()
+    item = plot_widget.plot(autoDownsample=True)
+    for k in range(100_000, 100_003):
+        item.setData(x[:k], y[:k])
+        process_events()
+    with count_calls(pg.PlotDataItem, 'updateItems') as updates, \
+            count_calls(pg.PlotCurveItem, 'paint') as paints:
+        for k in range(100_003, 100_023):
+            item.setData(x[:k], y[:k])
+            process_events()
+    assert updates.count == 20
+    # the deferred update is applied before the paint, not during it
+    assert paints.count <= 21
+
+
+def test_get_data_after_deferred_update_is_synchronous(plot_widget):
+    x, y = _streaming_data(10_000)
+    item = plot_widget.plot(x[:5000], y[:5000], autoDownsample=True)
+    process_events()
+    item.setData(x, y * 2)
+    # nothing was computed yet, but all accessors are consistent with the new data
+    assert item._displayDirty
+    np.testing.assert_array_equal(item.getOriginalDataset()[1], y * 2)
+    x_disp, y_disp = item.getData()
+    assert x_disp[-1] > 5000
+    np.testing.assert_array_equal(item.curve.yData, y_disp)
+    assert not item._displayDirty
+
+
+def test_curve_property_applies_deferred_update(plot_widget):
+    x, y = _streaming_data(1000)
+    item = plot_widget.plot(x[:500], y[:500], clipToView=True)
+    process_events()
+    item.setData(x, y)
+    assert len(item.curve.xData) == len(item.getData()[0])
+    lower = plot_widget.plot(x[:500], y[:500] - 1, clipToView=True)
+    fill = pg.FillBetweenItem(item, lower)
+    plot_widget.addItem(fill)
+    lower.setData(x, y - 1)  # FillBetweenItem reads the curve paths synchronously
+    assert fill.path().boundingRect().right() == pytest.approx(item.curve.xData[-1])
+
+
+def test_auto_range_converges_in_one_frame(plot_widget):
+    x, y = _streaming_data(10_000)
+    item = plot_widget.plot(x[:100], y[:100], autoDownsample=True)
+    process_events()
+    item.setData(x, y * 10)
+    process_events()
+    (xmin, xmax), (ymin, ymax) = plot_widget.getViewBox().viewRange()
+    assert xmin <= x[0] and xmax >= x[-1]
+    assert ymin <= np.min(y * 10) and ymax >= np.max(y * 10)
+
+
+@pytest.mark.parametrize('process', [True, False])
+def test_deferred_update_renders_identically(process):
+    x, y = _streaming_data(20_000)
+
+    def make(data_x, data_y):
+        pw = pg.PlotWidget()
+        pw.resize(300, 200)
+        item = pw.plot(data_x, data_y, autoDownsample=True, clipToView=True, pen='y')
+        pw.setRange(xRange=(5000, 15000), yRange=(y.min(), y.max()), padding=0)
+        pw.show()
+        process_events()
+        return pw, item
+
+    pw, item = make(x[:10_000], y[:10_000])
+    reference, reference_item = make(x, y)
+    # the downsampling factor depends on the final widget size
+    reference_item.setData(x, y)
+    process_events()
+    try:
+        item.setData(x, y)
+        if process:
+            process_events()
+        # without event processing, the render itself applies the deferred update
+        image = pw.grab().toImage()
+        expected = reference.grab().toImage()
+        assert image == expected
+    finally:
+        pw.close()
+        reference.close()
+
+
+def test_update_is_immediate_without_view_dependency():
+    # outside of a scene, or without clipToView/autoDownsample, nothing is deferred
+    item = pg.PlotDataItem(autoDownsample=True)
+    with count_calls(pg.PlotCurveItem, 'setData') as calls:
+        item.setData(np.arange(10.0))
+    assert calls.count == 1 and not item._displayDirty

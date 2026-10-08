@@ -1,5 +1,6 @@
 import math
 import warnings
+import weakref
 import bisect
 
 from typing import TypedDict
@@ -752,6 +753,8 @@ class PlotDataItem(GraphicsObject):
     sigClicked = QtCore.Signal(object, object)
     sigPointsClicked = QtCore.Signal(object, object, object)
     sigPointsHovered = QtCore.Signal(object, object, object)
+    # private: queued request to apply a deferred display update
+    _sigFlushDisplay = QtCore.Signal()
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
@@ -767,14 +770,21 @@ class PlotDataItem(GraphicsObject):
         # will hold a PlotDataset for data downsampled and limited for display,
         # accessed by getData()
         self._datasetDisplay = None
-        self.curve = PlotCurveItem()
-        self.scatter = ScatterPlotItem()
-        self.curve.setParentItem(self)
-        self.scatter.setParentItem(self)
+        # True while a data update of the curve and scatter plot is deferred to the
+        # next paint, see _requestDisplayUpdate
+        self._displayDirty = False
+        self._flushScene: weakref.ref | None = None
+        self._sigFlushDisplay.connect(
+            self._flushDisplay, QtCore.Qt.ConnectionType.QueuedConnection
+        )
+        self._curve = PlotCurveItem()
+        self._scatter = ScatterPlotItem()
+        self._curve.setParentItem(self)
+        self._scatter.setParentItem(self)
 
-        self.curve.sigClicked.connect(self.sigClicked)
-        self.scatter.sigClicked.connect(self.scatterClicked)
-        self.scatter.sigHovered.connect(self.sigPointsHovered)
+        self._curve.sigClicked.connect(self.sigClicked)
+        self._scatter.sigClicked.connect(self.scatterClicked)
+        self._scatter.sigHovered.connect(self.sigPointsHovered)
         
         # update-required notifications are handled through properties to allow future 
         # management through the QDynamicPropertyChangeEvent sent on any change.
@@ -792,6 +802,8 @@ class PlotDataItem(GraphicsObject):
         self._explicitOpts: set[str] = set()
         # extremes of the blocks of the 'peak' downsampling
         self._peakCache: _PeakBlockCache | None = None
+        # (ds, start, end) of the current display data, see _displaySelection
+        self._displayKey: tuple[int, int, int] | None = None
         # growth buffers of appendData, and the views of them in use
         self._appendBuffers: tuple[np.ndarray, np.ndarray] | None = None
         # True if the x values were generated as the index of the y values
@@ -843,6 +855,28 @@ class PlotDataItem(GraphicsObject):
     def paint(self, *args):
         ...
     
+    @property
+    def curve(self) -> PlotCurveItem:
+        """
+        :class:`~pyqtgraph.PlotCurveItem`: The item drawing the line.
+
+        A deferred data update is applied first, so that the curve is always
+        consistent with the data of this item.
+        """
+        self._flushDisplay()
+        return self._curve
+
+    @property
+    def scatter(self) -> ScatterPlotItem:
+        """
+        :class:`~pyqtgraph.ScatterPlotItem`: The item drawing the points.
+
+        A deferred data update is applied first, so that the scatter plot is always
+        consistent with the data of this item.
+        """
+        self._flushDisplay()
+        return self._scatter
+
     # Compatibility with direct property access to previous xData and yData structures:
     @property
     def xData(self):
@@ -882,7 +916,7 @@ class PlotDataItem(GraphicsObject):
         width : int 
             The distance tolerance margin in pixels to recognize the mouse click.
         """
-        self.curve.setClickable(state, width)
+        self._curve.setClickable(state, width)
 
     def curveClickable(self) -> bool:
         """
@@ -893,7 +927,7 @@ class PlotDataItem(GraphicsObject):
         bool
             Return if the curve is set to be clickable.
         """
-        return self.curve.clickable
+        return self._curve.clickable
 
     def boundingRect(self):
         return QtCore.QRectF()  # let child items handle this
@@ -1211,7 +1245,7 @@ class PlotDataItem(GraphicsObject):
         if self.opts['symbolBrush'] == brush:
             return
         self.opts['symbolBrush'] = brush
-        #self.scatter.setSymbolBrush(brush)
+        #self._scatter.setSymbolBrush(brush)
         self.updateItems(styleUpdate=True)
 
     def setSymbolSize(self, size: int | list[int]):
@@ -1616,7 +1650,7 @@ class PlotDataItem(GraphicsObject):
 
         profiler('set data')
 
-        self.updateItems( styleUpdate=self.property('styleWasChanged') )
+        self._requestDisplayUpdate(styleUpdate=self.property('styleWasChanged'))
         # items have been updated
         self.setProperty('styleWasChanged', False)
         profiler('update items')
@@ -1643,11 +1677,13 @@ class PlotDataItem(GraphicsObject):
         styleUpdate : bool, default True
             Indicates if the style was updated in addition to the data.
         """
+        # the latest data is applied now: a deferred update is no longer needed
+        self._cancelDisplayFlush()
         dataset = self._getDisplayDataset()
         if dataset is None:  # then we have nothing to show
             self._sentDisplayData = None
-            self.curve.hide()
-            self.scatter.hide()
+            self._curve.hide()
+            self._scatter.hide()
             return
 
         if (
@@ -1732,18 +1768,80 @@ class PlotDataItem(GraphicsObject):
                     #   use connect='finite' in case there are non-finites.
                     curveArgs['connect'] = 'finite'
                     curveArgs['skipFiniteCheck'] = False
-            self.curve.setData(x=x, y=y, _dataBounds=bounds, **curveArgs)
-            self.curve.show()
+            self._curve.setData(x=x, y=y, _dataBounds=bounds, **curveArgs)
+            self._curve.show()
         else:  # ...hide if not.
-            self.curve.hide()
+            self._curve.hide()
 
         if self.opts['symbol'] is not None:  # draw if visible...
             if self.opts.get('stepMode') == "center":
                 x = 0.5 * (x[:-1] + x[1:])                
-            self.scatter.setData(x=x, y=y, **scatterArgs)
-            self.scatter.show()
+            self._scatter.setData(x=x, y=y, **scatterArgs)
+            self._scatter.show()
         else:  # ...hide if not.
-            self.scatter.hide()
+            self._scatter.hide()
+
+    def _requestDisplayUpdate(self, styleUpdate: bool) -> None:
+        """
+        Update the curve and scatter plot now, or before the next paint.
+
+        When the displayed data depends on the view range (`clipToView` or
+        `autoDownsample`), a data update is deferred: a view change in the same frame,
+        e.g. ``setXRange`` in a streaming loop, then does not compute the displayed
+        data twice. The deferred update is applied by a queued call, which the event
+        loop delivers before paint events (these have a low priority), so that the
+        regions changed by the update are painted in the same pass. It is also
+        applied when the scene is about to be rendered
+        (``GraphicsScene.sigPrepareForPaint``, e.g. for a synchronous ``grab`` or an
+        export), and on demand by :meth:`getData`, :meth:`dataBounds`,
+        :meth:`pixelPadding`, :meth:`updateItems`, a view change requiring new display
+        data, and the :attr:`curve` and :attr:`scatter` properties. Style updates are
+        never deferred.
+
+        Parameters
+        ----------
+        styleUpdate : bool
+            Indicates if the style was updated in addition to the data.
+        """
+        scene = self.scene()
+        if (
+            styleUpdate
+            or not (self.opts['clipToView'] or self.opts['autoDownsample'])
+            or scene is None
+            or not hasattr(scene, 'sigPrepareForPaint')
+        ):
+            self.updateItems(styleUpdate=styleUpdate)
+            return
+        if not self._displayDirty:
+            self._displayDirty = True
+            self._sigFlushDisplay.emit()
+            # safety net for a render requested before the queued call is delivered
+            scene.sigPrepareForPaint.connect(self._flushDisplay)
+            self._flushScene = weakref.ref(scene)
+
+    @QtCore.Slot()
+    def _flushDisplay(self) -> None:
+        """
+        Apply a deferred data update of the curve and scatter plot, if any.
+        """
+        if self._displayDirty:
+            self.updateItems(styleUpdate=False)
+
+    def _cancelDisplayFlush(self) -> None:
+        """
+        Forget a deferred data update, and stop waiting for the next paint.
+        """
+        if not self._displayDirty:
+            return
+        self._displayDirty = False
+        scene = None if self._flushScene is None else self._flushScene()
+        self._flushScene = None
+        if scene is not None:
+            try:
+                scene.sigPrepareForPaint.disconnect(self._flushDisplay)
+            except (TypeError, RuntimeError):
+                # TypeError and RuntimeError are from PyQt and PySide, respectively
+                pass
 
     def getOriginalDataset(self) -> tuple[None, None] | tuple[np.ndarray, np.ndarray]:
         """
@@ -1860,7 +1958,7 @@ class PlotDataItem(GraphicsObject):
         self._sentDisplayData = None
         profiler('append data')
 
-        self.updateItems(styleUpdate=False)
+        self._requestDisplayUpdate(styleUpdate=False)
         profiler('update items')
         self.informViewBoundsChanged()
         self.sigPlotChanged.emit(self)
@@ -1982,68 +2080,25 @@ class PlotDataItem(GraphicsObject):
         x = mapped.x
         y = mapped.y
 
-        view = self.getViewBox()
         view_range = self._displayViewRange()
-
-        ds = self.opts['downsample']
-        if not isinstance(ds, int):
-            ds = 1
-
-        # indices of the first visible point and of the first point right of the view
-        visible = None
-        if self.opts['clipToView']:
-            if (
-                view is None
-                # while the item is being parented, the view can be the GraphicsView
-                or not (hasattr(view, 'implements') and view.implements('ViewBox'))
-                or view.autoRangeEnabled()[0]
-            ):
-                pass  # no ViewBox to clip to, or view will autoscale to data range.
-            elif view_range is not None and len(x) > 1:
-                # clip-to-view always presumes that x-values are in increasing order
-                # np.searchsorted performs poorly when the array.dtype does not
-                # match the type of the value (float) being searched.
-                # see: https://github.com/pyqtgraph/pyqtgraph/pull/2719
-                visible = (
-                    bisect.bisect_left(x, view_range.left()),
-                    bisect.bisect_left(x, view_range.right())
-                )
-
+        ds, visible = self._displayReduction(x, view_range)
         if self.opts['autoDownsample']:
-            ds = self._autoDownsampleFactor(x, view_range, visible, ds)
-            # use the last computed value if our new value is not too different.
-            # this guards against an infinite cycle where the plot never stabilizes.
-            if math.isclose(ds, self._adsLastValue, rel_tol=0.01):
-                ds = self._adsLastValue
             self._adsLastValue = ds
-            # downsampling is expensive; delay until after clipping.
+        # downsampling is expensive; it is applied after clipping.
+        start, end = self._displaySelection(len(y), ds, visible)
+        self._displayKey = (ds, start, end)
 
         connect = self.opts['connect'] if isinstance(self.opts['connect'], np.ndarray) else None
         if ds > 1 and self.opts['downsampleMethod'] == 'peak':
             # blocks are aligned to multiples of ds from the first point, so that they
             # do not move with the view, and their extremes are cached.
-            num_blocks = len(y) // ds
-            if visible is None:
-                first_block, end_block = 0, num_blocks
-            else:
-                # keep one block beyond each edge, so that the curve reaches the edges
-                first_block = max(visible[0] // ds - 1, 0)
-                end_block = min(-(-visible[1] // ds) + 1, num_blocks)
-            x, y, connect = self._peakDownsample(
-                x, y, connect, ds, first_block, end_block
-            )
+            x, y, connect = self._peakDownsample(x, y, connect, ds, start, end)
         else:
             if visible is not None:
-                # since we want the curve to go to the edge of the screen, we need to
-                # preserve one down-sampled point on the left and one of the right, so
-                # we extend the interval. Its start is aligned to a multiple of ds, so
-                # that the selected points do not change while panning.
-                x0 = (max(visible[0] - ds, 0) // ds) * ds
-                x1 = fn.clip_scalar(visible[1] + ds, x0, len(x))
-                x = x[x0:x1]
-                y = y[x0:x1]
+                x = x[start:end]
+                y = y[start:end]
                 if connect is not None:
-                    connect = connect[x0:x1]
+                    connect = connect[start:end]
 
             if ds > 1:
                 if self.opts['downsampleMethod'] == 'subsample':
@@ -2120,6 +2175,125 @@ class PlotDataItem(GraphicsObject):
         self.setProperty('yViewRangeWasChanged', False)
 
         return self._datasetDisplay
+
+    def _displayReduction(
+        self,
+        x: np.ndarray,
+        view_range: QtCore.QRectF | None
+    ) -> tuple[int, tuple[int, int] | None]:
+        """
+        Determine the downsampling factor and the visible index range.
+
+        This method has no side effect: the auto-downsampling hysteresis is applied
+        with respect to the last factor, but the factor is not stored.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Mapped `x` data.
+        view_range : :class:`QRectF` or None
+            Visible range, see :meth:`_displayViewRange`.
+
+        Returns
+        -------
+        ds : int
+            Downsampling factor, at least 1.
+        visible : tuple of int or None
+            Index of the first visible point and of the first point right of the view,
+            or ``None`` if the data is not clipped to the view.
+        """
+        view = self.getViewBox()
+        ds = self.opts['downsample']
+        if not isinstance(ds, int):
+            ds = 1
+
+        # indices of the first visible point and of the first point right of the view
+        visible = None
+        if self.opts['clipToView']:
+            if (
+                view is None
+                # while the item is being parented, the view can be the GraphicsView
+                or not (hasattr(view, 'implements') and view.implements('ViewBox'))
+                or view.autoRangeEnabled()[0]
+            ):
+                pass  # no ViewBox to clip to, or view will autoscale to data range.
+            elif view_range is not None and len(x) > 1:
+                # clip-to-view always presumes that x-values are in increasing order
+                # np.searchsorted performs poorly when the array.dtype does not
+                # match the type of the value (float) being searched.
+                # see: https://github.com/pyqtgraph/pyqtgraph/pull/2719
+                visible = (
+                    bisect.bisect_left(x, view_range.left()),
+                    bisect.bisect_left(x, view_range.right())
+                )
+
+        if self.opts['autoDownsample']:
+            ds = self._autoDownsampleFactor(x, view_range, visible, ds)
+            # use the last computed value if our new value is not too different.
+            # this guards against an infinite cycle where the plot never stabilizes.
+            if math.isclose(ds, self._adsLastValue, rel_tol=0.01):
+                ds = self._adsLastValue
+        return ds, visible
+
+    def _displaySelection(
+        self,
+        n: int,
+        ds: int,
+        visible: tuple[int, int] | None
+    ) -> tuple[int, int]:
+        """
+        Determine the part of the data that is displayed.
+
+        Parameters
+        ----------
+        n : int
+            Number of data points.
+        ds : int
+            Downsampling factor.
+        visible : tuple of int or None
+            Visible index range, see :meth:`_displayReduction`.
+
+        Returns
+        -------
+        tuple of int
+            For the 'peak' downsampling, the range of blocks to draw. Otherwise, the
+            range of points to draw.
+        """
+        if ds > 1 and self.opts['downsampleMethod'] == 'peak':
+            num_blocks = n // ds
+            if visible is None:
+                return 0, num_blocks
+            # keep one block beyond each edge, so that the curve reaches the edges
+            return (
+                max(visible[0] // ds - 1, 0),
+                min(-(-visible[1] // ds) + 1, num_blocks)
+            )
+        if visible is None:
+            return 0, n
+        # since we want the curve to go to the edge of the screen, we need to preserve
+        # one down-sampled point on the left and one of the right, so we extend the
+        # interval. Its start is aligned to a multiple of ds, so that the selected
+        # points do not change while panning.
+        x0 = (max(visible[0] - ds, 0) // ds) * ds
+        return x0, int(fn.clip_scalar(visible[1] + ds, x0, n))
+
+    def _displayChangedByView(self) -> bool:
+        """
+        Test whether the current view range requires new display data.
+
+        The downsampling factor and the selected range are compared with those of the
+        current display data; the test is O(log N).
+
+        Returns
+        -------
+        bool
+            ``True`` if the display data has to be recomputed.
+        """
+        mapped = self._datasetMapped
+        if self._datasetDisplay is None or mapped is None or self._displayKey is None:
+            return True
+        ds, visible = self._displayReduction(mapped.x, self._displayViewRange())
+        return (ds, *self._displaySelection(len(mapped.y), ds, visible)) != self._displayKey
 
     def _peakDownsample(
         self,
@@ -2335,6 +2509,7 @@ class PlotDataItem(GraphicsObject):
         :meth:`getOriginalDataset`
             This method returns the original data provided to PlotDataItem instead.
         """
+        self._flushDisplay()
         dataset = self._getDisplayDataset()
         return (None, None) if dataset is None else (dataset.x, dataset.y)
 
@@ -2387,11 +2562,12 @@ class PlotDataItem(GraphicsObject):
             The maximum end of the range that the data occupies along the specified
             axis. ``None`` if there is no data.
         """
+        self._flushDisplay()
         bounds: tuple[None, None] | tuple[float, float] = (None, None)
-        if self.curve.isVisible():
-            bounds = self.curve.dataBounds(ax, frac, orthoRange)
-        if self.scatter.isVisible():
-            bounds2 = self.scatter.dataBounds(ax, frac, orthoRange)
+        if self._curve.isVisible():
+            bounds = self._curve.dataBounds(ax, frac, orthoRange)
+        if self._scatter.isVisible():
+            bounds2 = self._scatter.dataBounds(ax, frac, orthoRange)
             bounds = (
                 min(
                     (i for i in [bounds2[0], bounds[0]] if i is not None), default=None
@@ -2416,25 +2592,27 @@ class PlotDataItem(GraphicsObject):
             returned by :meth:`dataBounds`. This method is called by :class:`ViewBox`
             when auto-scaling.
         """
+        self._flushDisplay()
         pad = 0
-        if self.curve.isVisible():
-            pad = max(pad, self.curve.pixelPadding())
-        elif self.scatter.isVisible():
-            pad = max(pad, self.scatter.pixelPadding())
+        if self._curve.isVisible():
+            pad = max(pad, self._curve.pixelPadding())
+        elif self._scatter.isVisible():
+            pad = max(pad, self._scatter.pixelPadding())
         return pad
 
     def clear(self) -> None:
         """
         Remove all data from this item and from its curve and scatter plot.
         """
+        self._cancelDisplayFlush()
         self._dataset = self._datasetMapped = self._datasetDisplay = None
         self._sentDisplayData = None
         self._drlClipActive = False
         self._peakCache = None
         self._appendBuffers = None
         self._implicitX = False
-        self.curve.clear()
-        self.scatter.clear()
+        self._curve.clear()
+        self._scatter.clear()
 
     @QtCore.Slot(object, object)
     def curveClicked(self, _: PlotCurveItem, ev):
@@ -2480,8 +2658,9 @@ class PlotDataItem(GraphicsObject):
         Update the displayed data after a change of the view range, if needed.
 
         A horizontal change requires new display data with `clipToView` or
-        `autoDownsample`. A vertical change requires it only while the dynamic range
-        limiter clips the data, or when the new range requires clipping.
+        `autoDownsample`, if the visible points or the downsampling factor change. A
+        vertical change requires it only while the dynamic range limiter clips the
+        data, or when the new range requires clipping.
 
         Parameters
         ----------
@@ -2495,16 +2674,15 @@ class PlotDataItem(GraphicsObject):
         """
         # view range has changed; re-plot if needed 
         update_needed = False
-        if changed is None or changed[0]: 
-            # if ranges is not None:
-            #     print('hor:', ranges[0])
+        if (
+            (changed is None or changed[0])
+            and (self.opts['clipToView'] or self.opts['autoDownsample'])
+            and self._displayChangedByView()
+        ):
+            # the visible points or the downsampling factor changed
             self.setProperty('xViewRangeWasChanged', True)
-            if (
-                self.opts['clipToView']
-                or self.opts['autoDownsample']
-            ):
-                self._datasetDisplay = None
-                update_needed = True
+            self._datasetDisplay = None
+            update_needed = True
         if (changed is None or changed[1]) and self._drlUpdateRequired():
             # The dynamic range limiter clips the data, or has to start doing so:
             # update, but do not discard cached display data.
