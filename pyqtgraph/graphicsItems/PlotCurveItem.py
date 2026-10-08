@@ -487,13 +487,26 @@ class PlotCurveItem(GraphicsObject):
         self._boundingRect = None
         self._boundsCache = [None, None]
 
+    def _styleBoundsChanged(self) -> None:
+        """
+        Notify a style change that can alter the bounds of the curve.
+
+        The pen widths enter the pixel padding and, for non-cosmetic pens, the data
+        bounds; the fill level enters the data bounds. The geometry change is
+        announced to the scene before the cached bounds are dropped, and the view is
+        told, so that the bounds it caches per item are refreshed as well.
+        """
+        self.prepareGeometryChange()
+        self.invalidateBounds()
+        self.informViewBoundsChanged()
+
     def setPen(self, *args, **kwargs):
         """Set the pen used to draw the curve."""
         if args and args[0] is None:
             self.opts['pen'] = None
         else:
             self.opts['pen'] = fn.mkPen(*args, **kwargs)
-        self.invalidateBounds()
+        self._styleBoundsChanged()
         self.update()
 
     def setShadowPen(self, *args, **kwargs):
@@ -507,7 +520,7 @@ class PlotCurveItem(GraphicsObject):
             self.opts['shadowPen'] = None
         else:
             self.opts['shadowPen'] = fn.mkPen(*args, **kwargs)
-        self.invalidateBounds()
+        self._styleBoundsChanged()
         self.update()
 
     def setBrush(self, *args, **kwargs):
@@ -527,7 +540,7 @@ class PlotCurveItem(GraphicsObject):
         self.opts['fillLevel'] = level
         self.fillPath = None
         self._fillPathList = None
-        self.invalidateBounds()
+        self._styleBoundsChanged()
         self.update()
         
     def setSkipFiniteCheck(self, skipFiniteCheck):
