@@ -1,3 +1,5 @@
+from types import ModuleType
+
 import numpy
 
 from .Qt import QtGui
@@ -82,6 +84,64 @@ def _convert_2dlut_to_1dlut(xp, lut):
     lut = lut.ravel()
 
     return lut
+
+
+def _resample_lut(
+    xp: ModuleType, lut: numpy.ndarray, size: int, max_deviation: int = 1
+) -> numpy.ndarray | None:
+    """
+    Resample a lookup table to fewer entries, if this barely changes the displayed colors.
+
+    A value normalized to ``u`` in [0, 1) by the levels is displayed with entry
+    ``floor(u * N)`` of a table of N entries. Entry ``j`` of the resampled table covers
+    the values ``j / size <= u < (j + 1) / size``; it is the original table linearly
+    interpolated over the indices at the center of that interval. The deviation is the
+    largest difference, over all values and channels, between the color of a value
+    through the resampled table and its color through ``lut``.
+
+    Parameters
+    ----------
+    xp : module
+        Array module of ``lut``, either numpy or cupy.
+    lut : numpy.ndarray or cupy.ndarray
+        Lookup table of dtype uint8 and shape (N,) or (N, C), with ``N >= size``.
+    size : int
+        Number of entries of the resampled table.
+    max_deviation : int, default 1
+        Largest accepted deviation, in levels of 255.
+
+    Returns
+    -------
+    numpy.ndarray or cupy.ndarray or None
+        Resampled uint8 table of shape ``(size,) + lut.shape[1:]`` on the array module of
+        ``lut``, or None if its deviation exceeds ``max_deviation``.
+    """
+    if xp != numpy:
+        lut = lut.get()  # a few hundred entries: cheaper to resample on the host
+    n = lut.shape[0]
+    if n < size:
+        raise ValueError(f"cannot resample a lookup table of {n} entries to {size} entries")
+    table = lut.reshape(n, -1).astype(numpy.float64)
+
+    pos = (numpy.arange(size) + 0.5) * (n / size) - 0.5
+    numpy.clip(pos, 0, n - 1, out=pos)
+    lo = pos.astype(numpy.intp)  # pos >= 0, so truncation is floor
+    hi = numpy.minimum(lo + 1, n - 1)
+    frac = (pos - lo)[:, numpy.newaxis]
+    resampled = numpy.rint(table[lo] * (1.0 - frac) + table[hi] * frac).astype(numpy.uint8)
+
+    # original entry k covers k / n <= u < (k + 1) / n, i.e. the resampled entries
+    # first[k] to last[k] (at most two of them, since n >= size)
+    k = numpy.arange(n)
+    first = (k * size) // n
+    last = -((-(k + 1) * size) // n) - 1
+    deviation = max(
+        numpy.abs(table - resampled[first]).max(),
+        numpy.abs(table - resampled[last]).max(),
+    )
+    if deviation > max_deviation:
+        return None
+    return xp.asarray(resampled.reshape((size,) + lut.shape[1:]))
 
 
 def _rescale_and_lookup_float(xp, image, levels, lut, *, forceApplyLut):
