@@ -1,5 +1,7 @@
 import sys
 import weakref
+from collections import OrderedDict
+from collections.abc import Hashable
 from math import ceil, copysign, floor, frexp, isfinite, log10, sqrt
 
 import numpy as np
@@ -12,6 +14,107 @@ from ..Qt import QtCore, QtGui, QtWidgets
 from .GraphicsWidget import GraphicsWidget
 
 __all__ = ['AxisItem']
+
+_AlignmentFlag = QtCore.Qt.AlignmentFlag
+
+# Flags used to draw the tick labels, per orientation; computed once instead of once
+# per label (combining enum flags is comparatively slow with PyQt6 / PySide6).
+_TICK_TEXT_FLAGS = {
+    'left': (_AlignmentFlag.AlignRight | _AlignmentFlag.AlignVCenter)
+            | QtCore.Qt.TextFlag.TextDontClip,
+    'right': (_AlignmentFlag.AlignLeft | _AlignmentFlag.AlignVCenter)
+             | QtCore.Qt.TextFlag.TextDontClip,
+    'top': (_AlignmentFlag.AlignHCenter | _AlignmentFlag.AlignBottom)
+           | QtCore.Qt.TextFlag.TextDontClip,
+    'bottom': (_AlignmentFlag.AlignHCenter | _AlignmentFlag.AlignTop)
+              | QtCore.Qt.TextFlag.TextDontClip,
+}
+
+# Rectangle in which tick labels are measured, see AxisItem._measureTickText.
+_TEXT_MEASURE_RECT = QtCore.QRectF(0, 0, 100, 100)
+
+
+class _LRUCache:
+    """
+    Mapping bounded to a maximum number of entries, least recently used first out.
+
+    Parameters
+    ----------
+    maxSize : int
+        Maximum number of entries kept.
+    """
+
+    __slots__ = ('_data', '_maxSize')
+
+    def __init__(self, maxSize: int) -> None:
+        self._data = OrderedDict()
+        self._maxSize = maxSize
+
+    def __len__(self) -> int:
+        """
+        Return the number of entries.
+
+        Returns
+        -------
+        int
+            The number of cached entries.
+        """
+        return len(self._data)
+
+    def __contains__(self, key: Hashable) -> bool:
+        """
+        Tell whether ``key`` is cached, without marking it as recently used.
+
+        Parameters
+        ----------
+        key : Hashable
+            The key to look up.
+
+        Returns
+        -------
+        bool
+            True if ``key`` is cached.
+        """
+        return key in self._data
+
+    def get(self, key: Hashable) -> object | None:
+        """
+        Return the value stored for ``key`` and mark it as recently used.
+
+        Parameters
+        ----------
+        key : Hashable
+            The key to look up.
+
+        Returns
+        -------
+        object or None
+            The stored value, or None if ``key`` is not cached.
+        """
+        value = self._data.get(key)
+        if value is not None:
+            self._data.move_to_end(key)
+        return value
+
+    def put(self, key: Hashable, value: object) -> None:
+        """
+        Store ``value`` for ``key``, evicting the least recently used entry if full.
+
+        Parameters
+        ----------
+        key : Hashable
+            The key.
+        value : object
+            The value to store; must not be None.
+        """
+        self._data[key] = value
+        self._data.move_to_end(key)
+        if len(self._data) > self._maxSize:
+            self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        """Remove all entries."""
+        self._data.clear()
 
 
 class AxisItem(GraphicsWidget):
@@ -47,19 +150,33 @@ class AxisItem(GraphicsWidget):
     **args
         All additional keyword arguments are passed to :func:`setLabel`.
     """
+
+    # Size of the tick label strings, ``(text, font and device key) -> (width,
+    # height)``, shared by all axes: linked axes usually display the same labels.
+    # Keyed by font, so it never needs to be invalidated.
+    _tickTextSizeCache = _LRUCache(4096)
+
     def __init__(
             self,
             orientation: str,
-            pen=None,
-            textPen=None,
-            tickPen = None,
-            linkView=None,
-            parent=None,
-            maxTickLength=-5,
-            showValues=True,
-            **args,
-    ):
+            pen: object = None,
+            textPen: object = None,
+            tickPen: object = None,
+            linkView: object = None,
+            parent: QtWidgets.QGraphicsItem | None = None,
+            maxTickLength: int = -5,
+            showValues: bool = True,
+            **args: object,
+    ) -> None:
         super().__init__(parent)
+        # Tick strings, ``(values, scale, spacing, extra state) -> strings``; see
+        # _tickStringsCacheKey.
+        self._tickStringsCache = _LRUCache(64)
+        # While a picture is pending, weak reference to the scene whose
+        # sigPrepareForPaint is connected to _prepareForPaint; see _invalidatePicture.
+        self._preparingScene = None
+        # True while _buildPicture runs: the picture it builds is assigned afterwards.
+        self._buildingPicture = False
         self.label = QtWidgets.QGraphicsTextItem(self)
         self.picture = None
         self.orientation = orientation
@@ -146,7 +263,7 @@ class AxisItem(GraphicsWidget):
         self.grid = False
 
 
-    def setStyle(self, **kwargs):
+    def setStyle(self, **kwargs: object) -> None:
         """
         Set various style options.
 
@@ -285,7 +402,8 @@ class AxisItem(GraphicsWidget):
             else:
                 self.style[kwd] = value
 
-        self.picture = None
+        self._invalidateTickCaches()
+        self._invalidatePicture()
         self._adjustSize()
         self.update()
 
@@ -315,7 +433,7 @@ class AxisItem(GraphicsWidget):
             grid = min(grid, 255)
             grid = max(grid, 0)
         self.grid = grid
-        self.picture = None
+        self._invalidatePicture()
         self.prepareGeometryChange()
         self.update()
 
@@ -323,7 +441,7 @@ class AxisItem(GraphicsWidget):
         self,
         *args: bool,
         **kwargs: bool
-    ):
+    ) -> None:
         """
         Set log scaling for x and / or y axes.
 
@@ -374,10 +492,11 @@ class AxisItem(GraphicsWidget):
             elif self.orientation in ('left', 'right'):
                 self._linkedView().setLogMode('y', self.logMode)
 
-        self.picture = None
+        self._invalidateTickCaches()
+        self._invalidatePicture()
         self.update()
 
-    def setTickFont(self, font: QtGui.QFont | None):
+    def setTickFont(self, font: QtGui.QFont | None) -> None:
         """
         Set the font used for tick values.
         
@@ -387,7 +506,8 @@ class AxisItem(GraphicsWidget):
             The font to use for the tick values. Set to ``None`` for the default font.
         """
         self.style['tickFont'] = font
-        self.picture = None
+        self._invalidateTickCaches()
+        self._invalidatePicture()
         self.prepareGeometryChange()
         # Need to re-allocate space depending on font size?
         self.update()
@@ -415,7 +535,7 @@ class AxisItem(GraphicsWidget):
             p.setX(int(self.size().width()/2. - br.width()/2.))
             p.setY(int(self.size().height()-br.height()+nudge))
         self.label.setPos(p)
-        self.picture = None
+        self._invalidatePicture()
 
     def showLabel(self, show: bool=True):
         """
@@ -441,8 +561,8 @@ class AxisItem(GraphicsWidget):
         unitPrefix: str | None=None,
         siPrefixEnableRanges: tuple[tuple[float, float], ...] | None=None,
         unitPower: int | float=1,
-        **kwargs
-    ):
+        **kwargs: object
+    ) -> None:
         """
         Set the text displayed adjacent to the axis.
 
@@ -488,6 +608,7 @@ class AxisItem(GraphicsWidget):
         # Account empty string and `None` for units and text
         visible = bool(text or units)
         self.showLabel(visible)
+        self._invalidateTickCaches()
         self._updateLabel()
 
     def setSIPrefixEnableRanges(self, ranges=None):
@@ -529,7 +650,7 @@ class AxisItem(GraphicsWidget):
     def _updateLabel(self):
         self.label.setHtml(self.labelString())
         self._adjustSize()
-        self.picture = None
+        self._invalidatePicture()
         self.update()
 
     def labelString(self) -> str:
@@ -860,7 +981,7 @@ class AxisItem(GraphicsWidget):
             # XXX: Will already update once!
             self.updateAutoSIPrefix()
         else:
-            self.picture = None
+            self._invalidatePicture()
             self.update()
 
     def linkedView(self):
@@ -979,23 +1100,168 @@ class AxisItem(GraphicsWidget):
         path.addRect(rect)
         return path
 
-    def paint(self, p, opt, widget):
-        profiler = debug.Profiler()
+    def paint(
+        self,
+        p: QtGui.QPainter,
+        opt: QtWidgets.QStyleOptionGraphicsItem | None,
+        widget: QtWidgets.QWidget | None
+    ) -> None:
+        """
+        Paint the axis, its ticks and tick labels.
+
+        The picture is normally built when the scene prepares, before Qt computes the
+        regions to repaint (see :meth:`_invalidatePicture`). It is built here if it
+        was not, e.g. outside a :class:`GraphicsScene <pyqtgraph.GraphicsScene>`.
+
+        Parameters
+        ----------
+        p : QtGui.QPainter
+            The painter, in local coordinates.
+        opt : QtWidgets.QStyleOptionGraphicsItem or None
+            Style options, unused.
+        widget : QtWidgets.QWidget or None
+            The widget painted on, unused.
+        """
         if self.picture is None:
-            try:
-                picture = QtGui.QPicture()
-                painter = QtGui.QPainter(picture)
-                if self.style["tickFont"]:
-                    painter.setFont(self.style["tickFont"])
-                specs = self.generateDrawSpecs(painter)
-                profiler('generate specs')
-                if specs is not None:
-                    self.drawPicture(painter, *specs)
-                    profiler('draw picture')
-            finally:
-                painter.end()
-            self.picture = picture
+            self.picture = self._buildPicture()
         self.picture.play(p)
+
+    def _buildPicture(self, keepSize: bool = False) -> QtGui.QPicture | None:
+        """
+        Generate the drawing specifications and draw them into a new picture.
+
+        Generating the specifications measures the tick labels, which may change the
+        size constraints of the axis (see :meth:`_updateMaxTextSize`); the layout
+        applies them later.
+
+        Parameters
+        ----------
+        keepSize : bool, default False
+            If True and the size constraints of the axis changed while generating the
+            specifications, return None without drawing: the picture would be drawn for
+            a geometry about to change.
+
+        Returns
+        -------
+        QtGui.QPicture or None
+            The picture, or None if ``keepSize`` is True and the size constraints
+            changed.
+        """
+        profiler = debug.Profiler()
+        picture = QtGui.QPicture()
+        painter = QtGui.QPainter(picture)
+        self._buildingPicture = True
+        try:
+            if self.style["tickFont"]:
+                painter.setFont(self.style["tickFont"])
+            constraints = self._sizeConstraints() if keepSize else None
+            specs = self.generateDrawSpecs(painter)
+            profiler('generate specs')
+            if constraints is not None and self._sizeConstraints() != constraints:
+                return None
+            if specs is not None:
+                self.drawPicture(painter, *specs)
+                profiler('draw picture')
+        finally:
+            self._buildingPicture = False
+            painter.end()
+        return picture
+
+    def _sizeConstraints(self) -> tuple[float, float, float, float]:
+        """
+        Return the size constraints that the layout applies to the axis.
+
+        Returns
+        -------
+        tuple of float
+            The minimum and maximum widths, then the minimum and maximum heights.
+        """
+        return (self.minimumWidth(), self.maximumWidth(),
+                self.minimumHeight(), self.maximumHeight())
+
+    def _invalidatePicture(self) -> None:
+        """
+        Drop the picture of the axis and have it built when the scene prepares.
+
+        In a :class:`GraphicsScene <pyqtgraph.GraphicsScene>`, :meth:`_prepareForPaint`
+        is connected to its ``sigPrepareForPaint`` signal until the picture is built,
+        and a prepare is requested (see :meth:`GraphicsScene.requestPrepare
+        <pyqtgraph.GraphicsScene.requestPrepare>`). The picture is thus built before
+        Qt computes the regions to repaint, and a new size of the tick labels is laid
+        out before the paint instead of after it, which cost a second paint.
+        Otherwise :meth:`paint` builds the picture, as it does for hidden axes and for
+        subclasses overriding :meth:`paint`, which may not use the picture.
+
+        Changes made while the picture is built (see :meth:`_buildPicture`) only drop
+        the picture: the built picture is assigned afterwards. The size constraints
+        set by :meth:`_updateWidth` and :meth:`_updateHeight` do not change the
+        picture by themselves; a new geometry reaches :meth:`resizeEvent`.
+        """
+        self.picture = None
+        if self._buildingPicture or not self.isVisible():
+            return
+        if type(self).paint is not AxisItem.paint:
+            return
+        scene = self.scene()
+        requestPrepare = getattr(scene, 'requestPrepare', None)
+        if requestPrepare is None:
+            return
+        preparing = self._preparingScene
+        if preparing is None or preparing() is not scene:
+            self._disconnectPrepare()
+            # Connected while a picture is pending only, not for as long as the item is
+            # in the scene (from itemChange): the signal stays cheap to emit, and
+            # itemChange also runs while a scene is torn down, when connecting can
+            # crash PySide6.
+            scene.sigPrepareForPaint.connect(self._prepareForPaint)
+            self._preparingScene = weakref.ref(scene)
+        requestPrepare()
+
+    def _disconnectPrepare(self) -> QtWidgets.QGraphicsScene | None:
+        """
+        Disconnect :meth:`_prepareForPaint` from the scene it is connected to, if any.
+
+        Returns
+        -------
+        QtWidgets.QGraphicsScene or None
+            The scene that was connected, or None if there was none or it was
+            deleted.
+        """
+        preparing, self._preparingScene = self._preparingScene, None
+        scene = None if preparing is None else preparing()
+        if scene is not None:
+            try:
+                scene.sigPrepareForPaint.disconnect(self._prepareForPaint)
+            except (TypeError, RuntimeError):
+                # TypeError and RuntimeError are from PyQt and PySide, respectively
+                pass
+        return scene
+
+    @QtCore.Slot()
+    def _prepareForPaint(self) -> None:
+        """
+        Build the picture invalidated by :meth:`_invalidatePicture`, then disconnect.
+
+        Connected to ``sigPrepareForPaint`` of the scene only while a picture is
+        pending. When the tick labels need a new size, the picture, which would be
+        drawn for the previous geometry, is not kept: the scene lays out the new size
+        and prepares again (see :meth:`GraphicsScene.event
+        <pyqtgraph.GraphicsScene.event>`), and the picture is built for the new
+        geometry then.
+        """
+        scene = self._disconnectPrepare()
+        if (
+            self.picture is not None
+            or scene is None
+            or scene is not self.scene()
+            or not self.isVisible()
+        ):
+            return
+        picture = self._buildPicture(keepSize=True)
+        if picture is None:
+            self._invalidatePicture()
+        else:
+            self.picture = picture
 
 
     def setTickDensity(self, density=1.0):
@@ -1012,7 +1278,7 @@ class AxisItem(GraphicsWidget):
             Density of ticks to display, by default 1.0.
         """
         self._tickDensity = density
-        self.picture = None
+        self._invalidatePicture()
         self.update()
 
 
@@ -1063,7 +1329,7 @@ class AxisItem(GraphicsWidget):
         """        
 
         self._tickLevels = ticks
-        self.picture = None
+        self._invalidatePicture()
         self.update()
 
     def setTickSpacing(
@@ -1105,7 +1371,7 @@ class AxisItem(GraphicsWidget):
         if levels is None:
             levels = None if major is None else [(major, 0.), (minor, 0.)]
         self._tickSpacing = levels
-        self.picture = None
+        self._invalidatePicture()
         self.update()
 
     def tickSpacing(self, minVal: float, maxVal: float, size: float):
@@ -1402,7 +1668,130 @@ class AxisItem(GraphicsWidget):
                 dstrings.append(e)
         return dstrings
 
-    def generateDrawSpecs(self, p):
+    def _invalidateTickCaches(self) -> None:
+        """
+        Forget the cached tick strings of this axis.
+
+        Called when the font, the style, the label or the log mode change (the cache
+        keys also hold the state the strings depend on). The shared tick label size
+        cache is keyed by font and needs no invalidation.
+        """
+        self._tickStringsCache.clear()
+
+    def _tickStringsCacheKey(self, spacing: float | None) -> tuple | None:
+        """
+        Return what the tick strings depend on, besides their arguments.
+
+        The default :meth:`tickStrings` and :meth:`logTickStrings` depend on the log
+        mode only. Subclasses whose strings depend on other state must override this
+        method; overriding :meth:`tickStrings` or :meth:`logTickStrings` alone
+        disables the cache.
+
+        Parameters
+        ----------
+        spacing : float or None
+            The spacing between ticks.
+
+        Returns
+        -------
+        tuple or None
+            Extra key items of the tick strings cache, or None to call
+            :meth:`tickStrings` without caching.
+        """
+        if (
+            getattr(self.tickStrings, '__func__', None) is not AxisItem.tickStrings
+            or getattr(self.logTickStrings, '__func__', None) is not AxisItem.logTickStrings
+        ):
+            return None
+        return (self.logMode,)
+
+    def _tickStringsCached(
+        self,
+        values: list[float],
+        scale: float,
+        spacing: float | None
+    ) -> list[str | None]:
+        """
+        Return ``self.tickStrings(values, scale, spacing)``, from a cache if possible.
+
+        See :meth:`_tickStringsCacheKey` for when the strings are cached.
+
+        Parameters
+        ----------
+        values : list of float
+            Tick values.
+        scale : float
+            The scaling factor for tick values.
+        spacing : float or None
+            The spacing between ticks.
+
+        Returns
+        -------
+        list of str or None
+            A new list, which the caller may modify.
+        """
+        extraKey = self._tickStringsCacheKey(spacing)
+        if extraKey is None:
+            return self.tickStrings(values, scale, spacing)
+        key = (tuple(values), scale, spacing, extraKey)
+        strings = self._tickStringsCache.get(key)
+        if strings is None:
+            strings = tuple(self.tickStrings(values, scale, spacing))
+            self._tickStringsCache.put(key, strings)
+        return list(strings)
+
+    @staticmethod
+    def _tickTextFontKey(p: QtGui.QPainter) -> tuple:
+        """
+        Identify what the size of a tick label measured with ``p`` depends on.
+
+        Parameters
+        ----------
+        p : QtGui.QPainter
+            The painter used to measure the labels.
+
+        Returns
+        -------
+        tuple
+            The font key, the paint engine type and the resolution of the paint
+            device.
+        """
+        device = p.device()
+        engine = p.paintEngine()
+        return (
+            p.font().key(),
+            None if engine is None else engine.type(),
+            None if device is None else device.logicalDpiX(),
+            None if device is None else device.logicalDpiY(),
+        )
+
+    def _measureTickText(self, p: QtGui.QPainter, fontKey: tuple,
+                         text: str) -> tuple[float, float]:
+        """
+        Measure a tick label and store its size in the shared cache.
+
+        Parameters
+        ----------
+        p : QtGui.QPainter
+            The painter used to measure the label, with the tick font set.
+        fontKey : tuple
+            The value of :meth:`_tickTextFontKey` for ``p``.
+        text : str
+            The label.
+
+        Returns
+        -------
+        tuple of float, float
+            Width and height of the label.
+        """
+        br = p.boundingRect(_TEXT_MEASURE_RECT, QtCore.Qt.AlignmentFlag.AlignCenter, text)
+        ## boundingRect is usually just a bit too large
+        ## (but this probably depends on per-font metrics?)
+        size = (br.width(), br.height() * 0.8)
+        self._tickTextSizeCache.put((text, fontKey), size)
+        return size
+
+    def generateDrawSpecs(self, p: QtGui.QPainter) -> tuple | None:
         """
         Generate the drawing specifications for the axis, ticks, and labels.
 
@@ -1411,6 +1800,10 @@ class AxisItem(GraphicsWidget):
         tuple of values that are used to draw the axis. This is a good method to
         override in subclasses that need more control over the appearance of the axis.
 
+        Tick strings (see :meth:`_tickStringsCacheKey`) and the measured size of each
+        label (per font) are cached across calls, so that a range change only formats
+        and measures the labels that were not shown before.
+
         Parameters
         ----------
         p : QPainter
@@ -1418,9 +1811,10 @@ class AxisItem(GraphicsWidget):
 
         Returns
         -------
-        tuple
+        tuple or None
             A tuple containing the drawing specifications for the axis, ticks, and
-            labels. The tuple contains the following values:
+            labels, or None if the axis has no length on the device. The tuple
+            contains the following values:
 
             - ``axisSpec``: A tuple containing the pen, start point, and end point of
               the axis line.
@@ -1559,21 +1953,27 @@ class AxisItem(GraphicsWidget):
                 color.setAlpha(int(lineAlpha)) # adjust opacity
                 tickPen.setColor(color)
 
+            ## coordinates of both tick ends along the axis normal
+            tickEnd = tickStop
+            if self.grid is False:
+                tickEnd += tickLength*tickDir
+            tickStartF = float(tickStart)
+            tickEndF = float(tickEnd)
+            positions = tickPositions[i]
             for v in ticks:
                 ## determine actual position to draw this tick
                 x = (v * xScale) - offset
                 if x < xMin or x > xMax:  ## last check to make sure no out-of-bounds ticks are drawn
-                    tickPositions[i].append(None)
+                    positions.append(None)
                     continue
-                tickPositions[i].append(x)
+                positions.append(x)
 
-                p1 = [x, x]
-                p2 = [x, x]
-                p1[axis] = tickStart
-                p2[axis] = tickStop
-                if self.grid is False:
-                    p2[axis] += tickLength*tickDir
-                tickSpecs.append((tickPen, Point(p1), Point(p2)))
+                # Point(a, b) takes the fast two-argument path of Point.__init__
+                xf = float(x)
+                if axis == 0:
+                    tickSpecs.append((tickPen, Point(tickStartF, xf), Point(tickEndF, xf)))
+                else:
+                    tickSpecs.append((tickPen, Point(xf, tickStartF), Point(xf, tickEndF)))
         profiler('compute ticks')
 
 
@@ -1606,11 +2006,19 @@ class AxisItem(GraphicsWidget):
         if not self.style['showValues']:
             return (axisSpec, tickSpecs, textSpecs)
 
+        ## Constant for all labels: text measurement key, label flags, label offset
+        ## from the axis and clipping rectangle
+        fontKey = self._tickTextFontKey(p)
+        textSizeCache = self._tickTextSizeCache
+        textFlags = _TICK_TEXT_FLAGS[self.orientation]
+        labelOffset = max(0,self.style['tickLength']) + textOffset
+        br = self.boundingRect()
+
         for i in range(min(len(tickLevels), self.style['maxTextLevel']+1)):
             ## Get the list of strings to display for this level
             if tickStrings is None:
                 spacing, values = tickLevels[i]
-                strings = self.tickStrings(values, self.autoSIPrefixScale * self.scale, spacing)
+                strings = self._tickStringsCached(values, self.autoSIPrefixScale * self.scale, spacing)
             else:
                 strings = tickStrings[i]
 
@@ -1623,27 +2031,26 @@ class AxisItem(GraphicsWidget):
                     strings[j] = None
 
             ## Measure density of text; decide whether to draw this level
+            ## (sizes are (width, height) tuples, measured once per string and font)
             rects = []
             for s in strings:
                 if s is None:
                     rects.append(None)
                 else:
-                    br = p.boundingRect(QtCore.QRectF(0, 0, 100, 100), QtCore.Qt.AlignmentFlag.AlignCenter, s)
-                    ## boundingRect is usually just a bit too large
-                    ## (but this probably depends on per-font metrics?)
-                    br.setHeight(br.height() * 0.8)
-
-                    rects.append(br)
-                    textRects.append(rects[-1])
+                    size = textSizeCache.get((s, fontKey))
+                    if size is None:
+                        size = self._measureTickText(p, fontKey, s)
+                    rects.append(size)
+                    textRects.append(size)
 
             if textRects:
                 ## measure all text, make sure there's enough room
                 if axis == 0:
-                    textSize = np.sum([r.height() for r in textRects])
-                    textSize2 = np.max([r.width() for r in textRects])
+                    textSize = np.sum([r[1] for r in textRects])
+                    textSize2 = np.max([r[0] for r in textRects])
                 else:
-                    textSize = np.sum([r.width() for r in textRects])
-                    textSize2 = np.max([r.height() for r in textRects])
+                    textSize = np.sum([r[0] for r in textRects])
+                    textSize2 = np.max([r[1] for r in textRects])
             else:
                 textSize = 0
                 textSize2 = 0
@@ -1664,32 +2071,22 @@ class AxisItem(GraphicsWidget):
             lastTextSize2 = textSize2
 
             # Determine exactly where tick text should be drawn
+            positions = tickPositions[i]
             for j in range(len(strings)):
                 vstr = strings[j]
                 if vstr is None: ## this tick was ignored because it is out of bounds
                     continue
-                x = tickPositions[i][j]
-                textRect = rects[j]
-                height = textRect.height()
-                width = textRect.width()
-                offset = max(0,self.style['tickLength']) + textOffset
+                x = positions[j]
+                width, height = rects[j]
 
-                rect = QtCore.QRectF()
                 if self.orientation == 'left':
-                    alignFlags = QtCore.Qt.AlignmentFlag.AlignRight|QtCore.Qt.AlignmentFlag.AlignVCenter
-                    rect = QtCore.QRectF(tickStop-offset-width, x-(height/2), width, height)
+                    rect = QtCore.QRectF(tickStop-labelOffset-width, x-(height/2), width, height)
                 elif self.orientation == 'right':
-                    alignFlags = QtCore.Qt.AlignmentFlag.AlignLeft|QtCore.Qt.AlignmentFlag.AlignVCenter
-                    rect = QtCore.QRectF(tickStop+offset, x-(height/2), width, height)
+                    rect = QtCore.QRectF(tickStop+labelOffset, x-(height/2), width, height)
                 elif self.orientation == 'top':
-                    alignFlags = QtCore.Qt.AlignmentFlag.AlignHCenter|QtCore.Qt.AlignmentFlag.AlignBottom
-                    rect = QtCore.QRectF(x-width/2., tickStop-offset-height, width, height)
-                elif self.orientation == 'bottom':
-                    alignFlags = QtCore.Qt.AlignmentFlag.AlignHCenter|QtCore.Qt.AlignmentFlag.AlignTop
-                    rect = QtCore.QRectF(x-width/2., tickStop+offset, width, height)
-
-                textFlags = alignFlags | QtCore.Qt.TextFlag.TextDontClip
-                br = self.boundingRect()
+                    rect = QtCore.QRectF(x-width/2., tickStop-labelOffset-height, width, height)
+                else:  # 'bottom'
+                    rect = QtCore.QRectF(x-width/2., tickStop+labelOffset, width, height)
 
                 # br.contains(rect) suffers from floating point rounding errors
                 if br & rect != rect:

@@ -1,10 +1,11 @@
+import locale
 import sys
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
-from ..Qt.QtCore import QDateTime
+from ..Qt.QtCore import QDateTime, QTimeZone
 from .AxisItem import AxisItem
 
 __all__ = ['DateAxisItem']
@@ -356,6 +357,39 @@ class DateAxisItem(AxisItem):
             except ValueError:  # Windows can't handle dates before 1970
                 formatStrings.append('')
         return formatStrings
+
+    def _tickStringsCacheKey(self, spacing: float | None) -> tuple | None:
+        """
+        Return what the tick strings depend on, besides their arguments.
+
+        The strings depend on the format of the current zoom level for ``spacing``,
+        on the UTC offset and on the process locale (``strftime``); when no UTC
+        offset is set, also on the local time zone.
+
+        Parameters
+        ----------
+        spacing : float or None
+            The spacing between ticks.
+
+        Returns
+        -------
+        tuple or None
+            Extra key items of the tick strings cache, or None to call
+            :meth:`tickStrings` without caching.
+        """
+        zoomLevel = getattr(self, 'zoomLevel', None)
+        if (
+            getattr(self.tickStrings, '__func__', None) is not DateAxisItem.tickStrings
+            or zoomLevel is None
+        ):
+            return None
+        tickSpec = next((s for s in zoomLevel.tickSpecs if s.spacing == spacing), None)
+        return (
+            None if tickSpec is None else tickSpec.format,
+            self.utcOffset,
+            locale.setlocale(locale.LC_TIME),
+            QTimeZone.systemTimeZoneId().data() if self.utcOffset is None else None,
+        )
 
     def tickValues(self, minVal, maxVal, size):
         minVal, maxVal = sorted((minVal, maxVal))

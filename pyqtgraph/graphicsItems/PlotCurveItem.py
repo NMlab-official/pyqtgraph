@@ -1,7 +1,8 @@
-from ..Qt import QtCore, QtGui, QtOpenGL
+from ..Qt import QtCore, QtGui, QtOpenGL, QtWidgets
 
 import math
 import warnings
+import weakref
 
 import numpy as np
 
@@ -204,6 +205,65 @@ def arrayToLineSegments(x, y, connect, finiteCheck, out=None):
 
     return out
 
+
+class _VertexCache:
+    """
+    Per-data cache of the vertices of a curve drawn as a single polyline.
+
+    ``PlotCurveItem.updateData`` stores new array views on every call, so the cache is
+    bound to the identity of the data arrays. Only weak references to them are kept,
+    so that the cache never keeps replaced data alive.
+
+    Parameters
+    ----------
+    x, y : np.ndarray
+        Data arrays of the curve.
+    connect : str
+        ``connect`` option of the curve.
+    skipFiniteCheck : bool
+        ``skipFiniteCheck`` option of the curve.
+    """
+
+    __slots__ = ('_xref', '_yref', '_connect', '_skipFiniteCheck',
+                 'computed', 'vertices', 'polylineFilled')
+
+    def __init__(self, x: np.ndarray, y: np.ndarray, connect: str,
+                 skipFiniteCheck: bool) -> None:
+        self._xref = weakref.ref(x)
+        self._yref = weakref.ref(y)
+        self._connect = connect
+        self._skipFiniteCheck = skipFiniteCheck
+        self.computed = False
+        self.vertices: tuple[np.ndarray, np.ndarray] | None = None
+        self.polylineFilled = False
+
+    def matches(self, x: np.ndarray, y: np.ndarray, connect: str,
+                skipFiniteCheck: bool) -> bool:
+        """
+        Tell whether the cache was built for these data and options.
+
+        Parameters
+        ----------
+        x, y : np.ndarray
+            Current data arrays of the curve.
+        connect : str
+            Current ``connect`` option.
+        skipFiniteCheck : bool
+            Current ``skipFiniteCheck`` option.
+
+        Returns
+        -------
+        bool
+            True if the cached values are valid.
+        """
+        return (
+            self._xref() is x
+            and self._yref() is y
+            and self._connect == connect
+            and self._skipFiniteCheck == skipFiniteCheck
+        )
+
+
 class PlotCurveItem(GraphicsObject):
     """
     Class representing a single plot curve. Instances of this class are created
@@ -225,6 +285,11 @@ class PlotCurveItem(GraphicsObject):
 
     sigPlotChanged = QtCore.Signal(object)
     sigClicked = QtCore.Signal(object, object)
+
+    # Private caches of the polyline drawing of paint(), created on first use.
+    _vertexCache: _VertexCache | None = None
+    _polyline: QtGui.QPolygonF | None = None
+    _polylineMaxSize: int = 0
 
     def __init__(self, *args, **kwargs):
         """
@@ -321,13 +386,105 @@ class PlotCurveItem(GraphicsObject):
     def getData(self):
         return self.xData, self.yData
 
-    def dataBounds(self, ax, frac=1.0, orthoRange=None):
+    def dataBounds(
+        self,
+        ax: int,
+        frac: float = 1.0,
+        orthoRange: tuple[float, float] | None = None
+    ) -> tuple[float, float] | tuple[None, None]:
+        """
+        Get the range occupied by the data along an axis.
+
+        The result is cached. The full range of the finite data (``frac >= 1`` and
+        no `orthoRange`) is taken from the bounds passed by
+        :class:`~pyqtgraph.PlotDataItem` when available, without scanning the data.
+
+        Parameters
+        ----------
+        ax : { 0, 1 }
+            The axis, 0 for `x` and 1 for `y`.
+        frac : float, default 1.0
+            Fraction of the data to include, centered on the median. Values of 1.0 and
+            above include the full range of the finite data.
+        orthoRange : tuple of float or None, default None
+            Only include the data whose coordinate along the other axis lies within
+            this ``(min, max)`` range.
+
+        Returns
+        -------
+        tuple of float or tuple of None
+            ``(min, max)``, including the fill level and the width of non-cosmetic
+            pens, or ``(None, None)`` if there is no data.
+
+        Raises
+        ------
+        ValueError
+            Raised for an invalid `ax`.
+        Exception
+            Raised if `frac` is not positive.
+        """
         ## Need this to run as fast as possible.
         ## check cache first:
         cache = self._boundsCache[ax]
         if cache is not None and cache[0] == (frac, orthoRange):
             return cache[1]
 
+        if frac >= 1.0 and orthoRange is None and self._dataBoundsHint is not None:
+            b = self._dataBoundsHint[ax]
+        else:
+            b = self._computeDataBounds(ax, frac, orthoRange)
+            if b[0] is None:  # no data, not cached
+                return b
+
+        ## adjust for fill level
+        if ax == 1 and self.opts['fillLevel'] not in [None, 'enclosed']:
+            b = ( 
+                float( min(b[0], self.opts['fillLevel']) ), 
+                float( max(b[1], self.opts['fillLevel']) )
+            ) # enforce float format for bounds, even if data format is different
+
+        ## Add pen width only if it is non-cosmetic.
+        pen = self.opts['pen']
+        spen = self.opts['shadowPen']
+        if pen is not None and not pen.isCosmetic() and pen.style() != QtCore.Qt.PenStyle.NoPen:
+            b = (b[0] - pen.widthF()*0.7072, b[1] + pen.widthF()*0.7072)
+        if spen is not None and not spen.isCosmetic() and spen.style() != QtCore.Qt.PenStyle.NoPen:
+            b = (b[0] - spen.widthF()*0.7072, b[1] + spen.widthF()*0.7072)
+
+        self._boundsCache[ax] = [(frac, orthoRange), b]
+        return b
+
+    def _computeDataBounds(
+        self,
+        ax: int,
+        frac: float,
+        orthoRange: tuple[float, float] | None
+    ) -> tuple[float, float] | tuple[None, None]:
+        """
+        Scan the data for the range occupied along an axis.
+
+        Parameters
+        ----------
+        ax : { 0, 1 }
+            The axis, 0 for `x` and 1 for `y`.
+        frac : float
+            Fraction of the data to include, see :meth:`dataBounds`.
+        orthoRange : tuple of float or None
+            Range along the other axis, see :meth:`dataBounds`.
+
+        Returns
+        -------
+        tuple of float or tuple of None
+            ``(min, max)`` of the data, without fill level or pen width, or
+            ``(None, None)`` if there is no data.
+
+        Raises
+        ------
+        ValueError
+            Raised for an invalid `ax`.
+        Exception
+            Raised if `frac` is not positive.
+        """
         (x, y) = self.getData()
         if x is None or len(x) == 0:
             return (None, None)
@@ -379,23 +536,6 @@ class PlotCurveItem(GraphicsObject):
             if len(d) == 0:
                 return (None, None)
             b = np.percentile(d, [50 * (1 - frac), 50 * (1 + frac)]) # percentile result is always float64 or larger
-
-        ## adjust for fill level
-        if ax == 1 and self.opts['fillLevel'] not in [None, 'enclosed']:
-            b = ( 
-                float( min(b[0], self.opts['fillLevel']) ), 
-                float( max(b[1], self.opts['fillLevel']) )
-            ) # enforce float format for bounds, even if data format is different
-
-        ## Add pen width only if it is non-cosmetic.
-        pen = self.opts['pen']
-        spen = self.opts['shadowPen']
-        if pen is not None and not pen.isCosmetic() and pen.style() != QtCore.Qt.PenStyle.NoPen:
-            b = (b[0] - pen.widthF()*0.7072, b[1] + pen.widthF()*0.7072)
-        if spen is not None and not spen.isCosmetic() and spen.style() != QtCore.Qt.PenStyle.NoPen:
-            b = (b[0] - spen.widthF()*0.7072, b[1] + spen.widthF()*0.7072)
-
-        self._boundsCache[ax] = [(frac, orthoRange), b]
         return b
 
     def pixelPadding(self):
@@ -609,8 +749,28 @@ class PlotCurveItem(GraphicsObject):
         """
         self.updateData(*args, **kwargs)
 
-    def updateData(self, *args, **kwargs):
+    def updateData(self, *args, **kwargs) -> None:
+        """
+        Set the data and options of the curve.
+
+        Parameters
+        ----------
+        *args
+            ``(y,)`` or ``(x, y)``, see :meth:`setData`.
+        **kwargs
+            Data and options, see :meth:`setData`. The private keyword
+            ``_dataBounds``, ``((xmin, xmax), (ymin, ymax))`` of the finite data or
+            ``None``, is used by :class:`~pyqtgraph.PlotDataItem` to pass bounds it
+            has already computed; it is not part of the public API.
+
+        Raises
+        ------
+        Exception
+            Raised if the data is not one-dimensional, is complex, or if the lengths
+            of `x` and `y` do not match.
+        """
         profiler = debug.Profiler()
+        dataBounds = kwargs.pop('_dataBounds', None)
 
         if 'compositionMode' in kwargs:
             self.setCompositionMode(kwargs['compositionMode'])
@@ -644,6 +804,8 @@ class PlotCurveItem(GraphicsObject):
         
         self.prepareGeometryChange()
         self.invalidateBounds()
+        # bounds of the finite data, known in advance or computed on demand
+        self._dataBoundsHint = dataBounds
         self.informViewBoundsChanged()
 
         profiler('copy')
@@ -814,6 +976,129 @@ class PlotCurveItem(GraphicsObject):
 
         return self._lineSegments.drawargs()
 
+    def _getPolylineVertices(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """
+        Return the vertices of the curve when it is drawn as a single polyline.
+
+        The curve is a single polyline when ``stepMode`` is off and ``connect`` is
+        ``'all'``, or ``'finite'`` with finite data only. The vertices are those of the
+        path built by :meth:`generatePath`. The result is cached until the data or the
+        ``connect`` and ``skipFiniteCheck`` options change.
+
+        Returns
+        -------
+        tuple of np.ndarray or None
+            ``(x, y)`` coordinates of the vertices, or None if the curve is not a single
+            polyline. Fewer than 2 vertices means that nothing is drawn.
+        """
+        x, y = self.xData, self.yData
+        connect = self.opts['connect']
+        if (
+            x is None
+            or y is None
+            or self.opts['stepMode']
+            or not isinstance(connect, str)
+            or connect not in ('all', 'finite')
+        ):
+            return None
+
+        skipFiniteCheck = bool(self.opts['skipFiniteCheck'])
+        cache = self._vertexCache
+        if cache is None or not cache.matches(x, y, connect, skipFiniteCheck):
+            cache = self._vertexCache = _VertexCache(x, y, connect, skipFiniteCheck)
+        if not cache.computed:
+            if connect == 'all':
+                cache.vertices = fn._arrayToQPath_all_vertices(
+                    x, y, finiteCheck=not skipFiniteCheck)
+            elif not (np.isfinite(x) & np.isfinite(y)).all():
+                # 'finite' with non-finite values: several polylines
+                cache.vertices = None
+            elif skipFiniteCheck:
+                # arrayToQPath adds the finite data as a single polygon
+                cache.vertices = (x, y)
+            else:
+                # arrayToQPath delegates finite data to connect='all'
+                cache.vertices = fn._arrayToQPath_all_vertices(x, y, finiteCheck=False)
+            cache.computed = True
+        return cache.vertices
+
+    def _getPolyline(self) -> QtGui.QPolygonF:
+        """
+        Return the vertices of the curve as a ``QPolygonF``, filled once per data.
+
+        The polygon is reused from one data update to the next, so that streaming data
+        does not reallocate it on every frame. It is only valid when
+        :meth:`_getPolylineVertices` does not return None.
+
+        Returns
+        -------
+        QtGui.QPolygonF
+            The polyline. Fewer than 2 points means that nothing is drawn.
+        """
+        cache = self._vertexCache
+        if cache.polylineFilled:
+            return self._polyline
+
+        x, y = cache.vertices
+        size = len(x)
+        polyline = self._polyline
+        if polyline is None or size < self._polylineMaxSize // 4:
+            # create, or release the memory of a much longer former curve
+            polyline = self._polyline = fn.create_qpolygonf(size)
+            self._polylineMaxSize = size
+        else:
+            if hasattr(polyline, 'resize'):
+                polyline.resize(size)
+            else:
+                polyline.fill(QtCore.QPointF(), size)
+            self._polylineMaxSize = max(self._polylineMaxSize, size)
+        memory = fn.ndarray_from_qpolygonf(polyline)
+        memory[:, 0] = x
+        memory[:, 1] = y
+        cache.polylineFilled = True
+        return polyline
+
+    def _shouldUseDrawPolyline(self, painter: QtGui.QPainter, pen: QtGui.QPen,
+                               antialias: bool) -> bool:
+        """
+        Tell whether ``pen`` can stroke the curve with ``QPainter.drawPolyline``.
+
+        Drawing the vertices as a polyline avoids building and keeping the
+        ``QPainterPath`` of the curve. It is only done when the result is
+        pixel-identical to drawing the path.
+
+        Parameters
+        ----------
+        painter : QtGui.QPainter
+            The active painter.
+        pen : QtGui.QPen
+            The pen about to stroke the curve.
+        antialias : bool
+            Whether the painter antialiases.
+
+        Returns
+        -------
+        bool
+            True if the polyline can be drawn instead of the path.
+        """
+        if self._exportOpts is not False or self.opts['fillLevel'] is not None:
+            return False
+        shadowPen = self.opts['shadowPen']
+        if shadowPen is not None and shadowPen.style() != QtCore.Qt.PenStyle.NoPen:
+            return False
+        # The raster engine strokes a polyline and the equivalent path alike, except
+        # with its aliased "fast pens" (cosmetic, at most 1 px wide): for a polyline,
+        # QCosmeticStroker starts the next segment from the start of a segment too
+        # short to be drawn, which moves a few pixels of dense curves.
+        if not (antialias or (pen.isCosmetic() and pen.widthF() > 1.0)):
+            return False
+        if painter.paintEngine().type() != QtGui.QPaintEngine.Type.Raster:
+            return False
+        # drawPath also fills the path with the brush of the painter
+        if painter.brush().style() != QtCore.Qt.BrushStyle.NoBrush:
+            return False
+        return self._getPolylineVertices() is not None
+
     def _getClosingSegments(self):
         # this is only used for fillOutline
         # no point caching with so few elements generated
@@ -947,7 +1232,24 @@ class PlotCurveItem(GraphicsObject):
         return paths
 
     @debug.warnOnException  ## raising an exception here causes crash
-    def paint(self, p, opt, widget):
+    def paint(self, p: QtGui.QPainter, opt: QtWidgets.QStyleOptionGraphicsItem,
+              widget: QtWidgets.QWidget | None) -> None:
+        """
+        Draw the fill and the outline of the curve.
+
+        The ``QPainterPath`` of the curve is only built when it is drawn: curves drawn
+        as line segments (see :meth:`setSegmentedLineMode`) or, when the rendering is
+        identical, as a polyline, do not need it.
+
+        Parameters
+        ----------
+        p : QtGui.QPainter
+            Painter, in item coordinates.
+        opt : QtWidgets.QStyleOptionGraphicsItem
+            Style options of the item.
+        widget : QtWidgets.QWidget or None
+            Widget being painted on, if any.
+        """
         profiler = debug.Profiler()
         if self.xData is None or len(self.xData) == 0:
             return
@@ -1044,6 +1346,10 @@ class PlotCurveItem(GraphicsObject):
                     p.drawLines(*self._getLineSegments())
                     if do_fill_outline:
                         p.drawLines(self._getClosingSegments())
+                elif self._shouldUseDrawPolyline(p, pen, aa):
+                    polyline = self._getPolyline()
+                    if len(polyline) >= 2:
+                        p.drawPolyline(polyline)
                 else:
                     if do_fill_outline:
                         path = self._getFillPath()
@@ -1273,9 +1579,14 @@ class PlotCurveItem(GraphicsObject):
 
         glstate.m_vao.release()
 
-    def clear(self):
+    def clear(self) -> None:
+        """
+        Remove the data and all derived caches (paths, segments, bounds).
+        """
         self.xData = None  ## raw values
         self.yData = None
+        # ((xmin, xmax), (ymin, ymax)) of the finite data, passed by PlotDataItem
+        self._dataBoundsHint = None
         self._lineSegments = None
         self._lineSegmentsRendered = False
         self.path = None

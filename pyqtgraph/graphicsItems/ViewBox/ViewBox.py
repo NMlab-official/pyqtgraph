@@ -111,6 +111,10 @@ class ViewBox(GraphicsWidget):
     NamedViews = weakref.WeakValueDictionary()   # name: ViewBox
     AllViews = weakref.WeakKeyDictionary()       # ViewBox: None
 
+    # True while prepareForPaint auto-ranges, see _requestPrepare. A class attribute,
+    # as _requestPrepare may run before __init__ completes.
+    _preparing = False
+
     def __init__(self, parent=None, border=None, lockAspect=False, enableMouse=True, invertY=False, enableMenu=True, name=None, invertX=False, defaultPadding=0.02):
         """
         =================  =============================================================
@@ -323,6 +327,8 @@ class ViewBox(GraphicsWidget):
             scene = self.scene()
             if scene is not None and hasattr(scene, 'sigPrepareForPaint'):
                 scene.sigPrepareForPaint.connect(self.prepareForPaint)
+                # the auto-range or the matrix may be pending already
+                self._requestPrepare()
         return ret
 
     @QtCore.Slot()
@@ -330,8 +336,32 @@ class ViewBox(GraphicsWidget):
         #autoRangeEnabled = (self.state['autoRange'][0] is not False) or (self.state['autoRange'][1] is not False)
         # don't check whether auto range is enabled here--only check when setting dirty flag.
         if self._autoRangeNeedsUpdate: # and autoRangeEnabled:
-            self.updateAutoRange()
+            # The requests this auto-range makes are served right here:
+            # updateAutoRange clears the auto-range flag and updateMatrix follows.
+            self._preparing = True
+            try:
+                self.updateAutoRange()
+            finally:
+                self._preparing = False
         self.updateMatrix()
+
+    def _requestPrepare(self) -> None:
+        """
+        Ask the scene to call :meth:`prepareForPaint` before it repaints.
+
+        Called when the auto-range or the transformation of the child group becomes
+        pending, so that they are applied before Qt computes the regions to repaint
+        (see :meth:`GraphicsScene.requestPrepare
+        <pyqtgraph.GraphicsScene.requestPrepare>`). Without it, they would only be
+        applied during the paint, which then has to be done a second time.
+        """
+        if self._preparing:
+            return
+        scene = self.scene()
+        if scene is not None:
+            requestPrepare = getattr(scene, 'requestPrepare', None)
+            if requestPrepare is not None:
+                requestPrepare()
 
     def getState(self, copy=True):
         """Return the current state of the ViewBox.
@@ -496,6 +526,7 @@ class ViewBox(GraphicsWidget):
         if ev.oldSize() != ev.newSize():
             self._viewPixelSizeCache  = None
             self._matrixNeedsUpdate = True
+            self._requestPrepare()
 
             self.linkedXChanged()
             self.linkedYChanged()
@@ -722,8 +753,10 @@ class ViewBox(GraphicsWidget):
             # disables the auto-range of the axis it changes)
             if changed[0] and self.state['autoVisibleOnly'][1] and (self.state['autoRange'][1] is not False):
                 self._autoRangeNeedsUpdate = True
+                self._requestPrepare()
             elif changed[1] and self.state['autoVisibleOnly'][0] and (self.state['autoRange'][0] is not False):
                 self._autoRangeNeedsUpdate = True
+                self._requestPrepare()
             self.sigStateChanged.emit(self)
 
     def setYRange(self, min, max, padding=None, update=True):
@@ -927,6 +960,8 @@ class ViewBox(GraphicsWidget):
 
                 self.state['autoRange'][ax] = enable
                 self._autoRangeNeedsUpdate |= (enable is not False)
+                if enable is not False:
+                    self._requestPrepare()
                 self.update()
 
         self.sigStateChanged.emit(self)
@@ -974,6 +1009,7 @@ class ViewBox(GraphicsWidget):
         """
         self._autoRangeNeedsUpdate = True
         if self._autoRangeEnabledOnAnyAxis():
+            self._requestPrepare()
             self.update()
 
     def _autoRangeEnabledOnAnyAxis(self) -> bool:
@@ -1263,6 +1299,7 @@ class ViewBox(GraphicsWidget):
 
         self.state[key] = inv
         self._matrixNeedsUpdate = True # updateViewRange won't detect this for us
+        self._requestPrepare()
         self.updateViewRange()
         self.update()
         self.sigStateChanged.emit(self)
@@ -1882,6 +1919,7 @@ class ViewBox(GraphicsWidget):
 
         if any(changed):
             self._matrixNeedsUpdate = True
+            self._requestPrepare()
             self.update()
 
             # Inform linked views that the range has changed

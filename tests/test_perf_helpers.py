@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 
 import pyqtgraph as pg
 from tests.perf_helpers import count_calls, paints_per_update
@@ -45,8 +44,6 @@ def test_count_calls_on_instance():
     assert 'method' not in vars(obj)
 
 
-# Not strict: the double repaint is observed with PyQt6 but not with every binding.
-@pytest.mark.xfail(strict=False, reason="each update can be painted twice until T2.1 lands")
 def test_paints_per_update_autorange_streaming():
     pw = pg.PlotWidget()
     pw.resize(400, 300)
