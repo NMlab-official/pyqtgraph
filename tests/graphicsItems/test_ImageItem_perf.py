@@ -11,7 +11,7 @@ import pyqtgraph as pg
 import pyqtgraph.functions as fn
 from pyqtgraph import functions_qimage
 from pyqtgraph.Qt import QtGui
-from tests.perf_helpers import count_calls
+from tests.perf_helpers import count_calls, show_and_wait
 
 app = pg.mkQApp()
 
@@ -374,8 +374,7 @@ def test_nan_image_with_downsampling():
     view.resize(80, 80)
     viewbox.addItem(item)
     item.setImage(data, levels=(0, 1), lut=pg.colormap.get('viridis').getLookupTable(nPts=256))
-    view.show()
-    app.processEvents()
+    show_and_wait(view)
     item.render()
     xds, yds = item._lastDownsample
     assert (xds, yds) != (1, 1)

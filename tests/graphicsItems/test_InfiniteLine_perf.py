@@ -10,7 +10,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -42,8 +42,7 @@ def _make_view(specs=LINE_SPECS, xRange=(0, 10), yRange=(0, 10), lineClass=pg.In
     for line in lines:
         if line.movable:
             line.setMouseHover(True)  # drawn with its (wider) hover pen
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     return widget, vb, lines
 
 

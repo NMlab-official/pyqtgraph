@@ -7,7 +7,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -16,8 +16,7 @@ app = pg.mkQApp()
 def plot():
     pw = pg.PlotWidget()
     pw.resize(400, 300)
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     yield pw
     pw.close()
 

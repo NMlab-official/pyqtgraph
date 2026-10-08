@@ -22,7 +22,7 @@ from pyqtgraph.graphicsItems.ScatterPlotItem import (
     renderSymbol,
 )
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -193,8 +193,7 @@ def _renderInView(items, xRange=(0, 10), yRange=(0, 10), size=(160, 120)):
     for item in items:
         vb.addItem(item)
     vb.setRange(xRange=xRange, yRange=yRange, padding=0)
-    view.show()
-    process_events()
+    show_and_wait(view)
     img = view.grab().toImage()
     view.close()
     return img
@@ -674,8 +673,7 @@ def test_paint_arrays_cached_until_spots_change():
     view.resize(200, 150)
     scatter = pg.ScatterPlotItem(x=rng.random(n), y=rng.random(n), size=5)
     vb.addItem(scatter)
-    view.show()
-    process_events()
+    show_and_wait(view)
     with count_calls(_SpotArrays, '__init__') as builds:
         for i in range(5):  # pans: the arrays are reused
             vb.setRange(xRange=(i * 0.1, 1 + i * 0.1), yRange=(0, 1), padding=0)
@@ -759,8 +757,7 @@ def test_device_cache_not_used_with_other_composition_modes(integral_screens):
 def _scatterRepaintsPerUpdate(pw, update, n=10, warmup=3):
     # Count the Python-level fragment preparation done by each scatter paint rather
     # than wrapping the paint virtual, which is unreliable with PySide6.
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     for i in range(warmup):
         update(i)
         process_events()

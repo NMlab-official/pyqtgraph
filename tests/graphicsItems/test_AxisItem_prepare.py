@@ -16,7 +16,12 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from tests.perf_helpers import count_calls, paints_per_update, process_events
+from tests.perf_helpers import (
+    count_calls,
+    paints_per_update,
+    process_events,
+    show_and_wait,
+)
 
 app = pg.mkQApp()
 
@@ -135,8 +140,7 @@ def test_axis_pictures_are_built_before_the_paint():
     axes = _visible_axes(plots)
     missing = []
     watcher = _PaintWatcher(lambda: missing.extend(ax for ax in axes if ax.picture is None))
-    win.show()
-    process_events(5)
+    show_and_wait(win)
     win.viewport().installEventFilter(watcher)
     try:
         for i in range(20):
@@ -154,8 +158,7 @@ def test_axis_picture_is_built_at_most_once_per_update():
     pw, update = _streaming_plot()
     plot = pw.getPlotItem()
     left, bottom = plot.getAxis('left'), plot.getAxis('bottom')
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     changes = 0
     try:
         with count_calls(left, 'drawPicture') as draws, \
@@ -197,8 +200,7 @@ def test_rendering_equals_a_full_repaint(layout):
     else:
         win, plots, update = _linked_plots(2)
     axes = _visible_axes(plots)
-    win.show()
-    process_events(5)
+    show_and_wait(win)
     try:
         for i in range(10):
             update(i)
@@ -295,8 +297,7 @@ def test_hidden_axes_are_not_prepared():
     pw = pg.PlotWidget(size=(300, 200))
     curve = pw.plot(np.arange(10.0))
     plot = pw.getPlotItem()
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     top, right = plot.getAxis('top'), plot.getAxis('right')
     try:
         with count_calls(top, 'generateDrawSpecs') as topSpecs, \
