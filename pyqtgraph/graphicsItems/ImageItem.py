@@ -108,6 +108,9 @@ class ImageItem(GraphicsObject):
     sigImageChanged = QtCore.Signal()
     sigRemoveRequested = QtCore.Signal(object) 
 
+    # largest Indexed8 image of which a Format_ARGB32 copy is kept for repeated paints
+    _maxConvertedPixels = 1 << 24
+
     def __init__(self, image: np.ndarray | None=None, **kwargs):
         super().__init__()
         self.menu = None
@@ -132,6 +135,8 @@ class ImageItem(GraphicsObject):
         self._imageNanMask = None  # uint8, 255 at the NaN pixels of a mono image
         self._resampledLutCache = _LutDerivedCache()  # 256-entry equivalents of luts
         self._nanIndexLutCache = _LutDerivedCache()  # luts leaving index 255 free
+        self._paintedQImageKey = None  # cacheKey of the last painted qimage
+        self._convertedQImage = None   # (cacheKey, Format_ARGB32 copy) of an Indexed8 qimage
         self._defaultAutoLevels = True
 
         self.axisOrder = getConfigOption('imageAxisOrder')
@@ -561,6 +566,7 @@ class ImageItem(GraphicsObject):
         Clear the assigned image.
         """
         self.image = None
+        self._convertedQImage = None
         self.prepareGeometryChange()
         self.informViewBoundsChanged()
         self.update()
@@ -796,6 +802,7 @@ class ImageItem(GraphicsObject):
         Convert the image data to the QImage displayed by :meth:`paint`.
         """
         self._unrenderable = True
+        self._convertedQImage = None  # made from the previous qimage
         if self.image is None or self.image.size == 0:
             return
 
@@ -994,7 +1001,17 @@ class ImageItem(GraphicsObject):
             image, levels=levels, lut=table, merged=merged, nanMask=self._imageNanMask
         )
 
-    def paint(self, painter: QtGui.QPainter, *args):
+    def paint(self, painter: QtGui.QPainter, *args) -> None:
+        """
+        Draw the image, rendering it first if needed, and the border.
+
+        Parameters
+        ----------
+        painter : QtGui.QPainter
+            Painter, with the item coordinate system.
+        *args
+            Style option and widget, unused.
+        """
         profile = debug.Profiler()
         if self.image is None:
             return
@@ -1012,11 +1029,48 @@ class ImageItem(GraphicsObject):
             if self.axisOrder == 'col-major'
             else self.image.shape[:2][::-1]
         )
-        painter.drawImage(QtCore.QRectF(0, 0, *shape), self.qimage)
+        painter.drawImage(QtCore.QRectF(0, 0, *shape), self._paintedQImage())
         profile('p.drawImage')
         if self.border is not None:
             painter.setPen(self.border)
             painter.drawRect(self.boundingRect())
+
+    def _paintedQImage(self) -> QtGui.QImage:
+        """
+        Return the image to draw: :attr:`qimage` or, if painted again, a faster copy.
+
+        Qt converts the colors of an Indexed8 image at every paint. From the second
+        paint of the same Indexed8 image on, a Format_ARGB32 copy is drawn instead:
+        about 4 times faster, with the same pixels on premultiplied and RGB32 devices
+        (the premultiplied formats would be faster still, but are sampled differently
+        when scaled). An image painted once, e.g. while streaming, is not copied. Images
+        sharing their memory with the data, which show changes made to the data in
+        place, and images larger than `_maxConvertedPixels` are not copied either.
+
+        Returns
+        -------
+        QtGui.QImage
+            The image to draw.
+        """
+        qimage = self.qimage
+        if qimage.format() != QtGui.QImage.Format.Format_Indexed8:
+            return qimage
+        key = qimage.cacheKey()
+        if self._convertedQImage is not None and self._convertedQImage[0] == key:
+            return self._convertedQImage[1]
+        if self._paintedQImageKey != key:
+            self._paintedQImageKey = key
+            return qimage
+        data = getattr(qimage, 'data', None)
+        if (
+            data is None
+            or qimage.width() * qimage.height() > self._maxConvertedPixels
+            or (self._xp is np and np.may_share_memory(data, self.image))
+        ):
+            return qimage
+        converted = qimage.convertToFormat(QtGui.QImage.Format.Format_ARGB32)
+        self._convertedQImage = (key, converted)
+        return converted
 
     def save(self, fileName: str | pathlib.Path, *args, **kwargs) -> None:
         """
