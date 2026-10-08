@@ -1021,7 +1021,7 @@ def _candle_layout_results(data: dict[str, np.ndarray], n: int,
     Parameters
     ----------
     data : dict of numpy.ndarray
-        Candles, as returned by :func:`_candles`, at least ``n + 12`` of them.
+        Candles, as returned by :func:`_candles`, at least ``n + 24`` of them.
     n : int
         Number of candles shown at first; the following ones are streamed.
     nvol : int
@@ -1030,7 +1030,9 @@ def _candle_layout_results(data: dict[str, np.ndarray], n: int,
     Returns
     -------
     list of Result
-        Pan step of a 200-candle window, and streaming frame, with paints per step.
+        Pan step of a 200-candle window, and streaming frame with the new volume bar
+        appended (``BarGraphItem.appendData``) or all volume bars set again
+        (``setOpts``), with paints per step.
     """
     results = []
     w = pg.GraphicsLayoutWidget(size=(1400, 900))
@@ -1071,19 +1073,31 @@ def _candle_layout_results(data: dict[str, np.ndarray], n: int,
                            'bar paints/step': bp.count / steps}))
     state = {'k': n}
 
-    def stream() -> None:
-        k = state['k']
-        state['k'] = k + 1
-        candles.appendData(**_one_candle(data, k))
-        bars.setOpts(**volume_opts(k + 1))
-        price.setXRange(x[k - 199] - 30.0, x[k] + 30.0, padding=0)
-        _process(2)
+    def append_volume(k: int) -> None:
+        bars.appendData(x=x[k:k + 1], height=heights[k:k + 1], brushes=brushes[k:k + 1])
 
-    with _counters((pg.CandlestickItem, 'paint'), (pg.BarGraphItem, 'paint')) as (cp, bp):
-        ms, frames = _timed(stream, repeat=10)
-    results.append(Result(f'{label}, stream 1 candle]', ms, 'ms/frame',
-                          {'candle paints/frame': cp.count / frames,
-                           'bar paints/frame': bp.count / frames}))
+    def set_volume(k: int) -> None:
+        bars.setOpts(**volume_opts(k + 1))
+
+    def streaming(update_volume: Callable[[int], None]) -> Callable[[], None]:
+        def stream() -> None:
+            k = state['k']
+            state['k'] = k + 1
+            candles.appendData(**_one_candle(data, k))
+            update_volume(k)
+            price.setXRange(x[k - 199] - 30.0, x[k] + 30.0, padding=0)
+            _process(2)
+        return stream
+
+    variants = (('stream 1 candle', append_volume),
+                ('stream 1 candle, volume setOpts', set_volume))
+    for variant, update_volume in variants:
+        with _counters((pg.CandlestickItem, 'paint'),
+                       (pg.BarGraphItem, 'paint')) as (cp, bp):
+            ms, frames = _timed(streaming(update_volume), repeat=10)
+        results.append(Result(f'{label}, {variant}]', ms, 'ms/frame',
+                              {'candle paints/frame': cp.count / frames,
+                               'bar paints/frame': bp.count / frames}))
     w.close()
     return results
 
@@ -1098,8 +1112,9 @@ def s13_candlesticks(full: bool) -> list[Result]:
     trading UI, the candles are shown above a volume BarGraphItem holding the last
     5e5 candles (one brush per direction), with linked x, DateAxisItems and
     ``setAutoVisible(y=True)`` on both plots: one pan step of a 200-candle window,
-    and one streaming frame (one candle appended, the volume bars set again and the
-    view following the last candle).
+    and one streaming frame (one candle and its volume bar appended, and the view
+    following the last candle). For comparison, the ``volume setOpts`` variant sets
+    the volume bars of the last 5e5 candles again instead of appending one.
 
     Parameters
     ----------
