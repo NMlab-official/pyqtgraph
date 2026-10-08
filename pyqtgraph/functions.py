@@ -1903,6 +1903,91 @@ def _compute_backfill_indices(isfinite):
         return None
 
 
+# _arrayToQPath_all builds long paths by chunks of this many points, joined with
+# QPainterPath.connectPath, when there are at least _ARRAYTOQPATH_MINCHUNKS chunks.
+_ARRAYTOQPATH_CHUNKSIZE = 10000
+_ARRAYTOQPATH_MINCHUNKS = 3
+
+
+def _qpointf_fuzzy_equal(x1: float, y1: float, x2: float, y2: float) -> bool:
+    """
+    Compare two points like ``QPointF.operator==``, i.e. with ``qFuzzyCompare``.
+
+    Parameters
+    ----------
+    x1, y1 : float
+        Coordinates of the first point.
+    x2, y2 : float
+        Coordinates of the second point.
+
+    Returns
+    -------
+    bool
+        True if Qt considers both points equal.
+    """
+    def fuzzy_equal(a: float, b: float) -> bool:
+        if a == 0.0 or b == 0.0:
+            return abs(a - b) <= 1e-12
+        return abs(a - b) * 1e12 <= min(abs(a), abs(b))
+
+    return fuzzy_equal(x1, x2) and fuzzy_equal(y1, y2)
+
+
+def _arrayToQPath_all_vertices(
+    x: np.ndarray, y: np.ndarray, finiteCheck: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return the vertices of the polyline built by ``_arrayToQPath_all``.
+
+    Drawing these vertices with ``QPainter.drawPolyline`` strokes the same polyline
+    as drawing the path. Besides the removal of the non-finite points, the chunked
+    construction of the path has two effects, reproduced here:
+
+    - ``QPainterPath.connectPath`` drops the first point of a chunk when Qt considers
+      it equal to the last point of the previous chunk;
+    - a final chunk made of a single point is ignored by ``connectPath``.
+
+    Parameters
+    ----------
+    x, y : np.ndarray
+        Coordinates of the points, of shape (N,).
+    finiteCheck : bool
+        Remove the points with a non-finite coordinate, as ``_arrayToQPath_all``.
+
+    Returns
+    -------
+    x, y : np.ndarray
+        Coordinates of the vertices. They are the input arrays themselves when no point
+        is removed. Fewer than 2 vertices means that the path is empty.
+    """
+    if finiteCheck:
+        isfinite = np.isfinite(x) & np.isfinite(y)
+        if not isfinite.all():
+            x = x[isfinite]
+            y = y[isfinite]
+
+    n = x.shape[0]
+    chunksize = _ARRAYTOQPATH_CHUNKSIZE
+    numchunks = (n + chunksize - 1) // chunksize
+    if n < 2 or numchunks < _ARRAYTOQPATH_MINCHUNKS:
+        return x, y
+
+    drop = []
+    for start in range(chunksize, n, chunksize):
+        if n - start == 1:
+            # connectPath ignores a path made of a single MoveTo element
+            drop.append(start)
+        elif _qpointf_fuzzy_equal(float(x[start - 1]), float(y[start - 1]),
+                                  float(x[start]), float(y[start])):
+            drop.append(start)
+    if drop:
+        keep = np.ones(n, dtype=bool)
+        keep[drop] = False
+        x = x[keep]
+        y = y[keep]
+    return x, y
+
+
 def _arrayToQPath_all(x, y, finiteCheck):
     n = x.shape[0]
     if n == 0:
@@ -1918,9 +2003,9 @@ def _arrayToQPath_all(x, y, finiteCheck):
     if n < 2:
         return QtGui.QPainterPath()
 
-    chunksize = 10000
+    chunksize = _ARRAYTOQPATH_CHUNKSIZE
     numchunks = (n + chunksize - 1) // chunksize
-    minchunks = 3
+    minchunks = _ARRAYTOQPATH_MINCHUNKS
 
     if numchunks < minchunks:
         # too few chunks, batching would be a pessimization
