@@ -7,7 +7,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -336,8 +336,7 @@ def test_autorange_is_applied_before_the_paint():
 def test_hidden_view_defers_the_prepare():
     pw = pg.PlotWidget(size=(300, 200))
     curve = pw.plot(np.arange(10.0))
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     pw.hide()
     vb = pw.getViewBox()
     before = vb.viewRange()
@@ -349,8 +348,7 @@ def test_hidden_view_defers_the_prepare():
         # as before, a hidden plot does not auto-range until it is painted again
         assert calls == []
         assert vb.viewRange() == before
-        pw.show()
-        process_events(5)
+        show_and_wait(pw)
         assert vb.viewRange()[1][1] >= 90
     finally:
         pw.close()

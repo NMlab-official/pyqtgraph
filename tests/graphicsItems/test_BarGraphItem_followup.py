@@ -11,6 +11,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.exporters import CSVExporter
+from tests.perf_helpers import show_and_wait
 
 app = pg.mkQApp()
 
@@ -167,9 +168,7 @@ def test_autoVisible_y_fits_visible_bars_when_panning():
     pw.resize(400, 300)
     item = pg.BarGraphItem(x=x, height=heights, width=0.6)
     pw.addItem(item)
-    pw.show()
-    for _ in range(3):
-        app.processEvents()
+    show_and_wait(pw)
     assert pw.viewRange()[1][1] >= n
     pw.setAutoVisible(y=True)
     vb = pw.getViewBox()
