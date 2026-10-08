@@ -805,6 +805,40 @@ class BarGraphItem(GraphicsObject):
     def getData(self):
         return self.opts.get('x'),  self.opts.get('height')
 
+    def getOriginalDataset(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """
+        Positions and heights of the bars, one value per bar, e.g. for
+        :class:`~pyqtgraph.exporters.CSVExporter`.
+
+        These are the ``x`` and ``height`` options returned by :meth:`getData`, as
+        float arrays with one value per bar (a scalar option is repeated). When the
+        bars were not given by ``x`` (but by ``x0``, ``x1`` and ``width``) their
+        centers are returned, and when they were not given by ``height`` (but by
+        ``y1``) their signed heights ``y1 - y0``.
+
+        Returns
+        -------
+        x : numpy.ndarray or None
+            Center of each bar, or ``None`` without bars.
+        height : numpy.ndarray or None
+            Height of each bar, or ``None`` without bars.
+        """
+        nbars = len(self._rectarray)
+        if nbars == 0:
+            return None, None
+        x, height = self.getData()
+        if x is None:
+            memory = self._rectarray.ndarray()
+            x = memory[:, 0] + 0.5 * memory[:, 2]
+        if height is None:
+            # setOpts has checked that y1 is given; y0 defaults to 0 without height
+            y0 = self.opts.get('y0')
+            height = (np.asarray(self.opts['y1'], dtype=np.float64)
+                      - (0.0 if y0 is None else np.asarray(y0, dtype=np.float64)))
+        return tuple(
+            np.broadcast_to(np.asarray(values, dtype=np.float64), (nbars,)).copy()
+            for values in (x, height))
+
     def dataBounds(self, ax: int, frac: float = 1.0,
                    orthoRange: tuple[float, float] | None = None
                    ) -> tuple[float | None, float | None]:

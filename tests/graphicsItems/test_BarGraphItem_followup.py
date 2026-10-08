@@ -1,13 +1,16 @@
 """
 Follow-up tests of BarGraphItem: data bounds restricted to a range of the other axis
-(``ViewBox.setAutoVisible``) and percentile bounds.
+(``ViewBox.setAutoVisible``), percentile bounds and CSV export.
 
 Values are asserted, never timings.
 """
+import csv
+
 import numpy as np
 import pytest
 
 import pyqtgraph as pg
+from pyqtgraph.exporters import CSVExporter
 
 app = pg.mkQApp()
 
@@ -188,3 +191,55 @@ def test_autoVisible_y_fits_visible_bars_when_panning():
             app.processEvents()
         checkFitsVisibleBars()
     pw.close()
+
+
+def test_getOriginalDataset():
+    x = np.arange(4.)
+    heights = np.array([3., -1, 2, 5])
+    item = pg.BarGraphItem(x=x, height=heights, width=0.5)
+    ox, oh = item.getOriginalDataset()
+    np.testing.assert_array_equal(ox, x)
+    np.testing.assert_array_equal(oh, heights)
+    assert ox.dtype == oh.dtype == np.float64
+    # scalar options are repeated, integer sequences converted
+    item = pg.BarGraphItem(x=range(3), height=2, width=0.5)
+    np.testing.assert_array_equal(item.getOriginalDataset()[0], [0, 1, 2])
+    np.testing.assert_array_equal(item.getOriginalDataset()[1], [2, 2, 2])
+    # bars given by their edges: centers and signed heights y1 - y0
+    item = pg.BarGraphItem(x0=[0., 2], x1=[1., 4], y0=[1., 1], y1=[4., -1])
+    np.testing.assert_array_equal(item.getOriginalDataset()[0], [0.5, 3])
+    np.testing.assert_array_equal(item.getOriginalDataset()[1], [3, -2])
+    item = pg.BarGraphItem(x1=[1., 4], width=1, y1=[4., 5])
+    np.testing.assert_array_equal(item.getOriginalDataset()[0], [0.5, 3.5])
+    np.testing.assert_array_equal(item.getOriginalDataset()[1], [4, 5])
+    # the result is a copy
+    item = pg.BarGraphItem(x=x, height=heights, width=0.5)
+    item.getOriginalDataset()[1][0] = 100
+    assert heights[0] == 3
+    assert pg.BarGraphItem(x=[], height=[], width=1).getOriginalDataset() == (None, None)
+
+
+def test_csv_export_of_bars_and_candles(tmp_path):
+    plot = pg.PlotItem()
+    x = np.arange(5.)
+    volume = np.array([10., 30, 20, 50, 40])
+    plot.addItem(pg.BarGraphItem(x=x, height=volume, width=0.6, name='volume'))
+    close = np.array([101., 102, 100.5, 103, 104])
+    candles = pg.CandlestickItem(x=x[::-1], open=close[::-1] - 1, high=close[::-1] + 2,
+                                 low=close[::-1] - 2, close=close[::-1], name='price')
+    plot.addItem(candles)
+    plot.addItem(pg.BarGraphItem(x0=[0., 2, 4], x1=[1., 3, 5], height=[1., 2, 3]))
+    plot.addItem(pg.BarGraphItem(x=[], height=[], width=1))  # no data: skipped
+
+    fileName = tmp_path / 'bars.csv'
+    CSVExporter(plot).export(fileName=str(fileName))
+    with open(fileName, newline='') as file:
+        rows = list(csv.reader(file))
+    assert rows[0] == ['volume_x', 'volume_y', 'price_x', 'price_y', 'x0002', 'y0002']
+    values = [[float(v) if v else None for v in row] for row in rows[1:]]
+    assert len(values) == 5
+    columns = list(zip(*values))
+    assert columns[0] == tuple(x) and columns[1] == tuple(volume)
+    assert columns[2] == tuple(x) and columns[3] == tuple(close)  # sorted by x
+    assert columns[4] == (0.5, 2.5, 4.5, None, None)
+    assert columns[5] == (1, 2, 3, None, None)
