@@ -800,6 +800,9 @@ class PlotDataItem(GraphicsObject):
         self._sentDisplayData: tuple[np.ndarray, np.ndarray] | None = None
         # names of the _PLOT_DEFAULT_OPTS options set explicitly on this item
         self._explicitOpts: set[str] = set()
+        # True while a style change has not been forwarded to the curve and scatter
+        # plot yet (they are only updated when there is data to show)
+        self._styleDirty = True
         # extremes of the blocks of the 'peak' downsampling
         self._peakCache: _PeakBlockCache | None = None
         # (ds, start, end) of the current display data, see _displaySelection
@@ -1668,9 +1671,14 @@ class PlotDataItem(GraphicsObject):
         data or graphics style has been updated. It is not usually necessary to call this
         from user code. 
 
-        When `styleUpdate` is ``False`` and the displayed `x` and `y` arrays are the
-        same objects as those last forwarded, the curve and scatter plot are already up
-        to date and are left untouched.
+        Styles are forwarded only when they changed: the curve and the scatter plot
+        keep them across data updates. Per-point scatter styles (lists or arrays of
+        symbols, pens, brushes or sizes, and the point `data`) are forwarded with every
+        data update, since :meth:`ScatterPlotItem.setData
+        <pyqtgraph.ScatterPlotItem.setData>` discards them. When `styleUpdate` is
+        ``False`` and the displayed `x` and `y` arrays are the same objects as those
+        last forwarded, the curve and scatter plot are already up to date and are left
+        untouched.
 
         Parameters
         ----------
@@ -1679,8 +1687,11 @@ class PlotDataItem(GraphicsObject):
         """
         # the latest data is applied now: a deferred update is no longer needed
         self._cancelDisplayFlush()
+        # a style change that could not be forwarded yet (no data) is still pending
+        styleUpdate = bool(styleUpdate or self._styleDirty)
         dataset = self._getDisplayDataset()
         if dataset is None:  # then we have nothing to show
+            self._styleDirty = styleUpdate
             self._sentDisplayData = None
             self._curve.hide()
             self._scatter.hide()
@@ -1696,14 +1707,7 @@ class PlotDataItem(GraphicsObject):
             # without dynamic range clipping): forwarding them again would only discard
             # the cached path of the curve and the styles of the scatter plot.
             return
-
-        # override styleUpdate request and always enforce update until we have a
-        # better solution for:
-        # - ScatterPlotItem losing per-point style information
-        # - PlotDataItem performing multiple unnecessary setData calls on initialization
-        # See: https://github.com/pyqtgraph/pyqtgraph/pull/1653
-        if not styleUpdate:
-            styleUpdate = True
+        self._styleDirty = False
 
         curveArgs = {}
         scatterArgs = {}
@@ -1716,9 +1720,7 @@ class PlotDataItem(GraphicsObject):
                 ('fillOutline', 'fillOutline'),
                 ('fillBrush', 'brush'),
                 ('antialias', 'antialias'),
-                ('connect', 'connect'),
                 ('stepMode', 'stepMode'),
-                ('skipFiniteCheck', 'skipFiniteCheck')
             ]:
                 if k in self.opts:
                     curveArgs[v] = self.opts[k]
@@ -1728,13 +1730,28 @@ class PlotDataItem(GraphicsObject):
                 ('symbolBrush', 'brush'),
                 ('symbol', 'symbol'),
                 ('symbolSize', 'size'),
-                ('data', 'data'),
                 ('pxMode', 'pxMode'),
                 ('antialias', 'antialias'),
                 ('useCache', 'useCache')
             ]:
                 if k in self.opts:
                     scatterArgs[v] = self.opts[k]
+        else:
+            # ScatterPlotItem.setData discards the per-point styles: repeat them
+            for k, v in [
+                ('symbolPen', 'pen'),
+                ('symbolBrush', 'brush'),
+                ('symbol', 'symbol'),
+                ('symbolSize', 'size'),
+            ]:
+                if isinstance(self.opts[k], (list, np.ndarray)):
+                    scatterArgs[v] = self.opts[k]
+        if self.opts['data'] is not None:
+            # point data is stored per point as well
+            scatterArgs['data'] = self.opts['data']
+        # the connection mode depends on the data (see 'auto' below)
+        curveArgs['connect'] = self.opts['connect']
+        curveArgs['skipFiniteCheck'] = self.opts['skipFiniteCheck']
 
         self._sentDisplayData = (dataset.x, dataset.y)
         x = dataset.x
