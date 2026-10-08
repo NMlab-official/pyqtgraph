@@ -45,7 +45,8 @@ def test_count_calls_on_instance():
     assert 'method' not in vars(obj)
 
 
-@pytest.mark.xfail(strict=True, reason="each update is painted twice until T2.1 lands")
+# Not strict: the double repaint is observed with PyQt6 but not with every binding.
+@pytest.mark.xfail(strict=False, reason="each update can be painted twice until T2.1 lands")
 def test_paints_per_update_autorange_streaming():
     pw = pg.PlotWidget()
     pw.resize(400, 300)
