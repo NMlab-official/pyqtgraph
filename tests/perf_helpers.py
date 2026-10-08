@@ -8,11 +8,13 @@ performance regression shows up as a changed count.
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Callable, Iterator
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-__all__ = ['CallCounter', 'count_calls', 'process_events', 'paints_per_update']
+__all__ = ['CallCounter', 'count_calls', 'process_events', 'show_and_wait',
+           'paints_per_update']
 
 # Wrappers of the restored counters, kept alive on purpose. PySide6 caches, per object,
 # the Python override of a C++ virtual method (e.g. ``paint``) found at its first call
@@ -124,6 +126,35 @@ def process_events(passes: int = 3) -> None:
         app.processEvents()
 
 
+def show_and_wait(widget: QtWidgets.QWidget, timeout: int = 5000) -> None:
+    """
+    Show a widget and wait until its window is exposed, then process events.
+
+    On some platforms (macOS in particular) a window shown by ``show()`` is exposed,
+    and receives its first paint events, only some time later: tests counting paints
+    or reading the view state right after ``show()`` must wait for it.
+
+    Events are processed as by :func:`process_events` while waiting.
+    ``QTest.qWaitForWindowExposed`` is not used: it also runs the deferred deletions
+    of Qt, after which PySide6 crashed when later tests destroyed their widgets.
+
+    Parameters
+    ----------
+    widget : QtWidgets.QWidget
+        Widget to show.
+    timeout : int, default 5000
+        Maximum waiting time in milliseconds.
+    """
+    widget.show()
+    window = widget.window().windowHandle()
+    app = QtWidgets.QApplication.instance()
+    deadline = time.monotonic() + timeout / 1000
+    while window is not None and not window.isExposed() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    process_events(5)
+
+
 class _PaintEventCounter(QtCore.QObject):
     """
     Event filter counting the paint events received by the objects it is installed on.
@@ -195,8 +226,7 @@ def paints_per_update(widget: QtWidgets.QWidget, item_class: type | None,
         target = widget.viewport()
     else:
         target = widget
-    widget.show()
-    process_events(5)
+    show_and_wait(widget)
     for i in range(warmup):
         update_fn(i)
         process_events()

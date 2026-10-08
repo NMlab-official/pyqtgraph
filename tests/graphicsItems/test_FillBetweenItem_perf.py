@@ -9,7 +9,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -302,8 +302,7 @@ def test_single_rebuild_per_frame(itemClass):
     fill = pg.FillBetweenItem(upper, lower, brush=(50, 50, 200, 80))
     for item in (upper, lower, fill):
         pw.addItem(item)
-    pw.show()
-    process_events()
+    show_and_wait(pw)
     with count_calls(pg.FillBetweenItem, 'updatePath') as rebuilds:
         for k in range(3):
             upper.setData(x, y + 2.0 + k)

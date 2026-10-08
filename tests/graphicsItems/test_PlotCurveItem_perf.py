@@ -410,6 +410,16 @@ def test_exposed_whole_curve_drawn(setup):
     assert slices == []
 
 
+# Reading the screen back with QScreen.grabWindow is reliable with the offscreen and
+# X11 platforms only: macOS composites windows asynchronously, and some macOS runners
+# return the whole screen.
+_screenReadback = pytest.mark.skipif(
+    QtWidgets.QApplication.platformName() not in ('offscreen', 'xcb'),
+    reason="reads back the window with QScreen.grabWindow",
+)
+
+
+@_screenReadback
 def test_view_partial_repaint():
     # a cursor line moving over a long curve repaints a few vertices of it, and the
     # screen shows the same pixels as after a full repaint
@@ -603,6 +613,7 @@ def rng_indices(n, fraction, seed=1):
     return np.flatnonzero(np.random.default_rng(seed).random(n) < fraction)
 
 
+@_screenReadback
 def test_view_partial_repaint_filled():
     # a cursor line over a filled curve fills a few chunks and draws a few vertices,
     # and the screen shows the same pixels as after a full repaint

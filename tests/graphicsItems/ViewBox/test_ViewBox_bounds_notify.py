@@ -1,7 +1,7 @@
 import numpy as np
 
 import pyqtgraph as pg
-from tests.perf_helpers import process_events
+from tests.perf_helpers import process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -10,8 +10,7 @@ def _plot(curve):
     pw = pg.PlotWidget()
     pw.resize(300, 200)
     pw.addItem(curve)
-    pw.show()
-    process_events()
+    show_and_wait(pw)
     return pw
 
 
