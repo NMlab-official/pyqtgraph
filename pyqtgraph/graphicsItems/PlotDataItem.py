@@ -111,9 +111,9 @@ class PlotDataset:
         self.yAllFinite = yAllFinite
         self.connect = connect
         self._dataRect = None
-        # ((xmin, xmax), (ymin, ymax)) of the finite values, as float. None if not
-        # computed yet, or if an axis holds no finite value.
-        self._finiteBoundsCache: tuple[tuple[float, float], tuple[float, float]] | None = None
+        # (xmin, xmax, ymin, ymax) of the finite values, as float (NaN for an axis
+        # without finite value). None if not computed yet.
+        self._bounds: tuple[float, float, float, float] | None = None
 
         if isinstance(x, np.ndarray) and x.dtype.kind in 'iu':
             self.xAllFinite = True
@@ -140,13 +140,58 @@ class PlotDataset:
             return None
         xmin, xmax, self.xAllFinite = self._getArrayBounds(self.x, self.xAllFinite)
         ymin, ymax, self.yAllFinite = self._getArrayBounds(self.y, self.yAllFinite)
+        self._setBounds(xmin, xmax, ymin, ymax)
+
+    def _setBounds(self, xmin: float, xmax: float, ymin: float, ymax: float) -> None:
+        """
+        Store the bounds of the finite values and the derived bounding rectangle.
+
+        Parameters
+        ----------
+        xmin, xmax : float
+            Bounds of the finite `x` values, ``NaN`` if there are none.
+        ymin, ymax : float
+            Bounds of the finite `y` values, ``NaN`` if there are none.
+        """
+        self._bounds = (float(xmin), float(xmax), float(ymin), float(ymax))
         self._dataRect = QtCore.QRectF(
-            QtCore.QPointF(xmin, ymin),
-            QtCore.QPointF(xmax, ymax)
+            QtCore.QPointF(self._bounds[0], self._bounds[2]),
+            QtCore.QPointF(self._bounds[1], self._bounds[3])
         )
-        bounds = (float(xmin), float(xmax), float(ymin), float(ymax))
-        if all(math.isfinite(b) for b in bounds):
-            self._finiteBoundsCache = (bounds[:2], bounds[2:])
+
+    def _appended(self, x: np.ndarray, y: np.ndarray) -> 'PlotDataset':
+        """
+        Create the dataset of this data followed by more points.
+
+        If the bounds of this dataset are known, those of the new dataset are derived
+        from them and from the new points only.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            All `x` values. The leading values must be equal to ``self.x``.
+        y : np.ndarray
+            All `y` values. The leading values must be equal to ``self.y``.
+
+        Returns
+        -------
+        PlotDataset
+            The dataset of the extended data.
+        """
+        dataset = PlotDataset(x, y, self.xAllFinite, self.yAllFinite)
+        if self._bounds is None:
+            return dataset
+        n = len(self.x)
+        xmin, xmax, x_finite = self._getArrayBounds(x[n:], None)
+        ymin, ymax, y_finite = self._getArrayBounds(y[n:], None)
+        # fmin and fmax ignore NaN, the bound of an axis without finite values
+        dataset.xAllFinite = bool(self.xAllFinite and x_finite)
+        dataset.yAllFinite = bool(self.yAllFinite and y_finite)
+        dataset._setBounds(
+            np.fmin(self._bounds[0], xmin), np.fmax(self._bounds[1], xmax),
+            np.fmin(self._bounds[2], ymin), np.fmax(self._bounds[3], ymax)
+        )
+        return dataset
 
     def _getArrayBounds(
         self,
@@ -203,9 +248,13 @@ class PlotDataset:
             ``((xmin, xmax), (ymin, ymax))`` of the finite values, or ``None`` if an
             axis holds no finite value.
         """
-        if self._dataRect is None:
+        if self._bounds is None:
             self._updateDataRect()
-        return self._finiteBoundsCache
+            if self._bounds is None:
+                return None
+        if not all(math.isfinite(b) for b in self._bounds):
+            return None
+        return self._bounds[:2], self._bounds[2:]
 
     def dataRect(self) -> QtCore.QRectF | None:
         """
@@ -259,6 +308,104 @@ class PlotDataset:
             else:
                 all_y_finite = True
             self.yAllFinite = all_y_finite
+
+
+class _PeakBlockCache:
+    """
+    Cache of the extremes of fixed-size blocks of an array.
+
+    Block ``b`` covers the values ``b * ds`` to ``(b + 1) * ds - 1``. Only complete
+    blocks are cached. The extremes are computed on demand for a contiguous range of
+    blocks, which grows as further blocks are requested, e.g. while panning or while
+    data is appended.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        The data.
+    ds : int
+        Number of values per block.
+    """
+
+    def __init__(self, y: np.ndarray, ds: int) -> None:
+        self.y = y
+        self.ds = ds
+        # computed range of blocks [_lo, _hi)
+        self._lo = 0
+        self._hi = 0
+        self._max = np.empty(0, dtype=y.dtype)
+        self._min = np.empty(0, dtype=y.dtype)
+        self.computedBlocks = 0  # total number of block extremes computed
+
+    def extend(self, y: np.ndarray) -> None:
+        """
+        Replace the data by a longer array starting with the same values.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            The extended data. Its leading values must be equal to the current data.
+        """
+        self.y = y
+
+    def blocks(self, first: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Get the maxima and minima of a range of complete blocks.
+
+        Parameters
+        ----------
+        first : int
+            First block.
+        end : int
+            End of the range, excluded. ``end * ds`` must not exceed the data length.
+
+        Returns
+        -------
+        maxima, minima : np.ndarray
+            Extremes of the blocks ``first`` to ``end - 1``. These are views of the
+            cache.
+        """
+        if end <= first:
+            return self._max[:0], self._min[:0]
+        if end > len(self._max):
+            # grow the storage geometrically; untouched pages are not committed
+            size = max(end, 2 * len(self._max))
+            for name in ('_max', '_min'):
+                old = getattr(self, name)
+                new = np.empty(size, dtype=old.dtype)
+                new[self._lo:self._hi] = old[self._lo:self._hi]
+                setattr(self, name, new)
+        if end < self._lo or first > self._hi:
+            # disjoint from the computed range: restart from the requested range
+            self._compute(first, end)
+            self._lo, self._hi = first, end
+        else:
+            if first < self._lo:
+                self._compute(first, self._lo)
+                self._lo = first
+            if end > self._hi:
+                self._compute(self._hi, end)
+                self._hi = end
+        return self._max[first:end], self._min[first:end]
+
+    def _compute(self, first: int, end: int) -> None:
+        """
+        Compute the extremes of a range of blocks.
+
+        Parameters
+        ----------
+        first : int
+            First block.
+        end : int
+            End of the range, excluded.
+        """
+        if end <= first:
+            return
+        ds = self.ds
+        blocks = self.y[first * ds:end * ds].reshape(end - first, ds)
+        np.max(blocks, axis=1, out=self._max[first:end])
+        np.min(blocks, axis=1, out=self._min[first:end])
+        self.computedBlocks += end - first
 
 
 class PlotDataItem(GraphicsObject):
@@ -643,6 +790,12 @@ class PlotDataItem(GraphicsObject):
         self._sentDisplayData: tuple[np.ndarray, np.ndarray] | None = None
         # names of the _PLOT_DEFAULT_OPTS options set explicitly on this item
         self._explicitOpts: set[str] = set()
+        # extremes of the blocks of the 'peak' downsampling
+        self._peakCache: _PeakBlockCache | None = None
+        # growth buffers of appendData, and the views of them in use
+        self._appendBuffers: tuple[np.ndarray, np.ndarray] | None = None
+        # True if the x values were generated as the index of the y values
+        self._implicitX = False
         self._adsLastValue = 1
         # self.clear()
         self.opts = {
@@ -1432,6 +1585,7 @@ class PlotDataItem(GraphicsObject):
             if not isinstance(y, np.ndarray):
                 y = np.array(y)
             yData = y.view(np.ndarray)
+            implicit_x = x is None
             if x is None:
                 x = np.arange(len(y))
                 
@@ -1444,14 +1598,19 @@ class PlotDataItem(GraphicsObject):
 
         if xData is None or yData is None:
             self._dataset = None
+            self._implicitX = False
         else:
             self._dataset = PlotDataset( xData, yData )
+            self._implicitX = implicit_x
         # invalidate mapped data , will be generated in getData() / _getDisplayDataset()
         self._datasetMapped  = None
         # invalidate display data, will be generated in getData() / _getDisplayDataset()
         self._datasetDisplay = None
         # new data is always forwarded to the curve and scatter plot items
         self._sentDisplayData = None
+        # data derived from the previous data is released
+        self._peakCache = None
+        self._appendBuffers = None
         # reset auto-downsample value
         self._adsLastValue   = 1
 
@@ -1605,6 +1764,150 @@ class PlotDataItem(GraphicsObject):
         dataset = self._dataset
         return (None, None) if dataset is None else (dataset.x, dataset.y)
 
+    def appendData(self, *args, **kwargs) -> None:
+        """
+        Append points to the data.
+
+        This is the efficient way to stream data: the points are copied into internal
+        buffers whose capacity grows geometrically, so that appending is O(1)
+        amortized in the number of points already held. The data bounds are updated
+        from the new points only, and the extremes of the blocks drawn by the 'peak'
+        downsampling method are kept, so that only the new blocks are computed.
+
+        With an active data mapping (FFT, derivative, phase map, mean subtraction or
+        log mode), ``stepMode='center'``, a `connect` array, or boolean data, the data
+        is concatenated and set with :meth:`setData` instead. Per-point style lists
+        (e.g. `symbolBrush`) are not extended.
+
+        Parameters
+        ----------
+        *args
+            ``appendData(y)`` or ``appendData(x, y)``: array-like or scalar values.
+            `x` may only be omitted if it was omitted in :meth:`setData` as well, in
+            which case the index of the points is continued.
+        **kwargs
+            `x` and `y` may also be given as keyword arguments.
+
+        Raises
+        ------
+        TypeError
+            Raised if too many arguments are given, if `y` is missing, or if `x` is
+            missing while the current `x` values were not generated.
+        ValueError
+            Raised if `x` and `y` do not have the same length.
+
+        Notes
+        -----
+        After this call, the arrays returned by :meth:`getOriginalDataset` (and the
+        :attr:`xData` and :attr:`yData` attributes) are views of the internal buffers.
+        They must not be modified in place.
+        """
+        if len(args) > 2:
+            raise TypeError(f'appendData takes at most 2 positional arguments ({len(args)} given)')
+        x = kwargs.get('x', args[0] if len(args) == 2 else None)
+        y = kwargs.get('y', args[-1] if args else None)
+        if y is None:
+            raise TypeError('appendData requires y values')
+        y = np.atleast_1d(np.asarray(y)).ravel()
+        if x is None:
+            if self._dataset is not None and not self._implicitX:
+                raise TypeError('appendData requires x values, as setData was given x')
+            start = 0 if self._dataset is None else len(self._dataset.y)
+            x = np.arange(start, start + len(y))
+        else:
+            x = np.atleast_1d(np.asarray(x)).ravel()
+        if len(x) != len(y):
+            raise ValueError(
+                f'x and y must have the same length (got {len(x)} and {len(y)})'
+            )
+        if len(y) == 0:
+            return
+        dataset = self._dataset
+        if dataset is None:
+            if 'x' in kwargs or len(args) == 2:
+                self.setData(x=x, y=y)
+            else:
+                self.setData(y=y)
+            return
+        if (
+            self.opts['fftMode']
+            or self.opts['derivativeMode']
+            or self.opts['phasemapMode']
+            or self.opts['subtractMeanMode']
+            or True in self.opts['logMode']
+            or self.opts['stepMode'] == 'center'
+            or isinstance(self.opts['connect'], np.ndarray)
+            or any(a.dtype == bool for a in (dataset.x, dataset.y, x, y))
+        ):
+            # the mapped data has to be computed from all points
+            implicit_x = self._implicitX
+            self.setData(
+                x=np.concatenate([dataset.x, x]), y=np.concatenate([dataset.y, y])
+            )
+            self._implicitX = implicit_x
+            return
+
+        profiler = debug.Profiler()
+        x_all = self._appendToBuffer(0, dataset.x, x)
+        y_all = self._appendToBuffer(1, dataset.y, y)
+        self._appendBuffers = (x_all.base, y_all.base)
+        self._dataset = dataset._appended(x_all, y_all)
+        # the extremes of the complete blocks of the previous data stay valid
+        if self._peakCache is not None and self._peakCache.y is dataset.y:
+            self._peakCache.extend(y_all)
+        self._datasetMapped  = None
+        self._datasetDisplay = None
+        self._sentDisplayData = None
+        profiler('append data')
+
+        self.updateItems(styleUpdate=False)
+        profiler('update items')
+        self.informViewBoundsChanged()
+        self.sigPlotChanged.emit(self)
+        profiler('emit')
+
+    def _appendToBuffer(
+        self,
+        axis: int,
+        current: np.ndarray,
+        new: np.ndarray
+    ) -> np.ndarray:
+        """
+        Append values to the growth buffer of an axis.
+
+        Parameters
+        ----------
+        axis : { 0, 1 }
+            0 for `x`, 1 for `y`.
+        current : np.ndarray
+            Current values of the axis.
+        new : np.ndarray
+            Values to append.
+
+        Returns
+        -------
+        np.ndarray
+            View of the buffer holding the current values followed by the new ones.
+        """
+        n = len(current)
+        size = n + len(new)
+        dtype = np.result_type(current.dtype, new.dtype)
+        buffer = None if self._appendBuffers is None else self._appendBuffers[axis]
+        if (
+            buffer is None
+            or current.base is not buffer
+            or buffer.dtype != dtype
+            or current.__array_interface__['data'][0] != buffer.__array_interface__['data'][0]
+        ):
+            # the current values are not the start of the buffer (e.g. after setData)
+            buffer = None
+        if buffer is None or size > len(buffer):
+            grown = np.empty(max(2 * size, 1024), dtype=dtype)
+            grown[:n] = current
+            buffer = grown
+        buffer[n:size] = new
+        return buffer[:size]
+
     def _getDisplayDataset(self) -> PlotDataset | None:
         """
         Get data suitable for display as a :class:`PlotDataset`.
@@ -1716,47 +2019,46 @@ class PlotDataItem(GraphicsObject):
             # downsampling is expensive; delay until after clipping.
 
         connect = self.opts['connect'] if isinstance(self.opts['connect'], np.ndarray) else None
-        if visible is not None:
-            # since we want the curve to go to the edge of the screen, we need to
-            # preserve one down-sampled point on the left and one of the right, so we
-            # extend the interval
-            x0 = fn.clip_scalar(visible[0] - ds, 0, len(x))
-            x1 = fn.clip_scalar(visible[1] + ds, x0, len(x))
-            x = x[x0:x1]
-            y = y[x0:x1]
-            if connect is not None:
-                connect = connect[x0:x1]
+        if ds > 1 and self.opts['downsampleMethod'] == 'peak':
+            # blocks are aligned to multiples of ds from the first point, so that they
+            # do not move with the view, and their extremes are cached.
+            num_blocks = len(y) // ds
+            if visible is None:
+                first_block, end_block = 0, num_blocks
+            else:
+                # keep one block beyond each edge, so that the curve reaches the edges
+                first_block = max(visible[0] // ds - 1, 0)
+                end_block = min(-(-visible[1] // ds) + 1, num_blocks)
+            x, y, connect = self._peakDownsample(
+                x, y, connect, ds, first_block, end_block
+            )
+        else:
+            if visible is not None:
+                # since we want the curve to go to the edge of the screen, we need to
+                # preserve one down-sampled point on the left and one of the right, so
+                # we extend the interval. Its start is aligned to a multiple of ds, so
+                # that the selected points do not change while panning.
+                x0 = (max(visible[0] - ds, 0) // ds) * ds
+                x1 = fn.clip_scalar(visible[1] + ds, x0, len(x))
+                x = x[x0:x1]
+                y = y[x0:x1]
+                if connect is not None:
+                    connect = connect[x0:x1]
 
-        if ds > 1:
-            if self.opts['downsampleMethod'] == 'subsample':
-                x = x[::ds]
-                y = y[::ds]
-                if connect is not None:
-                    connect = connect[::ds]
-            elif self.opts['downsampleMethod'] == 'mean':
-                n = len(x) // ds
-                # start of x-values try to select a somewhat centered point
-                stx = ds // 2
-                x = x[stx:stx + n * ds:ds]
-                y = y[:n * ds].reshape(n, ds).mean(axis=1)
-                if connect is not None:
-                    connect = connect[:n*ds].reshape(n,ds).all(axis=1)
-            elif self.opts['downsampleMethod'] == 'peak':
-                n = len(x) // ds
-                x1 = np.empty((n, 2))
-                # start of x-values; try to select a somewhat centered point
-                stx = ds // 2
-                x1[:] = x[stx:stx + n * ds:ds, np.newaxis]
-                x = x1.reshape(n * 2)
-                y1 = np.empty((n, 2))
-                y2 = y[:n * ds].reshape((n, ds))
-                y1[:, 0] = y2.max(axis=1)
-                y1[:, 1] = y2.min(axis=1)
-                y = y1.reshape(n * 2)
-                if connect is not None:
-                    c = np.ones((n*2), dtype=bool)
-                    c[1::2] = connect[:n*ds].reshape(n,ds).all(axis=1)
-                    connect = c
+            if ds > 1:
+                if self.opts['downsampleMethod'] == 'subsample':
+                    x = x[::ds]
+                    y = y[::ds]
+                    if connect is not None:
+                        connect = connect[::ds]
+                elif self.opts['downsampleMethod'] == 'mean':
+                    n = len(x) // ds
+                    # start of x-values try to select a somewhat centered point
+                    stx = ds // 2
+                    x = x[stx:stx + n * ds:ds]
+                    y = y[:n * ds].reshape(n, ds).mean(axis=1)
+                    if connect is not None:
+                        connect = connect[:n*ds].reshape(n,ds).all(axis=1)
 
         if x is mapped.x and y is mapped.y and connect is None:
             # nothing changed: share the mapped dataset and its cached bounds
@@ -1818,6 +2120,62 @@ class PlotDataItem(GraphicsObject):
         self.setProperty('yViewRangeWasChanged', False)
 
         return self._datasetDisplay
+
+    def _peakDownsample(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        connect: np.ndarray | None,
+        ds: int,
+        first_block: int,
+        end_block: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        """
+        Downsample by drawing the maximum and the minimum of blocks of points.
+
+        Block ``b`` holds the points ``b * ds`` to ``(b + 1) * ds - 1``. The extremes
+        of complete blocks are cached between calls, see :class:`_PeakBlockCache`.
+        As before the blocks were aligned, an incomplete block at the end of the data
+        is not drawn.
+
+        Parameters
+        ----------
+        x, y : np.ndarray
+            Mapped data, before clipping.
+        connect : np.ndarray or None
+            Connection array matching `x` and `y`, if any.
+        ds : int
+            Number of points per block, larger than 1.
+        first_block, end_block : int
+            Range of complete blocks to draw.
+
+        Returns
+        -------
+        x, y : np.ndarray
+            Two points per block: the maximum, then the minimum, at the `x` value of
+            the block center.
+        connect : np.ndarray or None
+            Matching connection array, if `connect` was given.
+        """
+        cache = self._peakCache
+        if cache is None or cache.ds != ds or cache.y is not y:
+            cache = self._peakCache = _PeakBlockCache(y, ds)
+        block_max, block_min = cache.blocks(first_block, end_block)
+        num = end_block - first_block
+        start, end = first_block * ds, end_block * ds
+
+        x_out = np.empty((num, 2))
+        y_out = np.empty((num, 2))
+        # x-values: select the point at the center of each block
+        x_out[:] = x[start + ds // 2:end:ds, np.newaxis]
+        y_out[:, 0] = block_max
+        y_out[:, 1] = block_min
+
+        if connect is not None:
+            c = np.ones(num * 2, dtype=bool)
+            c[1::2] = connect[start:end].reshape(num, ds).all(axis=1)
+            connect = c
+        return x_out.reshape(num * 2), y_out.reshape(num * 2), connect
 
     def _autoDownsampleFactor(
         self,
@@ -2072,11 +2430,11 @@ class PlotDataItem(GraphicsObject):
         self._dataset = self._datasetMapped = self._datasetDisplay = None
         self._sentDisplayData = None
         self._drlClipActive = False
+        self._peakCache = None
+        self._appendBuffers = None
+        self._implicitX = False
         self.curve.clear()
         self.scatter.clear()
-
-    def appendData(self, *args, **kwargs):
-        pass
 
     @QtCore.Slot(object, object)
     def curveClicked(self, _: PlotCurveItem, ev):
