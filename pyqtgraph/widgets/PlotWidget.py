@@ -41,15 +41,40 @@ class PlotWidget(GraphicsView):
     sigRangeChanged = QtCore.Signal(object, object)
     sigTransformChanged = QtCore.Signal(object)
 
-    def __init__(self, parent=None, background='default', plotItem=None, **kwargs):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        background: object = 'default',
+        plotItem: PlotItem | None = None,
+        useOpenGL: bool | None = None,
+        **kwargs,
+    ) -> None:
+        """
+        Create the widget and its PlotItem.
+
+        Parameters
+        ----------
+        parent : QWidget, optional
+            The parent widget.
+        background : object, default 'default'
+            Background color, see :meth:`GraphicsView.setBackground
+            <pyqtgraph.GraphicsView.setBackground>`.
+        plotItem : PlotItem, optional
+            The PlotItem to display. By default, a new PlotItem is created with
+            `kwargs`.
+        useOpenGL : bool, optional
+            Whether the view renders with OpenGL. By default, the ``useOpenGL``
+            configuration option is used. See :class:`GraphicsView
+            <pyqtgraph.GraphicsView>`.
+        **kwargs
+            Passed to :class:`PlotItem <pyqtgraph.PlotItem>` when `plotItem` is None.
+        """
         ## start by instantiating the plotItem attribute in order to avoid recursive 
         ## calls of PlotWidget.__getattr__ - which access self.plotItem!
         self.plotItem = None
-        """When initializing PlotWidget, *parent* and *background* are passed to 
-        :func:`GraphicsWidget.__init__() <pyqtgraph.GraphicsWidget.__init__>`
-        and all others are passed
-        to :func:`PlotItem.__init__() <pyqtgraph.PlotItem.__init__>`."""
-        GraphicsView.__init__(self, parent, background=background)
+        # useOpenGL belongs to GraphicsView: left in kwargs, it reached PlotItem, which
+        # created a spurious curve with it, and OpenGL was never enabled.
+        GraphicsView.__init__(self, parent, useOpenGL=useOpenGL, background=background)
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
         self.enableMouse(False)
         if plotItem is None:

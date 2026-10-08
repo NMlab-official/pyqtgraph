@@ -2,6 +2,7 @@ import numpy as np
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui
+from tests.perf_helpers import count_calls, process_events
 
 
 def test_scatterplotitem():
@@ -115,3 +116,27 @@ def test_init_spots():
     assert spots[1].brush() == pg.mkBrush(None)
     assert spots[1].data() == 'zzz'
     plot.close()
+
+
+def test_view_change_keeps_data_bounds_cache():
+    # T1.1: panning or zooming must not recompute the O(N) data bounds
+    pw = pg.PlotWidget()
+    pw.resize(300, 200)
+    pw.show()
+    scatter = pg.ScatterPlotItem(x=np.arange(100.), y=np.arange(100.) * 2, size=5)
+    pw.addItem(scatter)
+    pw.getViewBox().enableAutoRange(False)
+    process_events()
+    scatter.boundingRect()
+    with count_calls(np, 'nanmin') as nanmin:
+        for _ in range(5):
+            pw.getViewBox().scaleBy((0.5, 0.5))
+            process_events()
+    assert nanmin.count == 0
+    pw.close()
+
+
+def test_orthorange_bounds_do_not_pollute_cache():
+    scatter = pg.ScatterPlotItem(x=np.arange(10.), y=np.arange(10.), size=0)
+    assert scatter.dataBounds(1, orthoRange=(0, 2)) == (0.0, 2.0)
+    assert scatter.dataBounds(1) == (0.0, 9.0)

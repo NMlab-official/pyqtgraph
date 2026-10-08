@@ -3,6 +3,7 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.graphicsItems.PlotCurveItem import arrayToLineSegments
 from tests.image_testing import assertImageApproved
+from tests.perf_helpers import count_calls, process_events
 
 
 def test_PlotCurveItem():
@@ -49,3 +50,26 @@ def test_arrayToLineSegments():
         assert len(segs[0]) == 0
     elif len(segs) == 2:
         assert segs[1] == 0
+
+
+def test_view_change_keeps_data_bounds_cache():
+    # T1.1: panning or zooming must not recompute the O(N) data bounds
+    pw = pg.PlotWidget()
+    pw.resize(300, 200)
+    pw.show()
+    curve = pg.PlotCurveItem(np.arange(1000.), np.sin(np.arange(1000.) / 50.))
+    pw.addItem(curve)
+    pw.getViewBox().enableAutoRange(False)
+    process_events()
+    curve.boundingRect()
+    vb = pw.getViewBox()
+    rect_before = curve.boundingRect()
+    with count_calls(np, 'nanmin') as nanmin:
+        for _ in range(5):
+            vb.scaleBy((0.5, 0.5))
+            process_events()
+    assert nanmin.count == 0
+    assert curve.dataBounds(0) == (0.0, 999.0)
+    # the pixel padding still follows the zoom level
+    assert curve.boundingRect() != rect_before
+    pw.close()

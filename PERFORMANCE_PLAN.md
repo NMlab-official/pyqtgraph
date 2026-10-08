@@ -126,17 +126,17 @@ Référence à `cc94092` : `pytest tests/graphicsItems tests/test_functions.py` 
 |----|-------|:-----:|:------:|:------:|-------------------------|-----------|:------:|
 | T0.1 | Scénarios de benchmark reproductibles | 0 | M | F | — (mesure) | — | ☑ |
 | T0.2 | Compteurs d'instrumentation pour les tests | 0 | S | F | — (mesure) | — | ☑ |
-| T1.1 | Ne plus vider le cache des bornes de données au zoom | 1 | S | F | 2-4 parcours O(N) en moins par image | T0.2 | ☐ |
-| T1.2 | Pas de `setData` sur pan/zoom Y sans écrêtage effectif | 1 | S | F | pan Y nuage 1e5 : 394 → ~36 ms | T0.2 | ☐ |
-| T1.3 | Cache `childrenBounds` actif ; ignorer les objets `ignoreBounds` | 1 | M | F | réticule : 58 → ~9 ms/mouvement | T0.2 | ☐ |
-| T1.4 | Test « is None » par identité dans `ScatterPlotItem._style` | 1 | S | F | −115 ms par `setData` de 1e5 | — | ☐ |
-| T1.5 | SpotItem créés seulement pour les points touchés | 1 | S | F | 1er survol 1e6 : 2,3 s → < 50 ms | — | ☐ |
-| T1.6 | Supprimer la copie `x[np.isfinite(x)]` du sous-échantillonnage | 1 | S | F | −43 ms/`setData` à 1e7 | — | ☐ |
-| T1.7 | Table de couleurs > 256 entrées ramenée à 256 (images float) | 1 | S | F | 11 → 3,3 ms (2000×1000) | — | ☐ |
-| T1.8 | `InfiniteLine` : `prepareGeometryChange` hors de `boundingRect` | 1 | S | F | ~−30 % par ligne | — | ☐ |
-| T1.9 | Légende et liste des paramètres sans coût quadratique | 1 | S | F | 500 courbes : 4,05 → ~0,6 s | — | ☐ |
-| T1.10 | `itemsNearEvent` : une seule requête, filtrer avant de trier | 1 | S | F | 4,65 → 2,3 ms/mouvement (500 courbes) | — | ☐ |
-| T1.11 | Bugs d'API qui désactivent des optimisations | 1 | S | F | `clipToView`/`autoDownsample` réellement actifs | — | ☐ |
+| T1.1 | Ne plus vider le cache des bornes de données au zoom | 1 | S | F | 2-4 parcours O(N) en moins par image | T0.2 | ☑ |
+| T1.2 | Pas de `setData` sur pan/zoom Y sans écrêtage effectif | 1 | S | F | pan Y nuage 1e5 : 394 → ~36 ms | T0.2 | ☑ |
+| T1.3 | Cache `childrenBounds` actif ; ignorer les objets `ignoreBounds` | 1 | M | F | réticule : 58 → ~9 ms/mouvement | T0.2 | ☑ |
+| T1.4 | Test « is None » par identité dans `ScatterPlotItem._style` | 1 | S | F | −115 ms par `setData` de 1e5 | — | ☑ |
+| T1.5 | SpotItem créés seulement pour les points touchés | 1 | S | F | 1er survol 1e6 : 2,3 s → < 50 ms | — | ☑ |
+| T1.6 | Supprimer la copie `x[np.isfinite(x)]` du sous-échantillonnage | 1 | S | F | −43 ms/`setData` à 1e7 | — | ☑ |
+| T1.7 | Table de couleurs > 256 entrées ramenée à 256 (images float) | 1 | S | F | 11 → 3,3 ms (2000×1000) | — | ☑ |
+| T1.8 | `InfiniteLine` : `prepareGeometryChange` hors de `boundingRect` | 1 | S | F | ~−30 % par ligne | — | ☑ |
+| T1.9 | Légende et liste des paramètres sans coût quadratique | 1 | S | F | 500 courbes : 4,05 → ~0,6 s | — | ☑ |
+| T1.10 | `itemsNearEvent` : une seule requête, filtrer avant de trier | 1 | S | F | 4,65 → 2,3 ms/mouvement (500 courbes) | — | ☑ |
+| T1.11 | Bugs d'API qui désactivent des optimisations | 1 | S | F | `clipToView`/`autoDownsample` réellement actifs | — | ☑ |
 | T2.1 | Supprimer le double rendu par mise à jour | 2 | M | M | −25 à −45 % par image | T0.2 | ☐ |
 | T2.2 | Pipeline courbe : un seul passage O(N) par `setData` | 2 | M | F | 1e7 clip+ds : 100 → ~5 ms/image | T1.6 | ☐ |
 | T2.3 | Flux incrémental : `appendData`, blocs de pics alignés et mis en cache | 2 | L | M | 1e7 vue complète : ~2 ms/image | T2.2 | ☐ |
