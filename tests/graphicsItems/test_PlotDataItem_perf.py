@@ -506,11 +506,17 @@ def test_streaming_with_auto_range_updates_once_per_frame(plot_widget):
     for k in range(100_000, 100_003):
         item.setData(x[:k], y[:k])
         process_events()
-    with count_calls(pg.PlotDataItem, 'updateItems') as updates, \
-            count_calls(pg.PlotCurveItem, 'paint') as paints:
-        for k in range(100_003, 100_023):
-            item.setData(x[:k], y[:k])
-            process_events()
+    # Count viewport paint events rather than wrapping the paint virtual: with
+    # PySide6, wrapping a C++ virtual at class level is unreliable.
+    paints = _PaintLog()
+    plot_widget.viewport().installEventFilter(paints)
+    try:
+        with count_calls(pg.PlotDataItem, 'updateItems') as updates:
+            for k in range(100_003, 100_023):
+                item.setData(x[:k], y[:k])
+                process_events()
+    finally:
+        plot_widget.viewport().removeEventFilter(paints)
     assert updates.count == 20
     # the deferred update is applied before the paint, not during it
     assert paints.count <= 21
