@@ -221,15 +221,8 @@ def viewport_paints_per_update(widget, update, n=20, warmup=3):
     return len(log) / n
 
 
-def _fixed_axes(plotItem):
-    # The width of a vertical axis follows its tick labels, which AxisItem measures
-    # while painting: a new width relayouts the plot, which costs another paint.
-    plotItem.getAxis('left').setWidth(45)
-
-
 def test_streaming_with_autorange_paints_once():
     pw = pg.PlotWidget(size=(400, 300))
-    _fixed_axes(pw.getPlotItem())
     curve = pw.plot(np.zeros(100))
     rng = np.random.default_rng(0)
 
@@ -246,7 +239,6 @@ def test_streaming_with_autorange_paints_once():
 @pytest.mark.parametrize('axis', ['x', 'y'])
 def test_pan_paints_once(axis):
     pw = pg.PlotWidget(size=(400, 300))
-    _fixed_axes(pw.getPlotItem())
     pw.plot(np.random.default_rng(0).normal(size=1000))
     vb = pw.getViewBox()
 
@@ -264,7 +256,6 @@ def test_linked_plots_streaming_paints_once():
     plots = []
     for row in range(3):
         p = win.addPlot(row=row, col=0)
-        _fixed_axes(p)
         if plots:
             p.setXLink(plots[0])
         plots.append(p)
@@ -317,7 +308,6 @@ def test_requested_prepare_runs_before_the_paint():
 
 def test_autorange_is_applied_before_the_paint():
     pw = pg.PlotWidget(size=(300, 200))
-    _fixed_axes(pw.getPlotItem())
     curve = pw.plot(np.arange(10.0))
     pw.show()
     process_events(5)
