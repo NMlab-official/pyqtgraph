@@ -2326,8 +2326,13 @@ class PlotDataItem(GraphicsObject):
 
         Block ``b`` holds the points ``b * ds`` to ``(b + 1) * ds - 1``. The extremes
         of complete blocks are cached between calls, see :class:`_PeakBlockCache`.
-        As before the blocks were aligned, an incomplete block at the end of the data
-        is not drawn.
+
+        When the drawn blocks reach the end of the data, the incomplete block at the
+        end, if any, is drawn with its own extremes, and the last drawn block is placed
+        at the `x` value of the last point. The newest points of a stream are thus
+        always visible, and the drawn `x` range ends at the newest point, as without
+        downsampling: an auto-range follows the data without jumping back and forth
+        as blocks complete.
 
         Parameters
         ----------
@@ -2344,7 +2349,7 @@ class PlotDataItem(GraphicsObject):
         -------
         x, y : np.ndarray
             Two points per block: the maximum, then the minimum, at the `x` value of
-            the block center.
+            the block center (of the last point, for the last block of the data).
         connect : np.ndarray or None
             Matching connection array, if `connect` was given.
         """
@@ -2352,21 +2357,33 @@ class PlotDataItem(GraphicsObject):
         if cache is None or cache.ds != ds or cache.y is not y:
             cache = self._peakCache = _PeakBlockCache(y, ds)
         block_max, block_min = cache.blocks(first_block, end_block)
+        n = len(y)
         num = end_block - first_block
         start, end = first_block * ds, end_block * ds
+        at_end = end_block == n // ds
+        has_tail = at_end and end < n
+        total = num + 1 if has_tail else num
 
-        x_out = np.empty((num, 2))
-        y_out = np.empty((num, 2))
+        x_out = np.empty((total, 2))
+        y_out = np.empty((total, 2))
         # x-values: select the point at the center of each block
-        x_out[:] = x[start + ds // 2:end:ds, np.newaxis]
-        y_out[:, 0] = block_max
-        y_out[:, 1] = block_min
+        x_out[:num] = x[start + ds // 2:end:ds, np.newaxis]
+        y_out[:num, 0] = block_max
+        y_out[:num, 1] = block_min
+        if has_tail:
+            # the incomplete block holding the newest points
+            y_out[num, 0] = y[end:].max()
+            y_out[num, 1] = y[end:].min()
+        if at_end and total > 0:
+            x_out[total - 1] = x[n - 1]
 
         if connect is not None:
-            c = np.ones(num * 2, dtype=bool)
-            c[1::2] = connect[start:end].reshape(num, ds).all(axis=1)
+            c = np.ones(total * 2, dtype=bool)
+            c[1:num * 2:2] = connect[start:end].reshape(num, ds).all(axis=1)
+            if has_tail:
+                c[num * 2 + 1] = connect[end:].all()
             connect = c
-        return x_out.reshape(num * 2), y_out.reshape(num * 2), connect
+        return x_out.reshape(total * 2), y_out.reshape(total * 2), connect
 
     def _autoDownsampleFactor(
         self,

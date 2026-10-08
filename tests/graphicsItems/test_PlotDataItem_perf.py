@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore
 from tests.perf_helpers import count_calls, process_events
 
 app = pg.mkQApp()
@@ -686,3 +687,78 @@ def test_connect_follows_the_data_without_style_update():
     item.setData(np.arange(10.0), connect='pairs')
     item.setData(np.arange(10.0) + 1)
     assert item.curve.opts['connect'] == 'pairs'
+
+
+# --------------------------------------------------------------------------------------
+# T2.3 follow-up: the newest points are drawn while streaming with peak downsampling
+# --------------------------------------------------------------------------------------
+
+class _PaintLog(QtCore.QObject):
+    """Event filter counting the paint events of a viewport, binding agnostic."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.count = 0
+
+    def eventFilter(self, obj: QtCore.QObject, ev: QtCore.QEvent) -> bool:
+        if ev.type() == QtCore.QEvent.Type.Paint:
+            self.count += 1
+        return False
+
+
+@pytest.mark.parametrize('append', [False, True])
+def test_streaming_peaks_show_the_newest_points(append):
+    n = 50_000
+    rng = np.random.default_rng(0)
+    x = np.arange(n + 200, dtype=float)
+    y = np.cumsum(rng.standard_normal(n + 200))
+    y[n + 100] = y.max() + 50  # a new extreme while a block is incomplete
+    pw = pg.PlotWidget(size=(400, 300))
+    # the width of the left axis follows its labels: keep it fixed to count paints
+    pw.getPlotItem().getAxis('left').setWidth(45)
+    item = pw.plot(x[:n], y[:n], autoDownsample=True, downsampleMethod='peak')
+    pw.show()
+    process_events(5)
+    vb = pw.getViewBox()
+    log = _PaintLog()
+    pw.viewport().installEventFilter(log)
+    x_max = []
+    try:
+        for k in range(n, n + 200):
+            if append:
+                item.appendData(x[k:k + 1], y[k:k + 1])
+            else:
+                item.setData(x[:k + 1], y[:k + 1])
+            process_events()
+            ds = item._adsLastValue
+            x_disp, y_disp = item.getData()
+            # the drawn curve ends at the newest point, whose value is drawn
+            assert x_disp[-1] == x[k]
+            assert y_disp[-2:].min() <= y[k] <= y_disp[-2:].max()
+            # the extremes of all points are drawn: the auto-range sees all data
+            assert item.dataBounds(1) == (y[:k + 1].min(), y[:k + 1].max())
+            x_max.append(vb.viewRange()[0][1])
+    finally:
+        pw.viewport().removeEventFilter(log)
+        pw.close()
+    assert ds > 10  # the incomplete block holds up to ds - 1 points
+    # one paint per update, the x range only grows with the data
+    assert log.count / 200 <= 1.05
+    assert all(b > a for a, b in zip(x_max, x_max[1:]))
+
+
+def test_clipped_peaks_show_the_newest_points(plot_widget):
+    x = np.arange(100_000.0)
+    y = np.sin(x / 100.0)
+    item = plot_widget.plot(x[:90_007], y[:90_007], downsample=10, clipToView=True)
+    plot_widget.setXRange(80_000.0, 90_006.0, padding=0)
+    process_events()
+    x_disp, y_disp = item.getData()
+    assert x_disp[-1] == 90_006.0
+    tail = y[90_000:90_007]
+    assert (y_disp[-2], y_disp[-1]) == (tail.max(), tail.min())
+    # the view away from the end of the data: no extra block
+    plot_widget.setXRange(10_000.0, 20_000.0, padding=0)
+    process_events()
+    x_disp, _ = item.getData()
+    assert x_disp[-1] < 20_100
