@@ -558,3 +558,129 @@ def test_autorange_follows_appended_bars():
     _, (_, ymax) = pw.viewRange()
     assert 3 <= ymax < 4
     pw.close()
+
+
+# bars with non-finite coordinates are not drawn and do not count in the bounds
+
+HEIGHTS = np.array([5., 1, 7, 3, 9, 2, 8, 4, 6, 10])
+NON_FINITE = {
+    'nan height': ('height', np.nan),
+    'nan x': ('x', np.nan),
+    'inf height': ('height', np.inf),
+    '-inf height': ('height', -np.inf),
+    'nan width': ('width', np.nan),
+    '-inf y0': ('y0', -np.inf),
+}
+
+
+def finiteBounds(item: pg.BarGraphItem, ax: int) -> tuple[float | None, float | None]:
+    """
+    Range of the bars with finite coordinates along an axis, bar by bar, without pen.
+
+    Parameters
+    ----------
+    item : BarGraphItem
+        Item whose bars are measured.
+    ax : int
+        0 for x, 1 for y.
+
+    Returns
+    -------
+    tuple of float or None
+        Lowest lower edge and highest upper edge of the bars whose rectangle is
+        finite, or ``(None, None)`` when there is none.
+    """
+    lows, highs = [], []
+    for row in item._rectarray.ndarray().tolist():
+        if all(np.isfinite(row)):
+            lows.append(row[ax])
+            highs.append(row[ax] + row[ax + 2])
+    if not lows:
+        return None, None
+    return min(lows), max(highs)
+
+
+@pytest.mark.parametrize('case', list(NON_FINITE))
+@pytest.mark.parametrize('position', [0, 4, 9], ids=['first', 'middle', 'last'])
+def test_bounds_ignore_non_finite_bars(case, position):
+    opts = {'x': np.arange(10.), 'height': HEIGHTS.copy(), 'width': np.full(10, 0.6),
+            'y0': np.full(10, -1.0)}
+    key, value = NON_FINITE[case]
+    opts[key][position] = value
+    with np.errstate(invalid='ignore'):  # inf - inf in the rectangles
+        item = pg.BarGraphItem(pen=pg.mkPen('w', width=0.2, cosmetic=False), **opts)
+    for ax in (0, 1):
+        low, high = finiteBounds(item, ax)
+        assert item.dataBounds(ax) == pytest.approx((low - 0.1, high + 0.1))
+        # as the restricted and percentile ranges
+        assert item.dataBounds(ax, orthoRange=(-100, 100)) == pytest.approx(
+            item.dataBounds(ax))
+        assert item.dataBounds(ax, frac=0.99)[1] <= item.dataBounds(ax)[1]
+    (xmin, xmax), (ymin, ymax) = item.dataBounds(0), item.dataBounds(1)
+    rect = item.boundingRect()
+    assert rect.isValid()
+    assert (rect.left(), rect.right()) == pytest.approx((xmin, xmax))
+    assert (rect.top(), rect.bottom()) == pytest.approx((ymin, ymax))
+
+
+def test_bounds_of_sorted_bars_match_orthoRange():
+    # with sorted bars the range of all bars within an x range reuses the full range
+    heights = HEIGHTS.copy()
+    heights[[2, 9]] = np.nan
+    item = pg.BarGraphItem(x=np.arange(10.), height=heights, width=0.6)
+    assert item._x1Sorted
+    assert item.dataBounds(1) == pytest.approx((0, 9))
+    assert item.dataBounds(1, orthoRange=(-100, 100)) == pytest.approx((0, 9))
+    assert item.dataBounds(1, orthoRange=(1.5, 8.5)) == pytest.approx((0, 9))
+    # along both axes
+    assert item.dataBounds(0) == pytest.approx((-0.3, 8.3))
+    assert item.dataBounds(0, orthoRange=(-100, 100)) == pytest.approx((-0.3, 8.3))
+    assert item.dataBounds(0, frac=0.999) == pytest.approx(
+        (np.percentile(np.r_[0:2, 3:9] - 0.3, 0.05), np.percentile(np.r_[0:2, 3:9] + 0.3,
+                                                                 99.95)))
+    infinite = pg.BarGraphItem(x=np.arange(10.), height=np.r_[HEIGHTS[:9], np.inf],
+                               width=0.6)
+    assert infinite.dataBounds(1) == pytest.approx((0, 9))
+    assert infinite.dataBounds(1, orthoRange=(-100, 100)) == pytest.approx((0, 9))
+    assert infinite.dataBounds(1, orthoRange=(7.5, 9.5)) == pytest.approx((0, 6))
+
+
+def test_bounds_without_finite_bars():
+    item = pg.BarGraphItem(x=np.arange(3.), height=np.full(3, np.nan), width=0.5)
+    for ax in (0, 1):
+        assert item.dataBounds(ax) == (None, None)
+        assert item.dataBounds(ax, orthoRange=(-10, 10)) == (None, None)
+        assert item.dataBounds(ax, frac=0.5) == (None, None)
+    assert item.boundingRect() == QtCore.QRectF()
+    # appended bars bring finite bounds, replaced ones take them away again
+    item.appendData(x=[3.], height=[2.])
+    assert item.dataBounds(0) == pytest.approx((2.75, 3.25))
+    assert item.dataBounds(1) == pytest.approx((0, 2))
+    assert item.boundingRect() == QtCore.QRectF(2.75, 0, 0.5, 2)
+    item.appendData(x=[3.], height=[np.nan], replaceLast=True)
+    assert item.dataBounds(0) == item.dataBounds(1) == (None, None)
+    item.appendData(x=[np.nan, 4.], height=[5., 4.])
+    assert item.dataBounds(0) == pytest.approx((3.75, 4.25))
+    assert item.dataBounds(1) == pytest.approx((0, 4))
+
+
+def test_autorange_includes_bars_with_nan():
+    pw = pg.PlotWidget()
+    pw.resize(400, 300)
+    heights = 1.0 + np.arange(100.)
+    heights[50] = np.nan
+    item = pg.BarGraphItem(x=np.arange(100.) + 1000, height=heights, width=0.8)
+    pw.addItem(item)
+    pw.show()
+    for _ in range(3):
+        app.processEvents()
+    (xmin, xmax), (ymin, ymax) = pw.viewRange()
+    assert 990 < xmin <= 999.6 and 1099.4 <= xmax < 1110
+    assert -10 < ymin <= 0 and 100 <= ymax < 110
+    with np.errstate(invalid='ignore'):
+        item.appendData(x=[1100., 1101.], height=[np.inf, 150.])
+    for _ in range(3):
+        app.processEvents()
+    (_, xmax), (_, ymax) = pw.viewRange()
+    assert 1101.4 <= xmax < 1115 and 150 <= ymax < 165
+    pw.close()
