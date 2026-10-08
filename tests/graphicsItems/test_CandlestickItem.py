@@ -12,6 +12,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from tests.perf_helpers import show_and_wait
 
 app = pg.mkQApp()
 
@@ -411,9 +412,7 @@ def test_in_plot_with_legend_and_autorange():
     legend = pw.addLegend()
     item = pg.CandlestickItem(name='OHLC', **sixCandles())
     pw.addItem(item)
-    pw.show()
-    for _ in range(3):
-        app.processEvents()
+    show_and_wait(pw)
     assert item in pw.getPlotItem().listDataItems()
     assert len(legend.items) == 1
     (xmin, xmax), (ymin, ymax) = pw.viewRange()
