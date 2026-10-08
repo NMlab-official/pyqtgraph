@@ -1933,6 +1933,30 @@ def _qpointf_fuzzy_equal(x1: float, y1: float, x2: float, y2: float) -> bool:
     return fuzzy_equal(x1, x2) and fuzzy_equal(y1, y2)
 
 
+def _arrayToQPath_chunk_starts(n: int) -> list[int]:
+    """
+    Return the start indices of the chunks used by ``_arrayToQPath_all``.
+
+    The points are split in chunks of ``_ARRAYTOQPATH_CHUNKSIZE`` points. A last chunk
+    of a single point would be ignored by ``QPainterPath.connectPath``, losing the
+    last segment of the curve: that point is appended to the previous chunk instead.
+
+    Parameters
+    ----------
+    n : int
+        Number of points, at least 2.
+
+    Returns
+    -------
+    list of int
+        Start index of each chunk, the first one being 0.
+    """
+    starts = list(range(0, n, _ARRAYTOQPATH_CHUNKSIZE))
+    if len(starts) > 1 and n - starts[-1] == 1:
+        del starts[-1]
+    return starts
+
+
 def _arrayToQPath_all_vertices(
     x: np.ndarray, y: np.ndarray, finiteCheck: bool
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1941,11 +1965,10 @@ def _arrayToQPath_all_vertices(
 
     Drawing these vertices with ``QPainter.drawPolyline`` strokes the same polyline
     as drawing the path. Besides the removal of the non-finite points, the chunked
-    construction of the path has two effects, reproduced here:
-
-    - ``QPainterPath.connectPath`` drops the first point of a chunk when Qt considers
-      it equal to the last point of the previous chunk;
-    - a final chunk made of a single point is ignored by ``connectPath``.
+    construction of the path has one effect, reproduced here:
+    ``QPainterPath.connectPath`` drops the first point of a chunk when Qt considers
+    it equal to the last point of the previous chunk. (A single remaining point is
+    appended to the previous chunk, see :func:`_arrayToQPath_chunk_starts`.)
 
     Parameters
     ----------
@@ -1973,12 +1996,9 @@ def _arrayToQPath_all_vertices(
         return x, y
 
     drop = []
-    for start in range(chunksize, n, chunksize):
-        if n - start == 1:
-            # connectPath ignores a path made of a single MoveTo element
-            drop.append(start)
-        elif _qpointf_fuzzy_equal(float(x[start - 1]), float(y[start - 1]),
-                                  float(x[start]), float(y[start])):
+    for start in _arrayToQPath_chunk_starts(n)[1:]:
+        if _qpointf_fuzzy_equal(float(x[start - 1]), float(y[start - 1]),
+                                float(x[start]), float(y[start])):
             drop.append(start)
     if drop:
         keep = np.ones(n, dtype=bool)
@@ -2030,8 +2050,9 @@ def _arrayToQPath_all(x, y, finiteCheck):
     path.reserve(n)
     subpoly = QtGui.QPolygonF()
     subpath = QtGui.QPainterPath()
-    for idx in range(numchunks):
-        sl = slice(idx*chunksize, min((idx+1)*chunksize, n))
+    starts = _arrayToQPath_chunk_starts(n)
+    for start, stop in zip(starts, starts[1:] + [n]):
+        sl = slice(start, stop)
         currsize = sl.stop - sl.start
         if currsize != subpoly.size():
             if hasattr(subpoly, 'resize'):

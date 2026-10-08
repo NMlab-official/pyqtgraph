@@ -79,13 +79,14 @@ def test_arrayToQPath_all_vertices_without_change_are_the_inputs():
 
 
 def test_arrayToQPath_all_vertices_single_point_last_chunk():
-    # connectPath ignores a final chunk of a single point: the last segment is not drawn
+    # a single remaining point is appended to the previous chunk: connectPath would
+    # ignore a chunk made of it, and the last segment would not be drawn
     n = 2 * fn._ARRAYTOQPATH_CHUNKSIZE + 1
     x = np.arange(n, dtype=np.float64)
     y = np.zeros(n)
     vx, vy = fn._arrayToQPath_all_vertices(x, y, finiteCheck=False)
-    assert len(vx) == n - 1
-    assert fn.arrayToQPath(x, y).elementCount() == n - 1
+    assert len(vx) == n
+    assert fn.arrayToQPath(x, y).elementCount() == n
 
 
 @pytest.mark.parametrize('a, b, expected', [
