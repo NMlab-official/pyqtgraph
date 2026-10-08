@@ -172,6 +172,11 @@ class AxisItem(GraphicsWidget):
         # Tick strings, ``(values, scale, spacing, extra state) -> strings``; see
         # _tickStringsCacheKey.
         self._tickStringsCache = _LRUCache(64)
+        # While a picture is pending, weak reference to the scene whose
+        # sigPrepareForPaint is connected to _prepareForPaint; see _invalidatePicture.
+        self._preparingScene = None
+        # True while _buildPicture runs: the picture it builds is assigned afterwards.
+        self._buildingPicture = False
         self.label = QtWidgets.QGraphicsTextItem(self)
         self.picture = None
         self.orientation = orientation
@@ -398,7 +403,7 @@ class AxisItem(GraphicsWidget):
                 self.style[kwd] = value
 
         self._invalidateTickCaches()
-        self.picture = None
+        self._invalidatePicture()
         self._adjustSize()
         self.update()
 
@@ -428,7 +433,7 @@ class AxisItem(GraphicsWidget):
             grid = min(grid, 255)
             grid = max(grid, 0)
         self.grid = grid
-        self.picture = None
+        self._invalidatePicture()
         self.prepareGeometryChange()
         self.update()
 
@@ -488,7 +493,7 @@ class AxisItem(GraphicsWidget):
                 self._linkedView().setLogMode('y', self.logMode)
 
         self._invalidateTickCaches()
-        self.picture = None
+        self._invalidatePicture()
         self.update()
 
     def setTickFont(self, font: QtGui.QFont | None) -> None:
@@ -502,7 +507,7 @@ class AxisItem(GraphicsWidget):
         """
         self.style['tickFont'] = font
         self._invalidateTickCaches()
-        self.picture = None
+        self._invalidatePicture()
         self.prepareGeometryChange()
         # Need to re-allocate space depending on font size?
         self.update()
@@ -530,7 +535,7 @@ class AxisItem(GraphicsWidget):
             p.setX(int(self.size().width()/2. - br.width()/2.))
             p.setY(int(self.size().height()-br.height()+nudge))
         self.label.setPos(p)
-        self.picture = None
+        self._invalidatePicture()
 
     def showLabel(self, show: bool=True):
         """
@@ -645,7 +650,7 @@ class AxisItem(GraphicsWidget):
     def _updateLabel(self):
         self.label.setHtml(self.labelString())
         self._adjustSize()
-        self.picture = None
+        self._invalidatePicture()
         self.update()
 
     def labelString(self) -> str:
@@ -976,7 +981,7 @@ class AxisItem(GraphicsWidget):
             # XXX: Will already update once!
             self.updateAutoSIPrefix()
         else:
-            self.picture = None
+            self._invalidatePicture()
             self.update()
 
     def linkedView(self):
@@ -1095,23 +1100,168 @@ class AxisItem(GraphicsWidget):
         path.addRect(rect)
         return path
 
-    def paint(self, p, opt, widget):
-        profiler = debug.Profiler()
+    def paint(
+        self,
+        p: QtGui.QPainter,
+        opt: QtWidgets.QStyleOptionGraphicsItem | None,
+        widget: QtWidgets.QWidget | None
+    ) -> None:
+        """
+        Paint the axis, its ticks and tick labels.
+
+        The picture is normally built when the scene prepares, before Qt computes the
+        regions to repaint (see :meth:`_invalidatePicture`). It is built here if it
+        was not, e.g. outside a :class:`GraphicsScene <pyqtgraph.GraphicsScene>`.
+
+        Parameters
+        ----------
+        p : QtGui.QPainter
+            The painter, in local coordinates.
+        opt : QtWidgets.QStyleOptionGraphicsItem or None
+            Style options, unused.
+        widget : QtWidgets.QWidget or None
+            The widget painted on, unused.
+        """
         if self.picture is None:
-            try:
-                picture = QtGui.QPicture()
-                painter = QtGui.QPainter(picture)
-                if self.style["tickFont"]:
-                    painter.setFont(self.style["tickFont"])
-                specs = self.generateDrawSpecs(painter)
-                profiler('generate specs')
-                if specs is not None:
-                    self.drawPicture(painter, *specs)
-                    profiler('draw picture')
-            finally:
-                painter.end()
-            self.picture = picture
+            self.picture = self._buildPicture()
         self.picture.play(p)
+
+    def _buildPicture(self, keepSize: bool = False) -> QtGui.QPicture | None:
+        """
+        Generate the drawing specifications and draw them into a new picture.
+
+        Generating the specifications measures the tick labels, which may change the
+        size constraints of the axis (see :meth:`_updateMaxTextSize`); the layout
+        applies them later.
+
+        Parameters
+        ----------
+        keepSize : bool, default False
+            If True and the size constraints of the axis changed while generating the
+            specifications, return None without drawing: the picture would be drawn for
+            a geometry about to change.
+
+        Returns
+        -------
+        QtGui.QPicture or None
+            The picture, or None if ``keepSize`` is True and the size constraints
+            changed.
+        """
+        profiler = debug.Profiler()
+        picture = QtGui.QPicture()
+        painter = QtGui.QPainter(picture)
+        self._buildingPicture = True
+        try:
+            if self.style["tickFont"]:
+                painter.setFont(self.style["tickFont"])
+            constraints = self._sizeConstraints() if keepSize else None
+            specs = self.generateDrawSpecs(painter)
+            profiler('generate specs')
+            if constraints is not None and self._sizeConstraints() != constraints:
+                return None
+            if specs is not None:
+                self.drawPicture(painter, *specs)
+                profiler('draw picture')
+        finally:
+            self._buildingPicture = False
+            painter.end()
+        return picture
+
+    def _sizeConstraints(self) -> tuple[float, float, float, float]:
+        """
+        Return the size constraints that the layout applies to the axis.
+
+        Returns
+        -------
+        tuple of float
+            The minimum and maximum widths, then the minimum and maximum heights.
+        """
+        return (self.minimumWidth(), self.maximumWidth(),
+                self.minimumHeight(), self.maximumHeight())
+
+    def _invalidatePicture(self) -> None:
+        """
+        Drop the picture of the axis and have it built when the scene prepares.
+
+        In a :class:`GraphicsScene <pyqtgraph.GraphicsScene>`, :meth:`_prepareForPaint`
+        is connected to its ``sigPrepareForPaint`` signal until the picture is built,
+        and a prepare is requested (see :meth:`GraphicsScene.requestPrepare
+        <pyqtgraph.GraphicsScene.requestPrepare>`). The picture is thus built before
+        Qt computes the regions to repaint, and a new size of the tick labels is laid
+        out before the paint instead of after it, which cost a second paint.
+        Otherwise :meth:`paint` builds the picture, as it does for hidden axes and for
+        subclasses overriding :meth:`paint`, which may not use the picture.
+
+        Changes made while the picture is built (see :meth:`_buildPicture`) only drop
+        the picture: the built picture is assigned afterwards. The size constraints
+        set by :meth:`_updateWidth` and :meth:`_updateHeight` do not change the
+        picture by themselves; a new geometry reaches :meth:`resizeEvent`.
+        """
+        self.picture = None
+        if self._buildingPicture or not self.isVisible():
+            return
+        if type(self).paint is not AxisItem.paint:
+            return
+        scene = self.scene()
+        requestPrepare = getattr(scene, 'requestPrepare', None)
+        if requestPrepare is None:
+            return
+        preparing = self._preparingScene
+        if preparing is None or preparing() is not scene:
+            self._disconnectPrepare()
+            # Connected while a picture is pending only, not for as long as the item is
+            # in the scene (from itemChange): the signal stays cheap to emit, and
+            # itemChange also runs while a scene is torn down, when connecting can
+            # crash PySide6.
+            scene.sigPrepareForPaint.connect(self._prepareForPaint)
+            self._preparingScene = weakref.ref(scene)
+        requestPrepare()
+
+    def _disconnectPrepare(self) -> QtWidgets.QGraphicsScene | None:
+        """
+        Disconnect :meth:`_prepareForPaint` from the scene it is connected to, if any.
+
+        Returns
+        -------
+        QtWidgets.QGraphicsScene or None
+            The scene that was connected, or None if there was none or it was
+            deleted.
+        """
+        preparing, self._preparingScene = self._preparingScene, None
+        scene = None if preparing is None else preparing()
+        if scene is not None:
+            try:
+                scene.sigPrepareForPaint.disconnect(self._prepareForPaint)
+            except (TypeError, RuntimeError):
+                # TypeError and RuntimeError are from PyQt and PySide, respectively
+                pass
+        return scene
+
+    @QtCore.Slot()
+    def _prepareForPaint(self) -> None:
+        """
+        Build the picture invalidated by :meth:`_invalidatePicture`, then disconnect.
+
+        Connected to ``sigPrepareForPaint`` of the scene only while a picture is
+        pending. When the tick labels need a new size, the picture, which would be
+        drawn for the previous geometry, is not kept: the scene lays out the new size
+        and prepares again (see :meth:`GraphicsScene.event
+        <pyqtgraph.GraphicsScene.event>`), and the picture is built for the new
+        geometry then.
+        """
+        scene = self._disconnectPrepare()
+        if (
+            self.picture is not None
+            or scene is None
+            or scene is not self.scene()
+            or not self.isVisible()
+        ):
+            return
+        picture = self._buildPicture(keepSize=True)
+        if picture is None:
+            self._invalidatePicture()
+        else:
+            self.picture = picture
 
 
     def setTickDensity(self, density=1.0):
@@ -1128,7 +1278,7 @@ class AxisItem(GraphicsWidget):
             Density of ticks to display, by default 1.0.
         """
         self._tickDensity = density
-        self.picture = None
+        self._invalidatePicture()
         self.update()
 
 
@@ -1179,7 +1329,7 @@ class AxisItem(GraphicsWidget):
         """        
 
         self._tickLevels = ticks
-        self.picture = None
+        self._invalidatePicture()
         self.update()
 
     def setTickSpacing(
@@ -1221,7 +1371,7 @@ class AxisItem(GraphicsWidget):
         if levels is None:
             levels = None if major is None else [(major, 0.), (minor, 0.)]
         self._tickSpacing = levels
-        self.picture = None
+        self._invalidatePicture()
         self.update()
 
     def tickSpacing(self, minVal: float, maxVal: float, size: float):

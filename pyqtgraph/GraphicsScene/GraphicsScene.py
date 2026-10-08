@@ -14,6 +14,10 @@ getMillis = lambda: perf_counter_ns() // 10 ** 6
 _LAYOUT_REQUEST = int(getattr(QtCore.QEvent.Type.LayoutRequest, 'value',
                               QtCore.QEvent.Type.LayoutRequest))
 
+# Maximum number of prepareForPaint passes before Qt computes the regions to repaint,
+# see GraphicsScene.event.
+_MAX_PREPARE_PASSES = 6
+
 
 __all__ = ['GraphicsScene']
 
@@ -133,8 +137,9 @@ class GraphicsScene(QtWidgets.QGraphicsScene):
 
         Items whose deferred work changes the geometry or the transformation of other
         items, such as the auto-range and the view transformation of a
-        :class:`ViewBox <pyqtgraph.ViewBox>`, call this method when that work becomes
-        pending. The work then happens before Qt processes the items marked dirty,
+        :class:`ViewBox <pyqtgraph.ViewBox>` or the tick labels of an
+        :class:`AxisItem <pyqtgraph.AxisItem>`, which set its size, call this method
+        when that work becomes pending. The work then happens before Qt processes the items marked dirty,
         and the changes it makes are repainted in the same pass instead of a second
         one. :meth:`GraphicsView.paintEvent <pyqtgraph.GraphicsView.paintEvent>`
         still calls :meth:`prepareForPaint` in any case.
@@ -170,15 +175,22 @@ class GraphicsScene(QtWidgets.QGraphicsScene):
             and ev.type() == QtCore.QEvent.Type.MetaCall
             and any(view.isVisible() for view in self.views())
         ):
-            self.prepareForPaint()
-            # Layouts invalidated meanwhile, e.g. by an item resizing itself while
-            # preparing, would otherwise be applied after the paint and repainted
-            # again: deliver their posted LayoutRequest events now. Then prepare again
-            # if more work was requested meanwhile, e.g. by a view resized by the
-            # layout or by a linked view whose range changed after it was prepared.
-            QtCore.QCoreApplication.sendPostedEvents(None, _LAYOUT_REQUEST)
-            if self._prepareRequested:
+            # Layouts invalidated while preparing, e.g. by an axis whose tick labels
+            # need a new size, would otherwise be applied after the paint and
+            # repainted again: their posted LayoutRequest events are delivered after
+            # each pass. Another pass follows if more work was requested meanwhile:
+            # by a view resized by the layout, by a linked view whose range changed
+            # after it was prepared, by an axis whose range changed. In a PlotItem,
+            # an auto-range changing the width of an axis takes four passes: the
+            # auto-range; the axis measuring its labels, then the layout; the
+            # auto-range and the axis pictures for the new size; a last pass finding
+            # nothing left. Grids of plots take one more. The bound stops work that
+            # would not converge, which GraphicsView.paintEvent then prepares.
+            for _ in range(_MAX_PREPARE_PASSES):
                 self.prepareForPaint()
+                QtCore.QCoreApplication.sendPostedEvents(None, _LAYOUT_REQUEST)
+                if not self._prepareRequested:
+                    break
         return super().event(ev)
     
 
