@@ -165,6 +165,21 @@ def test_clear_in_step_mode():
     w.addItem(c)
     c.clear()
 
+def test_dataBounds_curve_and_scatter():
+    # in step mode the scatter sits at the bin centres while the curve spans
+    # the bin edges; the merged upper bound must come from the curve
+    w = pg.PlotWidget()
+    x = np.arange(11.)
+    y = np.arange(10.)
+    item = pg.PlotDataItem(x, y, stepMode='center', symbol='o')
+    w.addItem(item)
+
+    assert item.curve.dataBounds(0)[1] == 10
+    assert item.scatter.dataBounds(0)[1] == 9.5
+    assert item.dataBounds(0)[1] == 10
+
+    w.close()
+
 def test_clipping():
     y = np.random.normal(size=150)
     x = np.exp2(np.linspace(5, 10, 150))  # non-uniform spacing
