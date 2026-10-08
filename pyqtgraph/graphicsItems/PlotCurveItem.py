@@ -443,8 +443,10 @@ class PlotCurveItem(GraphicsObject):
         return self._boundingRect
 
     def viewTransformChanged(self):
-        self.invalidateBounds()
+        # Only the pixel padding of the bounding rectangle depends on the view.
+        # The data bounds do not: keep their cache, recomputing them is O(N).
         self.prepareGeometryChange()
+        self._boundingRect = None
 
     #def boundingRect(self):
         #if self._boundingRect is None:
@@ -627,8 +629,8 @@ class PlotCurveItem(GraphicsObject):
         self.yData = kwargs['y'].view(np.ndarray)
         self.xData = kwargs['x'].view(np.ndarray)
         
-        self.invalidateBounds()
         self.prepareGeometryChange()
+        self.invalidateBounds()
         self.informViewBoundsChanged()
 
         profiler('copy')
