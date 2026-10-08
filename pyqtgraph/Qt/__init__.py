@@ -63,9 +63,65 @@ class FailedImport(object):
         raise self.err
 
 
-def _loadUiType(uiFile):
+def _loadUiType(uiFile: str) -> tuple[type, type]:
+    """
+    Load a Qt Designer ``.ui`` file with PySide.
+
+    ``QtUiTools.loadUiType`` runs the ``pyside*-uic`` script, which some PySide6
+    versions do not find with some installations (PySide6 6.12 on Windows, outside a
+    virtual environment) and then return None. The file is compiled with the ``uic``
+    tool of the binding instead in that case.
+
+    Parameters
+    ----------
+    uiFile : str
+        Path of the ``.ui`` file.
+
+    Returns
+    -------
+    tuple of (type, type)
+        The generated ``Ui_*`` form class, and the Qt widget class it sets up.
+    """
     QtUiTools = importlib.import_module(QT_LIB + '.QtUiTools')
-    return QtUiTools.loadUiType(uiFile)
+    result = QtUiTools.loadUiType(uiFile)
+    if result is None:
+        result = _compileUiType(uiFile)
+    return result
+
+
+def _compileUiType(uiFile: str) -> tuple[type, type]:
+    """
+    Compile a Qt Designer ``.ui`` file with the ``uic`` tool shipped with PySide.
+
+    The tool is run through the ``pyside_tool`` module of the binding, which locates
+    its ``uic`` executable as the ``pyside*-uic`` script does.
+
+    Parameters
+    ----------
+    uiFile : str
+        Path of the ``.ui`` file.
+
+    Returns
+    -------
+    tuple of (type, type)
+        The generated ``Ui_*`` form class, and the Qt widget class it sets up.
+    """
+    import subprocess
+    from xml.etree import ElementTree
+
+    root = ElementTree.parse(uiFile).getroot()
+    formName = root.find('class').text
+    widgetClass = root.find('widget').get('class')
+    code = subprocess.check_output([
+        sys.executable, '-c',
+        f'from {QT_LIB}.scripts.pyside_tool import uic; uic()',
+        os.fspath(uiFile),
+    ])
+    namespace = {}
+    exec(compile(code, os.fspath(uiFile), 'exec'), namespace)
+    formClass = namespace['Ui_' + formName]
+    baseClass = namespace.get(widgetClass) or getattr(QtWidgets, widgetClass)
+    return formClass, baseClass
 
 
 # For historical reasons, pyqtgraph maintains a Qt4-ish interface back when
