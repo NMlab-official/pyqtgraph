@@ -194,8 +194,8 @@ class _GrowableArray:
     """
     One-dimensional array with a logical length and a geometric capacity.
 
-    Appending is amortised O(1) per element. The interface is a superset of the
-    class of the same name in :mod:`pyqtgraph.graphicsItems.CandlestickItem`.
+    Appending is amortised O(1) per element. Also used by
+    :mod:`pyqtgraph.graphicsItems.CandlestickItem`.
 
     Parameters
     ----------
@@ -280,8 +280,7 @@ class _PrimitiveBuffer:
     The underlying array is only ever resized to its capacity, and drawn through
     ``drawargs(start, stop)``, so that appending keeps the existing primitives with
     every binding, including ``sip.array`` older than 6.7.8 which reallocates on any
-    resize. The interface is a superset of the class of the same name in
-    :mod:`pyqtgraph.graphicsItems.CandlestickItem`.
+    resize. Also used by :mod:`pyqtgraph.graphicsItems.CandlestickItem`.
 
     Parameters
     ----------
