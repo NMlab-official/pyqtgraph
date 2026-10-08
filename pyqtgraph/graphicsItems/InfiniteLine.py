@@ -1,10 +1,12 @@
-from math import atan2, degrees
+from collections.abc import Sequence
+from math import atan2, degrees, hypot
+from typing import Any
 
 import numpy as np
 
 from .. import functions as fn
 from ..Point import Point
-from ..Qt import QtCore, QtGui
+from ..Qt import QtCore, QtGui, QtWidgets
 from .GraphicsItem import GraphicsItem
 from .GraphicsObject import GraphicsObject
 from .TextItem import TextItem
@@ -34,40 +36,68 @@ class InfiniteLine(GraphicsObject):
     sigPositionChanged = QtCore.Signal(object)
     sigClicked = QtCore.Signal(object, object)
 
-    def __init__(self, pos=None, angle=90, pen=None, movable=False, bounds=None,
-                 hoverPen=None, label=None, labelOpts=None, span=(0, 1), markers=None, 
-                 name=None):
+    # Item changes after which the bounds, expressed in local coordinates, must be
+    # recomputed: they move the line relative to its view.
+    _geometryChanges = (
+        QtWidgets.QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged,
+        QtWidgets.QGraphicsItem.GraphicsItemChange.ItemTransformHasChanged,
+        QtWidgets.QGraphicsItem.GraphicsItemChange.ItemRotationHasChanged,
+        QtWidgets.QGraphicsItem.GraphicsItemChange.ItemScaleHasChanged,
+        QtWidgets.QGraphicsItem.GraphicsItemChange.ItemTransformOriginPointHasChanged,
+    )
+
+    def __init__(self, pos: float | Sequence[float] | QtCore.QPointF | None = None,
+                 angle: float = 90, pen: Any = None, movable: bool = False,
+                 bounds: Sequence[float | None] | None = None, hoverPen: Any = None,
+                 label: str | None = None, labelOpts: dict[str, Any] | None = None,
+                 span: tuple[float, float] = (0, 1),
+                 markers: Sequence[tuple[str, float, float]] | None = None,
+                 name: str | None = None) -> None:
         """
-        =============== ==================================================================
-        **Arguments:**
-        pos             Position of the line. This can be a QPointF or a single value for
-                        vertical/horizontal lines.
-        angle           Angle of line in degrees. 0 is horizontal, 90 is vertical.
-        pen             Pen to use when drawing line. Can be any arguments that are valid
-                        for :func:`mkPen <pyqtgraph.mkPen>`. Default pen is transparent
-                        yellow.
-        hoverPen        Pen to use when the mouse cursor hovers over the line. 
-                        Only used when movable=True.
-        movable         If True, the line can be dragged to a new position by the user.
-        bounds          Optional [min, max] bounding values. Bounds are only valid if the
-                        line is vertical or horizontal.
-        hoverPen        Pen to use when drawing line when hovering over it. Can be any
-                        arguments that are valid for :func:`mkPen <pyqtgraph.mkPen>`.
-                        Default pen is red.
-        label           Text to be displayed in a label attached to the line, or
-                        None to show no label (default is None). May optionally
-                        include formatting strings to display the line value.
-        labelOpts       A dict of keyword arguments to use when constructing the
-                        text label. See :class:`InfLineLabel <pyqtgraph.graphicsItems.InfiniteLine.InfLineLabel>`.
-        span            Optional tuple (min, max) giving the range over the view to draw
-                        the line. For example, with a vertical line, use span=(0.5, 1)
-                        to draw only on the top half of the view.
-        markers         List of (marker, position, size) tuples, one per marker to display
-                        on the line. See the addMarker method.
-        name            Name of the item
-        =============== ==================================================================
+        Parameters
+        ----------
+        pos : float or sequence of float or QtCore.QPointF, optional
+            Position of the line. This can be a QPointF or a single value for
+            vertical/horizontal lines.
+        angle : float, default 90
+            Angle of line in degrees. 0 is horizontal, 90 is vertical.
+        pen : Any, optional
+            Pen to use when drawing line. Can be any arguments that are valid
+            for :func:`mkPen <pyqtgraph.mkPen>`. Default pen is transparent
+            yellow.
+        movable : bool, default False
+            If True, the line can be dragged to a new position by the user.
+        bounds : sequence of float or None, optional
+            Optional [min, max] bounding values. Bounds are only valid if the
+            line is vertical or horizontal.
+        hoverPen : Any, optional
+            Pen to use when drawing line when the mouse cursor hovers over it (only
+            used when movable=True). Can be any arguments that are valid for
+            :func:`mkPen <pyqtgraph.mkPen>`. Default pen is red.
+        label : str, optional
+            Text to be displayed in a label attached to the line, or
+            None to show no label (default is None). May optionally
+            include formatting strings to display the line value.
+        labelOpts : dict, optional
+            A dict of keyword arguments to use when constructing the
+            text label. See :class:`InfLineLabel <pyqtgraph.graphicsItems.InfiniteLine.InfLineLabel>`.
+        span : tuple of float, default (0, 1)
+            Optional tuple (min, max) giving the range over the view to draw
+            the line. For example, with a vertical line, use span=(0.5, 1)
+            to draw only on the top half of the view.
+        markers : sequence of tuple, optional
+            List of (marker, position, size) tuples, one per marker to display
+            on the line. See the addMarker method.
+        name : str, optional
+            Name of the item
         """
-        self._boundingRect = None
+        # Cache variables for managing bounds. They are kept up to date by
+        # _updateBoundingRect, which is enabled at the end of __init__.
+        self._boundingRect = QtCore.QRectF()
+        self._endPoints = (0, 1)
+        self._line = QtCore.QLineF(0.0, 0.0, 1.0, 0.0)
+        self._lastViewSize = None
+        self._trackGeometry = False
 
         self._name = name
 
@@ -104,12 +134,10 @@ class InfiniteLine(GraphicsObject):
         if markers is not None:
             for m in markers:
                 self.addMarker(*m)
-                
-        # Cache variables for managing bounds
-        self._endPoints = [0, 1] # 
-        self._bounds = None
-        self._lastViewSize = None
-        
+
+        self._trackGeometry = True
+        self._updateBoundingRect()
+
         if label is not None:
             labelOpts = {} if labelOpts is None else labelOpts
             self.label = InfLineLabel(self, text=label, **labelOpts)
@@ -129,22 +157,35 @@ class InfiniteLine(GraphicsObject):
         """
         return self.maxRange[:]
         
-    def setPen(self, *args, **kwargs):
-        """Set the pen for drawing the line. Allowable arguments are any that are valid
-        for :func:`mkPen <pyqtgraph.mkPen>`."""
+    def setPen(self, *args: Any, **kwargs: Any) -> None:
+        """
+        Set the pen for drawing the line.
+
+        Parameters
+        ----------
+        *args, **kwargs : Any
+            Any arguments that are valid for :func:`mkPen <pyqtgraph.mkPen>`.
+        """
         self.pen = fn.mkPen(*args, **kwargs)
+        self._updateBoundingRect()  # the bounds depend on the pen width
         if not self.mouseHovering:
             self.currentPen = self.pen
             self.update()
 
-    def setHoverPen(self, *args, **kwargs):
-        """Set the pen for drawing the line while the mouse hovers over it.
-        Allowable arguments are any that are valid
-        for :func:`mkPen <pyqtgraph.mkPen>`.
+    def setHoverPen(self, *args: Any, **kwargs: Any) -> None:
+        """
+        Set the pen for drawing the line while the mouse hovers over it.
 
         If the line is not movable, then hovering is also disabled.
 
-        Added in version 0.9.9."""
+        Added in version 0.9.9.
+
+        Parameters
+        ----------
+        *args, **kwargs : Any
+            Any arguments that are valid for :func:`mkPen <pyqtgraph.mkPen>`. If no
+            width is given, the width of the regular pen is used.
+        """
         # If user did not supply a width, then copy it from pen
         widthSpecified = ((len(args) == 1 and 
                            (isinstance(args[0], QtGui.QPen) or
@@ -153,23 +194,27 @@ class InfiniteLine(GraphicsObject):
         self.hoverPen = fn.mkPen(*args, **kwargs)
         if not widthSpecified:
             self.hoverPen.setWidth(self.pen.width())
-            
+        self._updateBoundingRect()  # the bounds depend on the hover pen width
+
         if self.mouseHovering:
             self.currentPen = self.hoverPen
             self.update()
         
-    def addMarker(self, marker, position=0.5, size=10.0):
-        """Add a marker to be displayed on the line. 
-        
-        ============= =========================================================
-        **Arguments**
-        marker        String indicating the style of marker to add:
-                      ``'<|'``, ``'|>'``, ``'>|'``, ``'|<'``, ``'<|>'``,
-                      ``'>|<'``, ``'^'``, ``'v'``, ``'o'``
-        position      Position (0.0-1.0) along the visible extent of the line
-                      to place the marker. Default is 0.5.
-        size          Size of the marker in pixels. Default is 10.0.
-        ============= =========================================================
+    def addMarker(self, marker: str, position: float = 0.5, size: float = 10.0) -> None:
+        """
+        Add a marker to be displayed on the line.
+
+        Parameters
+        ----------
+        marker : str
+            String indicating the style of marker to add:
+            ``'<|'``, ``'|>'``, ``'>|'``, ``'|<'``, ``'<|>'``,
+            ``'>|<'``, ``'^'``, ``'v'``, ``'o'``
+        position : float, default 0.5
+            Position (0.0-1.0) along the visible extent of the line
+            to place the marker.
+        size : float, default 10.0
+            Size of the marker in pixels.
         """
         path = QtGui.QPainterPath()
         if marker == 'o': 
@@ -201,13 +246,14 @@ class InfiniteLine(GraphicsObject):
         
         self.markers.append((path, position, size))
         self._maxMarkerSize = max([m[2] / 2. for m in self.markers])
+        self._updateBoundingRect()
         self.update()
 
-    def clearMarkers(self):
-        """ Remove all markers from this line.
-        """
+    def clearMarkers(self) -> None:
+        """Remove all markers from this line."""
         self.markers = []
         self._maxMarkerSize = 0
+        self._updateBoundingRect()
         self.update()
         
     def setAngle(self, angle):
@@ -223,8 +269,16 @@ class InfiniteLine(GraphicsObject):
         self.setRotation(self.angle)
         self.update()
 
-    def setPos(self, pos):
+    def setPos(self, pos: float | Sequence[float] | QtCore.QPointF) -> None:
+        """
+        Set the position of the line.
 
+        Parameters
+        ----------
+        pos : float or sequence of float or QtCore.QPointF
+            New position. A single value is accepted for horizontal and vertical
+            lines; it is clipped to :meth:`bounds` for these lines.
+        """
         if isinstance(pos, (list, tuple, np.ndarray)) and not np.ndim(pos) == 0:
             newPos = list(pos)
         elif isinstance(pos, QtCore.QPointF):
@@ -251,7 +305,7 @@ class InfiniteLine(GraphicsObject):
 
         if self.p != newPos:
             self.p = newPos
-            self.viewTransformChanged()
+            # itemChange updates the cached bounds before the signal is emitted
             GraphicsObject.setPos(self, Point(self.p))
             self.sigPositionChanged.emit(self)
 
@@ -280,71 +334,194 @@ class InfiniteLine(GraphicsObject):
         QPointF are all acceptable)."""
         self.setPos(v)
     
-    def setSpan(self, mn, mx):
+    def setSpan(self, mn: float, mx: float) -> None:
+        """
+        Set the fraction of the view, along the line, over which it is drawn.
+
+        Parameters
+        ----------
+        mn, mx : float
+            Start and end of the line, from 0 to 1. For example, use ``(0.5, 1)`` to
+            draw a vertical line on the top half of the view only.
+        """
         if self.span != (mn, mx):
             self.span = (mn, mx)
+            self._updateBoundingRect()
             self.update()
 
-    def _computeBoundingRect(self):
-        #br = UIGraphicsItem.boundingRect(self)
-        vr = self.viewRect()  # bounds of containing ViewBox mapped to local coords.
+    def _orthoPixelSize(self, axisAligned: bool) -> float:
+        """
+        Return the size of a device pixel orthogonal to the line, in local units.
+
+        Parameters
+        ----------
+        axisAligned : bool
+            True if the local axes of the line are parallel to the axes of its view.
+            When the device transform is axis-aligned too (the view is neither
+            rotated nor sheared on screen), the pixel size is read from it directly
+            instead of the generic, much slower, :meth:`pixelVectors`.
+
+        Returns
+        -------
+        float
+            Length of one pixel orthogonal to the line, or 0 if the item is not
+            displayed yet.
+        """
+        if axisAligned:
+            dt = self.deviceTransform_()
+            if dt is None:
+                return 0.0
+            # The line runs along the local x axis. When the device transform maps
+            # the local axes onto the device axes, a pixel orthogonal to the line is
+            # 1 / (device scale of the local y axis).
+            if dt.m12() == 0.0 and dt.m21() == 0.0 and dt.m22() != 0.0:
+                return 1.0 / abs(dt.m22())
+            if dt.m11() == 0.0 and dt.m22() == 0.0 and dt.m21() != 0.0:
+                return 1.0 / abs(dt.m21())
+        _, ortho = self.pixelVectors(direction=QtCore.QPointF(1.0, 0.0))
+        return 0.0 if ortho is None else abs(ortho.y())
+
+    def _visibleExtent(self) -> tuple[float, float, bool] | None:
+        """
+        Return the extent of the view along the line, in local x coordinates.
+
+        Horizontal and vertical lines placed in a :class:`ViewBox` (the usual case)
+        read the view range directly. Other lines map the view rectangle to local
+        coordinates with the generic, slower, :meth:`viewRect`.
+
+        Returns
+        -------
+        start : float
+            Local x coordinate where the view starts along the line.
+        length : float
+            Length of the view along the line, in local units.
+        axisAligned : bool
+            True if the local axes of the line are parallel to the view axes.
+        None
+            Returned when the line is not in a view.
+        """
+        vb = self.getViewBox()
+        if vb is None:
+            return None
+        if isinstance(vb, ViewBox):
+            # transform from local to view coordinates
+            tr = self.itemTransform(vb.innerSceneItem())[0]
+            if tr.isAffine():
+                m11 = tr.m11()
+                m12 = tr.m12()
+                # The arithmetic below matches the generic mapping of the view
+                # rectangle (QTransform.mapRect), so that the end points are the same.
+                if m11 == 1.0 and m12 == 0.0 and tr.m21() == 0.0:
+                    # local x is view x shifted: horizontal line (any y scale or flip)
+                    (x0, x1), _ = vb.viewRange()
+                    return x0 - tr.dx(), x1 - x0, True
+                if m11 == 0.0 and m12 == 1.0 and tr.m22() == 0.0:
+                    # local x is view y shifted: vertical line (rotated by 90 degrees)
+                    _, (y0, y1) = vb.viewRange()
+                    top = y0 - tr.dy()
+                    bottom = (y0 + (y1 - y0)) - tr.dy()  # rounded as QRectF.bottom()
+                    return top, bottom - top, True
+        vr = self.viewRect()  # bounds of the containing view mapped to local coords
         if vr is None:
-            return QtCore.QRectF()
+            return None
+        return vr.left(), vr.width(), False
 
-        # compute the pixel size orthogonal to the line
-        # this is more complicated than it seems, maybe it can be simplified
-        _, ortho = self.pixelVectors(direction=Point(1, 0))
-        px = 0 if ortho is None else ortho.y()
+    def _computeBoundingRect(self) -> tuple[QtCore.QRectF, float, float] | None:
+        """
+        Compute the bounding rectangle and the visible end points of the line.
 
+        This method has no side effect; :meth:`_updateBoundingRect` stores its
+        result and notifies Qt of geometry changes.
+
+        Returns
+        -------
+        rect : QtCore.QRectF
+            Bounding rectangle in local coordinates, padded by the pen width, the
+            marker size and one pixel orthogonally to the line.
+        left, right : float
+            Local x coordinates of the end points of the line, given the span.
+        None
+            Returned when the line is not in a view.
+        """
+        extent = self._visibleExtent()
+        if extent is None:
+            return None
+        start, length, axisAligned = extent
+        px = self._orthoPixelSize(axisAligned)
         pw = max(self.pen.width() / 2, self.hoverPen.width() / 2)
         w = (self._maxMarkerSize + pw + 1) * px
-        br = QtCore.QRectF(vr)
-        br.setBottom(-w)
-        br.setTop(w)
+        left = start + length * self.span[0]
+        right = start + length * self.span[1]
+        rect = QtCore.QRectF(left, -w, right - left, 2 * w).normalized()
+        return rect, left, right
 
-        length = br.width()
-        left = br.left() + length * self.span[0]
-        right = br.left() + length * self.span[1]
-        br.setLeft(left)
-        br.setRight(right)
-        br = br.normalized()
-        
-        vs = self.getViewBox().size()
-        
-        if self._bounds != br or self._lastViewSize != vs:
-            self._bounds = br
-            self._lastViewSize = vs
+    def _updateBoundingRect(self) -> None:
+        """
+        Recompute the cached bounding rectangle and visible end points of the line.
+
+        Called whenever the bounds may have changed: view transform, position or
+        transform of the line, pens, markers and span. ``prepareGeometryChange`` is
+        called *before* the cached rectangle changes, as required by Qt, so that
+        :meth:`boundingRect` only reads the cache.
+        """
+        if not self._trackGeometry:
+            return  # still in __init__
+        computed = self._computeBoundingRect()
+        vb = self.getViewBox()
+        viewSize = None if vb is None else vb.size()
+        if computed is None:
+            rect = QtCore.QRectF()
+        else:
+            rect, left, right = computed
+            if (left, right) != self._endPoints:
+                self._endPoints = (left, right)
+                self._line = QtCore.QLineF(left, 0.0, right, 0.0)
+        if rect != self._boundingRect or viewSize != self._lastViewSize:
             self.prepareGeometryChange()
-        
-        self._endPoints = (left, right)
-        self._lastViewRect = vr
-        
-        return self._bounds
+            self._boundingRect = rect
+            self._lastViewSize = viewSize
 
-    def boundingRect(self):
-        if self._boundingRect is None:
-            self._boundingRect = self._computeBoundingRect()
+    def boundingRect(self) -> QtCore.QRectF:
+        """
+        Return the cached bounding rectangle of the line.
+
+        Returns
+        -------
+        QtCore.QRectF
+            Bounding rectangle in local coordinates; it spans the visible part of the
+            view along the line. The cache is kept up to date by
+            :meth:`_updateBoundingRect`.
+        """
         return self._boundingRect
 
-    def _getVisibleEndpoints(self):
-        left, right = self._endPoints
-        pt1 = Point(left, 0)
-        pt2 = Point(right, 0)
+    def _getVisibleEndpoints(self) -> tuple[QtCore.QPointF, QtCore.QPointF]:
+        """
+        Return the end points of the line clipped to its view.
+
+        Returns
+        -------
+        pt1, pt2 : QtCore.QPointF
+            End points in local coordinates. Oblique lines are clipped to the
+            bounding rectangle of their :class:`ViewBox`.
+        """
+        line = self._line
+        pt1 = line.p1()
+        pt2 = line.p2()
 
         if self.angle % 90 != 0:
             view = self.getViewBox()
             if not isinstance(view, ViewBox):
                 return pt1, pt2
 
-            line = QtGui.QPainterPath()
-            line.moveTo(pt1)
-            line.lineTo(pt2)
-            line = self.itemTransform(view)[0].map(line)
+            path = QtGui.QPainterPath()
+            path.moveTo(pt1)
+            path.lineTo(pt2)
+            path = self.itemTransform(view)[0].map(path)
 
             bounds = QtGui.QPainterPath()
             bounds.addRect(view.boundingRect())
 
-            paths = bounds.intersected(line).toSubpathPolygons(QtGui.QTransform())
+            paths = bounds.intersected(path).toSubpathPolygons(QtGui.QTransform())
             if len(paths) > 0:
                 pts = list(paths[0])
                 pt1 = self.mapFromItem(view, pts[0])
@@ -352,39 +529,47 @@ class InfiniteLine(GraphicsObject):
 
         return pt1, pt2
 
-    def paint(self, p, *args):
+    def paint(self, p: QtGui.QPainter, *args: Any) -> None:
+        """
+        Draw the line and its markers.
+
+        Parameters
+        ----------
+        p : QtGui.QPainter
+            Painter, in local coordinates.
+        *args : Any
+            Style option and widget, unused.
+        """
         if self.angle % 180 not in (0, 90):
             p.setRenderHint(p.RenderHint.Antialiasing)
-        
-        left, right = self._endPoints
+
         pen = self.currentPen
         pen.setJoinStyle(QtCore.Qt.PenJoinStyle.MiterJoin)
         p.setPen(pen)
-        p.drawLine(Point(left, 0), Point(right, 0))
-        
-        
+        p.drawLine(self._line)
+
         if len(self.markers) == 0:
             return
-        
+
         # paint markers in native coordinate system
         tr = p.transform()
         p.resetTransform()
-        
+
         pt1, pt2 = self._getVisibleEndpoints()
         start = tr.map(pt1)
         end = tr.map(pt2)
-        up = tr.map(pt1 + Point(0, 1))
+        up = tr.map(pt1 + QtCore.QPointF(0.0, 1.0))
         dif = end - start
-        length = Point(dif).length()
+        length = hypot(dif.x(), dif.y())
         angle = degrees(atan2(dif.y(), dif.x()))
-        
+
         p.translate(start)
         p.rotate(angle)
-        
+
         up = up - start
         det = up.x() * dif.y() - dif.x() * up.y()
         p.scale(1, 1 if det > 0 else -1)
-        
+
         p.setBrush(fn.mkBrush(self.currentPen.color()))
         #p.setPen(fn.mkPen(None))
         tr = p.transform()
@@ -394,7 +579,7 @@ class InfiniteLine(GraphicsObject):
             p.translate(x, 0)
             p.scale(size, size)
             p.drawPath(path)
-        
+
     def dataBounds(self, axis, frac=1.0, orthoRange=None):
         if axis == 0:
             return None   ## x axis should never be auto-scaled
@@ -444,14 +629,46 @@ class InfiniteLine(GraphicsObject):
             self.currentPen = self.pen
         self.update()
 
-    def viewTransformChanged(self):
+    def viewTransformChanged(self) -> None:
         """
         Called whenever the transformation matrix of the view has changed.
         (eg, the view range has changed or the view was resized)
+
+        The cached bounds are recomputed here, and Qt is notified if they changed,
+        so that :meth:`boundingRect` never has to.
         """
-        self._boundingRect = None
         GraphicsItem.viewTransformChanged(self)
-        
+        self._updateBoundingRect()
+
+    def itemChange(self, change: QtWidgets.QGraphicsItem.GraphicsItemChange,
+                   value: Any) -> Any:
+        """
+        Keep the cached bounds up to date when the line moves within its view.
+
+        Parameters
+        ----------
+        change : QtWidgets.QGraphicsItem.GraphicsItemChange
+            Kind of change.
+        value : Any
+            Value associated with the change.
+
+        Returns
+        -------
+        Any
+            The value returned by the base class.
+        """
+        ret = super().itemChange(change, value)
+        if change in self._geometryChanges:
+            try:
+                tracking = self._trackGeometry
+            except AttributeError:
+                # the item is being garbage collected
+                return ret
+            if tracking:
+                GraphicsItem.viewTransformChanged(self)  # the local view rect moved
+                self._updateBoundingRect()
+        return ret
+
     def setName(self, name):
         self._name = name
 
