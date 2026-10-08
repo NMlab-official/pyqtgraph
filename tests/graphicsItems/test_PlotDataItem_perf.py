@@ -340,3 +340,130 @@ def test_dynamic_range_limit_uses_displayed_data(plot_widget):
     process_events()
     assert item._drlClipActive
     assert item.getData()[1].max() < 1e7
+
+
+# --------------------------------------------------------------------------------------
+# T2.3: incremental streaming, aligned and cached peak blocks
+# --------------------------------------------------------------------------------------
+
+def _stream_pair(plot_widget, **opts):
+    streamed = plot_widget.plot(**opts)
+    reference = plot_widget.plot(**opts)
+    return streamed, reference
+
+
+@pytest.mark.parametrize('opts', [
+    {},
+    {'autoDownsample': True},
+    {'downsample': 7},
+    {'downsample': 7, 'downsampleMethod': 'mean'},
+    {'downsample': 7, 'downsampleMethod': 'subsample'},
+    {'autoDownsample': True, 'clipToView': True},
+    {'symbol': 'o', 'downsample': 3},
+])
+def test_append_data_matches_set_data(plot_widget, opts):
+    rng = np.random.default_rng(0)
+    x = np.cumsum(rng.uniform(0.5, 1.5, 5000))
+    y = rng.normal(size=5000)
+    y[1234] = np.nan
+    streamed, reference = _stream_pair(plot_widget, **opts)
+    if opts.get('clipToView'):
+        plot_widget.setXRange(x[1000], x[3000], padding=0)
+    streamed.setData(x[:100], y[:100])
+    end = 100
+    for size in (1, 1, 5, 300, 1, 2000, 7, 2585):
+        streamed.appendData(x[end:end + size], y[end:end + size])
+        end += size
+        reference.setData(x[:end], y[:end])
+        reference._adsLastValue = streamed._adsLastValue  # same hysteresis state
+        process_events()
+        for got, expected in zip(streamed.getOriginalDataset(), reference.getOriginalDataset()):
+            np.testing.assert_array_equal(got, expected)
+        for got, expected in zip(streamed.getData(), reference.getData()):
+            np.testing.assert_array_equal(got, expected)
+        for ax in (0, 1):
+            assert streamed.dataBounds(ax) == reference.dataBounds(ax)
+    assert end == 5000
+
+
+def test_append_data_scalars_and_implicit_x():
+    item = pg.PlotDataItem()
+    item.appendData([1.0, 2.0])
+    item.appendData(3.0)
+    item.appendData(y=[4.0, 5.0])
+    x, y = item.getOriginalDataset()
+    np.testing.assert_array_equal(x, np.arange(5))
+    np.testing.assert_array_equal(y, [1.0, 2.0, 3.0, 4.0, 5.0])
+    item.setData([0.0, 1.0], [2.0, 3.0])
+    with pytest.raises(TypeError):
+        item.appendData(4.0)
+    with pytest.raises(ValueError):
+        item.appendData([2.0, 3.0], [4.0])
+    item.appendData(2.0, 4.0)
+    np.testing.assert_array_equal(item.getOriginalDataset()[1], [2.0, 3.0, 4.0])
+
+
+def test_append_data_with_mapping_falls_back_to_set_data():
+    item = pg.PlotDataItem(np.arange(1.0, 11.0), np.arange(1.0, 11.0))
+    item.setLogMode(False, True)
+    item.appendData([11.0, 12.0], [11.0, 12.0])
+    x, y = item.getData()
+    np.testing.assert_allclose(y, np.log10(np.arange(1.0, 13.0)))
+
+
+def test_append_data_is_amortized_constant():
+    item = pg.PlotDataItem(np.arange(10.0), np.zeros(10))
+    buffers = set()
+    for k in range(10, 5000):
+        item.appendData(float(k), float(k))
+        buffers.add(id(item.getOriginalDataset()[1].base))
+    # the buffer capacity grows geometrically: few reallocations
+    assert len(buffers) <= 4
+    np.testing.assert_array_equal(item.yData[10:], np.arange(10.0, 5000.0))
+    # bounds are updated from the appended points only
+    with count_calls(pg.graphicsItems.PlotDataItem.PlotDataset, '_getArrayBounds') as scans:
+        item.appendData(5000.0, -1.0)
+    assert scans.count == 2
+    assert item.dataRect() == pg.QtCore.QRectF(
+        pg.QtCore.QPointF(0.0, -1.0), pg.QtCore.QPointF(5000.0, 4999.0)
+    )
+
+
+def test_peak_blocks_are_not_recomputed_while_streaming(plot_widget):
+    item = plot_widget.plot(downsample=10, downsampleMethod='peak')
+    item.setData(np.random.default_rng(0).normal(size=100_000))
+    process_events()
+    cache = item._peakCache
+    assert cache.computedBlocks == 10_000
+    for k in range(100):
+        item.appendData(float(k))
+        process_events()
+    # only the blocks completed by the appended points were computed
+    assert item._peakCache is cache
+    assert cache.computedBlocks == 10_010
+    _, y = item.getData()
+    # complete blocks only
+    assert len(y) == 2 * 10_010
+
+
+def test_peak_blocks_do_not_move_with_the_view(plot_widget):
+    rng = np.random.default_rng(0)
+    x = np.arange(100_000.0)
+    y = rng.normal(size=100_000)
+    item = plot_widget.plot(x, y, downsample=10, downsampleMethod='peak', clipToView=True)
+    shown = []
+    for offset in (0.0, 3.3, 6.6):  # shifts by a fraction of a block
+        plot_widget.setXRange(50_000.0 + offset, 60_000.0 + offset, padding=0)
+        process_events()
+        xd, yd = item.getData()
+        keep = (xd >= 50_100) & (xd <= 59_900)
+        shown.append((xd[keep], yd[keep]))
+    for xd, yd in shown[1:]:
+        np.testing.assert_array_equal(xd, shown[0][0])
+        np.testing.assert_array_equal(yd, shown[0][1])
+    # panning computes only the blocks entering the view
+    computed = item._peakCache.computedBlocks
+    plot_widget.setXRange(50_100.0, 60_100.0, padding=0)
+    process_events()
+    item.getData()
+    assert item._peakCache.computedBlocks - computed <= 11
