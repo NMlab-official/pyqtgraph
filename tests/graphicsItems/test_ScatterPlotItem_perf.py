@@ -7,7 +7,7 @@ entries) instead of durations, see ``tests/perf_helpers.py``.
 import numpy as np
 
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtGui
+from pyqtgraph.Qt import QtCore, QtGui
 
 app = pg.mkQApp()
 
@@ -78,3 +78,67 @@ def test_style_size_default_and_hover():
     assert brush[0] is scatter.opts['brush']
     # the stored data is not modified by _style
     np.testing.assert_array_equal(scatter.data['size'], [3, -1, 5, 6])
+
+
+# --------------------------------------------------------------------------------------
+# T1.5: SpotItems created only for the points hit
+# --------------------------------------------------------------------------------------
+
+class _HoverEvent:
+    """Minimal stand-in of a HoverEvent for ScatterPlotItem.hoverEvent."""
+
+    def __init__(self, pos, exit=False):
+        self._pos = pos
+        self.exit = exit
+
+    def pos(self):
+        return self._pos
+
+
+def _numberOfSpotItems(scatter):
+    return sum(item is not None for item in scatter.data['item'])
+
+
+def _lineScatter(n=100_000, **kwargs):
+    # spots of size 2.5 in data units on a line: a point query hits 3 spots
+    return pg.ScatterPlotItem(x=np.arange(n, dtype=float), y=np.zeros(n), size=2.5,
+                              pxMode=False, **kwargs)
+
+
+def test_points_at_creates_spot_items_for_hits_only():
+    scatter = _lineScatter()
+    assert _numberOfSpotItems(scatter) == 0
+    pts = scatter.pointsAt(QtCore.QPointF(50, 0))
+    assert [pt.index() for pt in pts] == [51, 50, 49]  # reversed order kept
+    assert _numberOfSpotItems(scatter) == 3
+    assert all(isinstance(pt, pg.SpotItem) for pt in pts)
+    assert pts[0].pos() == pg.Point(51, 0)
+
+    # the SpotItems are reused, and points() still creates all of them
+    again = scatter.pointsAt(QtCore.QPointF(50, 0))
+    assert all(a is b for a, b in zip(pts, again))
+    allPoints = scatter.points()
+    assert len(allPoints) == len(scatter.data)
+    assert _numberOfSpotItems(scatter) == len(scatter.data)
+    assert allPoints[50] is pts[1]
+
+    # setData drops the SpotItems
+    scatter.setData(x=np.arange(10.), y=np.zeros(10), size=2.5, pxMode=False)
+    assert _numberOfSpotItems(scatter) == 0
+    assert len(scatter.pointsAt(QtCore.QPointF(100, 0))) == 0
+    assert _numberOfSpotItems(scatter) == 0
+
+
+def test_hover_creates_spot_items_for_hits_only():
+    scatter = _lineScatter(hoverable=True, hoverBrush='r', tip=None)
+    hovered = []
+    scatter.sigHovered.connect(lambda item, points, ev: hovered.append(points))
+    scatter.hoverEvent(_HoverEvent(QtCore.QPointF(20, 0)))
+    assert [pt.index() for pt in hovered[-1]] == [21, 20, 19]
+    assert _numberOfSpotItems(scatter) == 3
+    assert scatter.data['hovered'].sum() == 3
+
+    scatter.hoverEvent(_HoverEvent(QtCore.QPointF(20, 0), exit=True))
+    assert len(hovered[-1]) == 0
+    assert scatter.data['hovered'].sum() == 0
+    assert _numberOfSpotItems(scatter) == 3

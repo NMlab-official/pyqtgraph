@@ -4,6 +4,7 @@ import operator
 import weakref
 from collections import OrderedDict
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -13,6 +14,9 @@ from .. import getConfigOption
 from ..Point import Point
 from ..Qt import QtCore, QtGui
 from .GraphicsObject import GraphicsObject
+
+if TYPE_CHECKING:
+    from ..GraphicsScene.mouseEvents import HoverEvent
 
 __all__ = ['ScatterPlotItem', 'SpotItem']
 
@@ -1083,8 +1087,48 @@ class ScatterPlotItem(GraphicsObject):
                 rec['item'] = SpotItem(rec, self, i)
         return self.data['item']
 
-    def pointsAt(self, pos):
-        return self.points()[self._maskAt(pos)][::-1]
+    def _pointsForIndices(self, idx: np.ndarray) -> np.ndarray:
+        """
+        Return the SpotItems of the given spots, creating only the missing ones.
+
+        Unlike :meth:`points`, which creates a SpotItem for every spot, this method only
+        creates those of ``idx``. Hit tests use it so that their cost does not depend on
+        the total number of spots.
+
+        Parameters
+        ----------
+        idx : numpy.ndarray
+            One-dimensional integer array of spot indices.
+
+        Returns
+        -------
+        numpy.ndarray
+            Object array of :class:`SpotItem`, in the order of ``idx``.
+        """
+        items = self.data['item']
+        for i in idx.tolist():
+            if items[i] is None:
+                items[i] = SpotItem(self.data[i], self, i)
+        return items[idx]
+
+    def pointsAt(self, pos: QtCore.QPointF | QtCore.QRectF) -> np.ndarray:
+        """
+        Return the visible spots overlapping a position or a rectangle.
+
+        Only the SpotItems of the spots found are created.
+
+        Parameters
+        ----------
+        pos : QtCore.QPointF or QtCore.QRectF
+            Position or rectangle in item coordinates.
+
+        Returns
+        -------
+        numpy.ndarray
+            Object array of :class:`SpotItem`, in reverse data order (the spot drawn on
+            top first).
+        """
+        return self._pointsForIndices(np.flatnonzero(self._maskAt(pos))[::-1])
 
     def _maskAt(self, obj):
         """
@@ -1144,7 +1188,18 @@ class ScatterPlotItem(GraphicsObject):
         else:
             ev.ignore()
 
-    def hoverEvent(self, ev):
+    def hoverEvent(self, ev: 'HoverEvent') -> None:
+        """
+        Update the hovered spots, their tool tip, and emit ``sigHovered``.
+
+        Nothing is done unless the item was created with ``hoverable=True``. Only the
+        SpotItems of the hovered spots are created.
+
+        Parameters
+        ----------
+        ev : HoverEvent
+            The hover event delivered by the scene.
+        """
         if self.opts['hoverable']:
             old = self.data['hovered']
 
@@ -1158,7 +1213,7 @@ class ScatterPlotItem(GraphicsObject):
                 self.data['hovered'] = new
                 self.updateSpots()
 
-            points = self.points()[new][::-1]
+            points = self._pointsForIndices(np.flatnonzero(new)[::-1])
 
             # Show information about hovered points in a tool tip
             vb = self.getViewBox()
