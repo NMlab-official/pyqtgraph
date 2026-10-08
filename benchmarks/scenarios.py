@@ -980,7 +980,9 @@ def _candle_item_results(data: dict[str, np.ndarray], n: int) -> list[Result]:
     -------
     list of Result
         setData, setData + first full view paint, full view paint, paint of 200
-        visible candles, appendData of one candle + full view paint.
+        visible candles, appendData of one candle + full view paint, and one tick
+        (``appendData(..., replaceLast=True)`` updating the last candle) + paint of
+        the last 200 candles or of the full view.
     """
     results = []
     head = {key: values[:n] for key, values in data.items()}
@@ -1010,6 +1012,23 @@ def _candle_item_results(data: dict[str, np.ndarray], n: int) -> list[Result]:
 
     results.append(Result(f'S13[{n:.0e} candles appendData 1 + full view paint]',
                           _median_ms(append_and_paint, repeat=18), 'ms'))
+    rng = np.random.default_rng(2)
+
+    def tick(paint: Callable[[], None]) -> Callable[[], None]:
+        def update() -> None:
+            # a trade updates the current candle: high, low and close; open fixed
+            x, o, h, lo, c = (values[-1:] for values in item.ohlc)
+            price = c + 0.05 * rng.standard_normal()
+            item.appendData(x=x, open=o, high=np.maximum(h, price),
+                            low=np.minimum(lo, price), close=price, replaceLast=True)
+            paint()
+        return update
+
+    last = state['k']
+    last_200 = _render_item(item, _candle_rect(data, last - 200, last))
+    for view, paint in (('200 visible', last_200), ('full view', full_view)):
+        label = f'S13[{n:.0e} candles tick: replace last candle + paint, {view}]'
+        results.append(Result(label, _median_ms(tick(paint), repeat=18), 'ms'))
     return results
 
 
@@ -1107,8 +1126,9 @@ def s13_candlesticks(full: bool) -> list[Result]:
     S13: OHLC candlesticks (CandlestickItem) with 1e6 candles and a volume plot.
 
     The item is first painted directly into an image, as in S08: ``setData``, paint
-    of the full view (aggregated candles) and of 200 visible candles, and
-    ``appendData`` of one candle followed by a full view paint. Then, as in a
+    of the full view (aggregated candles) and of 200 visible candles,
+    ``appendData`` of one candle followed by a full view paint, and a tick updating
+    the last candle in place (``replaceLast=True``) followed by a paint. Then, as in a
     trading UI, the candles are shown above a volume BarGraphItem holding the last
     5e5 candles (one brush per direction), with linked x, DateAxisItems and
     ``setAutoVisible(y=True)`` on both plots: one pan step of a 200-candle window,

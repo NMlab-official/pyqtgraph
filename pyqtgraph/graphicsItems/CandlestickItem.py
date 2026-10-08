@@ -150,6 +150,28 @@ class _PrimitiveBuffer:
         return self._array.drawargs(start, stop)
 
 
+def _union(a: tuple[float | None, float | None],
+           b: tuple[float | None, float | None]) -> tuple[float | None, float | None]:
+    """
+    Smallest range containing two ranges.
+
+    Parameters
+    ----------
+    a, b : tuple of float or None
+        ``(low, high)`` ranges; ``(None, None)`` is empty.
+
+    Returns
+    -------
+    tuple of float or None
+        The union, ``(None, None)`` when both are empty.
+    """
+    if a[0] is None:
+        return b
+    if b[0] is None:
+        return a
+    return min(a[0], b[0]), max(a[1], b[1])
+
+
 def _geometry(x: np.ndarray, halfWidth: np.ndarray, open: np.ndarray, high: np.ndarray,
               low: np.ndarray, close: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -255,8 +277,8 @@ class _Level:
     Candles aggregated by blocks of ``k`` consecutive candles.
 
     Block ``j`` holds candles ``j*k`` to ``(j+1)*k - 1``: blocks are aligned to
-    absolute multiples of ``k``, so that appending candles only changes the last
-    block. Level 1 holds the candles themselves.
+    absolute multiples of ``k``, so that appending candles, or replacing the last
+    one, only changes the last block. Level 1 holds the candles themselves.
 
     Parameters
     ----------
@@ -268,7 +290,9 @@ class _Level:
         self.k = k
         self.up = _Side()
         self.down = _Side()
-        # side holding the last block, which changes if that block is incomplete
+        # index of the last block stored in a side, and that side: it is the only
+        # block computed again when candles are appended or the last one replaced
+        self._lastBlock = -1
         self._lastSide = None
 
     def update(self, x: np.ndarray, open: np.ndarray, high: np.ndarray, low: np.ndarray,
@@ -284,17 +308,22 @@ class _Level:
             Width of one candle.
         fromCandle : int
             Candles before this index are unchanged since the previous update; 0 for
-            a full computation.
+            a full computation. Otherwise, at least the number of candles of the
+            previous update minus one: candles were appended, possibly replacing
+            the last one, so that only the last stored block can hold changed
+            candles.
         """
         k = self.k
         count = len(x)
+        firstBlock = fromCandle // k
         if fromCandle == 0:
             self.up.clear()
             self.down.clear()
-            self._lastSide = None
-        elif fromCandle % k and self._lastSide is not None:
-            self._lastSide.pop()  # the last block was incomplete: compute it again
-        first = fromCandle // k * k
+        elif self._lastBlock >= firstBlock:
+            self._lastSide.pop()  # the last block holds changed candles
+        # as fromCandle never decreases, the blocks stored before cannot change
+        self._lastBlock, self._lastSide = -1, None
+        first = firstBlock * k
         if first >= count:
             return
         x, open, high, low, close = (a[first:] for a in (x, open, high, low, close))
@@ -309,7 +338,6 @@ class _Level:
             x, halfWidth, open, high, low, close = self._aggregate(
                 x, open, high, low, close, valid, allValid, width)
         if len(x) == 0:
-            self._lastSide = None
             return
         bodies, wicks = _geometry(x, halfWidth, open, high, low, close)
         up = close >= open
@@ -320,8 +348,10 @@ class _Level:
         else:
             self.up.extend(x, bodies, wicks, np.flatnonzero(up))
             self.down.extend(x, bodies, wicks, np.flatnonzero(~up))
-        lastIsValid = bool(valid[len(valid) - 1 - (len(valid) - 1) % k:].any())
-        self._lastSide = (self.up if up[-1] else self.down) if lastIsValid else None
+        # the last stored block holds the last valid candle
+        lastValid = len(valid) - 1 - int(np.argmax(valid[::-1]))
+        self._lastBlock = firstBlock + lastValid // k
+        self._lastSide = self.up if up[-1] else self.down
 
     def _aggregate(self, x: np.ndarray, open: np.ndarray, high: np.ndarray,
                    low: np.ndarray, close: np.ndarray, valid: np.ndarray, allValid: bool,
@@ -438,7 +468,11 @@ class CandlestickItem(GraphicsObject):
         self._windowKey = None
         # incremented by every data change, invalidates the window
         self._version = 0
+        # y range of all candles, and of all candles but the last one (the head),
+        # which replacing the last candle starts from; _yCount candles are covered
         self._yBounds = None
+        self._yHeadBounds = None
+        self._yCount = 0
         self._upBrush = fn.mkBrush('g')
         self._downBrush = fn.mkBrush('r')
         self._upPen = fn.mkPen('g')
@@ -489,39 +523,83 @@ class CandlestickItem(GraphicsObject):
         self._dataChanged(0)
 
     def appendData(self, *, x: np.ndarray, open: np.ndarray, high: np.ndarray,
-                   low: np.ndarray, close: np.ndarray) -> None:
+                   low: np.ndarray, close: np.ndarray, replaceLast: bool = False) -> None:
         """
-        Append candles, e.g. while streaming.
+        Append candles, e.g. while streaming, or update the last candle in place.
 
-        Appending candles that follow the existing ones (x at or after the last x)
-        only computes the new candles and the last aggregated block of each level of
-        detail. Otherwise all candles are sorted again, as by :meth:`setData`.
+        In a live chart, each tick updates the current candle (its high, low and
+        close; its open is fixed) with ``replaceLast=True``, and a new candle is
+        appended when its period starts.
+
+        Candles that follow the existing ones are handled incrementally: only the new
+        candles, the bounds and the last aggregated block of each cached level of
+        detail are computed, so that the cost does not depend on the number of
+        candles. Candles follow the existing ones when their x are sorted and the
+        first one is at or after the x of the last candle kept: the last candle, or
+        with ``replaceLast=True`` the candle before the replaced one (so the
+        replacing candle may keep the x of the replaced one, the usual case, or move
+        it, provided it stays at or after its predecessor). Otherwise all candles are
+        sorted again, as by :meth:`setData`. Either way the result is the same as
+        :meth:`setData` with all candles and the current width; the automatic width
+        is not recomputed (unless fewer than two candles were kept).
 
         Parameters
         ----------
         x : array_like
-            Position of the new candles.
+            Position of the new candles. Candles with a non-finite x are ignored,
+            except that the candle replacing the last one must have a finite x.
         open, high, low, close : array_like
             Prices of the new candles, same length as ``x``.
+        replaceLast : bool, default False
+            If True, the first new candle replaces the last candle instead of
+            following it. The item must have at least one candle.
+
+        Raises
+        ------
+        ValueError
+            If the arrays have different lengths, or with ``replaceLast=True``, if
+            there is no candle to replace, no new candle or the replacing candle has a
+            non-finite x. The item is left unchanged.
+
+        Examples
+        --------
+        One-minute candles fed by trades:
+
+        >>> item = pg.CandlestickItem(x=[0.0], open=[10], high=[10], low=[10], close=[10])
+        >>> item.appendData(x=[0.0], open=[10], high=[12], low=[10], close=[11],
+        ...                 replaceLast=True)  # a trade at 12, then one at 11
+        >>> item.appendData(x=[60.0], open=[11], high=[11], low=[11], close=[11])
         """
+        if replaceLast:
+            count = len(self._x)
+            if count == 0:
+                raise ValueError('replaceLast=True needs an existing candle to replace')
+            first = np.asarray(x, dtype=np.float64).reshape(-1)[:1]
+            if len(first) == 0:
+                raise ValueError('replaceLast=True needs a new candle')
+            if not math.isfinite(first[0]):
+                raise ValueError('the candle replacing the last one needs a finite x')
         x, open, high, low, close = self._normalize(x, open, high, low, close)
         if len(x) == 0:
             return
-        count = len(self._x)
-        follows = (count == 0 or x[0] >= self._x.view[-1]) and bool((x[1:] >= x[:-1]).all())
+        kept = len(self._x) - 1 if replaceLast else len(self._x)  # unchanged candles
+        follows = ((kept == 0 or x[0] >= self._x.view[kept - 1])
+                   and bool((x[1:] >= x[:-1]).all()))
         if not follows:
-            old = (store.view for store in self._stores())
+            old = (store.view[:kept] for store in self._stores())
             new = (x, open, high, low, close)
             merged = [np.concatenate((a, b)) for a, b in zip(old, new)]
             self.setData(**dict(zip(self._dataNames, merged)))
             return
         for store, values in zip(self._stores(), (x, open, high, low, close)):
+            if replaceLast:
+                store.pop()
             store.extend(values)
-        if self._autoWidth and count < 2:
+        if self._autoWidth and kept < 2:
             self._width = self._defaultWidth()
             self._dataChanged(0)
         else:
-            self._dataChanged(count)
+            self._dataChanged(kept)
 
     def getData(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -618,31 +696,46 @@ class CandlestickItem(GraphicsObject):
 
     def _dataChanged(self, fromCandle: int) -> None:
         """
-        Update the cached geometry after a data or width change.
+        Update the cached geometry and bounds after a data or width change.
 
         Parameters
         ----------
         fromCandle : int
-            Index of the first new candle after an append; 0 when all candles or the
-            width changed.
+            Index of the first new or replaced candle after :meth:`appendData`;
+            candles before it are unchanged. 0 when all candles or the width changed.
         """
         self._version += 1
         if fromCandle == 0:
             self._levels = {}
-            self._yBounds = None
+            self._yBounds = self._yHeadBounds = None
         else:
             arrays = [store.view for store in self._stores()]
             for level in self._levels.values():
                 level.update(*arrays, self._width, fromCandle)
             if self._yBounds is not None:
-                low, high = self._yRange(fromCandle, len(self._x))
-                if low is not None:
-                    lo, hi = self._yBounds
-                    self._yBounds = (low if lo is None else min(lo, low),
-                                     high if hi is None else max(hi, high))
+                # the head bounds cover [0, fromCandle) before the change: the
+                # previous bounds, or the previous head bounds after replacing the
+                # last candle, which may have held the highest or lowest price
+                count = len(self._x)
+                base = self._yHeadBounds if fromCandle < self._yCount else self._yBounds
+                self._setYBounds(_union(base, self._yRange(fromCandle, count - 1)))
         self.prepareGeometryChange()
         self.update()
         self.informViewBoundsChanged()
+
+    def _setYBounds(self, head: tuple[float | None, float | None]) -> None:
+        """
+        Cache the y range of all candles, from that of all candles but the last.
+
+        Parameters
+        ----------
+        head : tuple of float or None
+            Lowest and highest price of all candles but the last one.
+        """
+        count = len(self._x)
+        self._yHeadBounds = head
+        self._yBounds = _union(head, self._yRange(count - 1, count))
+        self._yCount = count
 
     def _level(self, k: int, xmin: float, xmax: float) -> _Level:
         """
@@ -949,7 +1042,7 @@ class CandlestickItem(GraphicsObject):
         if start == 0 and stop == count:
             # all candles, e.g. a zoomed out view
             if self._yBounds is None:
-                self._yBounds = self._yRange(0, count)
+                self._setYBounds(self._yRange(0, count - 1))
             low, high = self._yBounds
         else:
             low, high = self._yRange(start, stop)
