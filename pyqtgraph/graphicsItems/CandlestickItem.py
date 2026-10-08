@@ -919,13 +919,17 @@ class CandlestickItem(GraphicsObject):
         frac : float, default 1.0
             Ignored; the full range is always returned.
         orthoRange : tuple of float or None, default None
-            For ``ax=1``, only the candles intersecting this x range are considered,
-            so that the y range fits the visible candles. Ignored for ``ax=0``.
+            For ``ax=1``, only the candles whose body intersects this x range
+            (bounds included) are considered, so that the y range fits the visible
+            candles, from their lowest low to their highest high: this is what
+            ``ViewBox.setAutoVisible(y=True)`` uses. The candles are found by binary
+            search, and the range of all candles is cached. Ignored for ``ax=0``.
 
         Returns
         -------
         tuple of float or None
-            ``(min, max)``, or ``(None, None)`` without data.
+            ``(min, max)``, or ``(None, None)`` without data or, with
+            ``orthoRange``, without candle within it.
         """
         count = len(self._x)
         if count == 0:
@@ -935,16 +939,19 @@ class CandlestickItem(GraphicsObject):
             x = self._x.view
             pad = 0.5 * self._width + penPad
             return float(x[0]) - pad, float(x[-1]) + pad
-        if orthoRange is None:
-            if self._yBounds is None:
-                self._yBounds = self._yRange(0, count)
-            low, high = self._yBounds
-        else:
+        start, stop = 0, count
+        if orthoRange is not None:
             x = self._x.view
             halfWidth = 0.5 * self._width
             xmin, xmax = min(orthoRange), max(orthoRange)
             start = int(np.searchsorted(x, xmin - halfWidth, side='left'))
             stop = int(np.searchsorted(x, xmax + halfWidth, side='right'))
+        if start == 0 and stop == count:
+            # all candles, e.g. a zoomed out view
+            if self._yBounds is None:
+                self._yBounds = self._yRange(0, count)
+            low, high = self._yBounds
+        else:
             low, high = self._yRange(start, stop)
         if low is None:
             return None, None
