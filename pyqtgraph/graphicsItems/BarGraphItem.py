@@ -459,8 +459,11 @@ class BarGraphItem(GraphicsObject):
             finite = np.isfinite(widths)
             self._meanWidth = float(widths[finite].mean()) if finite.any() else math.nan
         self._xSorted = bool(len(x0) > 0 and allFinite and (x0[1:] >= x0[:-1]).all())
+        # whether the right edges are sorted too, i.e. self._x1 holds the right edges
+        # themselves rather than their running maximum
+        self._x1Sorted = self._xSorted and bool((x1[1:] >= x1[:-1]).all())
         if self._xSorted:
-            if not (x1[1:] >= x1[:-1]).all():
+            if not self._x1Sorted:
                 # right edges are searched for the first visible bar: make them sorted
                 x1 = np.maximum.accumulate(x1)
             self._x0, self._x1 = x0, x1
@@ -802,15 +805,114 @@ class BarGraphItem(GraphicsObject):
     def getData(self):
         return self.opts.get('x'),  self.opts.get('height')
 
-    def dataBounds(self, ax, frac=1.0, orthoRange=None):
-        # _penWidth is available after _updateColors()
-        pw = self._penWidth[0] * 0.5
-        # _dataBounds is available after _prepareData()
-        bounds = self._dataBounds[ax]
+    def dataBounds(self, ax: int, frac: float = 1.0,
+                   orthoRange: tuple[float, float] | None = None
+                   ) -> tuple[float | None, float | None]:
+        """
+        Range of the bars along an axis, including half the width of non-cosmetic pens.
+
+        Parameters
+        ----------
+        ax : int
+            0 for x, 1 for y.
+        frac : float, default 1.0
+            Fraction of the bars to fit, in ``(0, 1]``. Below 1, the range spans from
+            the ``50 * (1 - frac)`` percentile of the lower edges of the bars to the
+            ``50 * (1 + frac)`` percentile of their upper edges, as the percentiles
+            of the data of the other plot items, so that a few outliers (e.g. volume
+            spikes) do not stretch an auto-range.
+        orthoRange : tuple of float or None, default None
+            Only the bars whose extent along the other axis intersects this range
+            (bounds included) are considered. For ``ax=1``, these are the bars within
+            the visible x range, which ``ViewBox.setAutoVisible(y=True)`` fits; when
+            the bars are sorted by x they are found by binary search.
+
+        Returns
+        -------
+        tuple of float or None
+            ``(min, max)``, or ``(None, None)`` without data or when no bar is
+            considered.
+
+        Notes
+        -----
+        The full range (``frac=1`` without ``orthoRange``) is computed once per data
+        change; it is NaN when a coordinate of a bar is NaN. The restricted and
+        percentile ranges ignore the bars with a NaN coordinate.
+        """
+        if ax not in (0, 1):
+            raise ValueError(f'ax must be 0 or 1, got {ax}')
+        if frac >= 1.0 and orthoRange is None:
+            # _dataBounds is available after _prepareData()
+            bounds = self._dataBounds[ax]
+        elif frac <= 0.0:
+            raise ValueError(f'frac must be in (0, 1], got {frac}')
+        else:
+            bounds = self._partialBounds(ax, frac, orthoRange)
         if bounds[0] is None or bounds[1] is None:
             return None, None
-
+        # _penWidth is available after _updateColors()
+        pw = self._penWidth[0] * 0.5
         return (bounds[0] - pw, bounds[1] + pw)
+
+    def _partialBounds(self, ax: int, frac: float,
+                       orthoRange: tuple[float, float] | None
+                       ) -> tuple[float | None, float | None]:
+        """
+        Range of some bars along an axis, without pen; see :meth:`dataBounds`.
+
+        Parameters
+        ----------
+        ax : int
+            0 for x, 1 for y.
+        frac : float
+            Fraction of the bars to fit, in ``(0, 1]``.
+        orthoRange : tuple of float or None
+            Range along the other axis that the bars must intersect; ``None`` for all
+            bars.
+
+        Returns
+        -------
+        tuple of float or None
+            ``(min, max)``, or ``(None, None)`` when no bar with finite coordinates
+            is considered.
+        """
+        memory = self._rectarray.ndarray()
+        if orthoRange is not None:
+            lo, hi = sorted(float(value) for value in orthoRange)
+            if ax == 1 and self._xSorted:
+                # first bar whose right edge reaches lo, first bar starting after hi
+                start = int(np.searchsorted(self._x1, lo, side='left'))
+                stop = int(np.searchsorted(self._x0, hi, side='right'))
+                if frac >= 1.0 and self._x1Sorted and stop - start == len(memory):
+                    # all bars, e.g. a zoomed out view: reuse the full range if finite
+                    ymin, ymax = self._dataBounds[1]
+                    if math.isfinite(ymin) and math.isfinite(ymax):
+                        return float(ymin), float(ymax)
+                memory = memory[start:stop]
+                if not self._x1Sorted:
+                    # self._x1 is the running maximum of the right edges: a bar
+                    # within the slice can still end before lo
+                    memory = memory[memory[:, 0] + memory[:, 2] >= lo]
+            else:
+                other = 1 - ax
+                low = memory[:, other]
+                memory = memory[(low <= hi) & (low + memory[:, other + 2] >= lo)]
+        if len(memory) == 0:
+            return None, None
+        low = memory[:, ax]
+        high = low + memory[:, ax + 2]
+        if frac >= 1.0:
+            bmin, bmax = np.fmin.reduce(low), np.fmax.reduce(high)
+        else:
+            low = low[np.isfinite(low)]
+            high = high[np.isfinite(high)]
+            if len(low) == 0 or len(high) == 0:
+                return None, None
+            bmin = np.percentile(low, 50 * (1 - frac))
+            bmax = np.percentile(high, 50 * (1 + frac))
+        if math.isnan(bmin) or math.isnan(bmax):
+            return None, None
+        return float(bmin), float(bmax)
 
     def pixelPadding(self):
         # _penWidth is available after _updateColors()
