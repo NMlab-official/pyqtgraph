@@ -124,8 +124,8 @@ Référence à `cc94092` : `pytest tests/graphicsItems tests/test_functions.py` 
 
 | ID | Tâche | Phase | Effort | Risque | Gain attendu (scénario) | Dépend de | Statut |
 |----|-------|:-----:|:------:|:------:|-------------------------|-----------|:------:|
-| T0.1 | Scénarios de benchmark reproductibles | 0 | M | F | — (mesure) | — | ☐ |
-| T0.2 | Compteurs d'instrumentation pour les tests | 0 | S | F | — (mesure) | — | ☐ |
+| T0.1 | Scénarios de benchmark reproductibles | 0 | M | F | — (mesure) | — | ☑ |
+| T0.2 | Compteurs d'instrumentation pour les tests | 0 | S | F | — (mesure) | — | ☑ |
 | T1.1 | Ne plus vider le cache des bornes de données au zoom | 1 | S | F | 2-4 parcours O(N) en moins par image | T0.2 | ☐ |
 | T1.2 | Pas de `setData` sur pan/zoom Y sans écrêtage effectif | 1 | S | F | pan Y nuage 1e5 : 394 → ~36 ms | T0.2 | ☐ |
 | T1.3 | Cache `childrenBounds` actif ; ignorer les objets `ignoreBounds` | 1 | M | F | réticule : 58 → ~9 ms/mouvement | T0.2 | ☐ |
