@@ -382,3 +382,132 @@ def test_nan_image_with_downsampling():
     expected = fn.downsample(fn.downsample(data, xds, axis=1), yds, axis=0)
     _assert_nan_indexed(item.qimage, expected)
     view.close()
+
+
+# --------------------------------------------------------------------------------------
+# T4.5: converted copy of Indexed8 images for repeated paints
+# --------------------------------------------------------------------------------------
+
+def _paint_item(item: pg.ImageItem, tr: QtGui.QTransform, smooth: bool = False,
+                device_format=Format.Format_ARGB32_Premultiplied) -> np.ndarray:
+    """
+    Paint an ImageItem onto an image with an opaque background.
+
+    Parameters
+    ----------
+    item : pg.ImageItem
+        Item to paint.
+    tr : QtGui.QTransform
+        Item to device transform.
+    smooth : bool, default False
+        Enable SmoothPixmapTransform.
+    device_format : QtGui.QImage.Format, default Format_ARGB32_Premultiplied
+        Format of the painted image.
+
+    Returns
+    -------
+    np.ndarray
+        Pixels, as int16.
+    """
+    out = QtGui.QImage(240, 180, device_format)
+    out.fill(QtGui.QColor(10, 80, 30))
+    p = QtGui.QPainter(out)
+    p.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, smooth)
+    p.setTransform(tr)
+    item.paint(p, None, None)
+    p.end()
+    return fn.ndarray_from_qimage(out).astype(np.int16)
+
+
+_TRANSFORMS = [
+    QtGui.QTransform(2.3, 0, 0, -1.7, 7.4, 170.2),
+    QtGui.QTransform(0.37, 0, 0, 0.61, -3.3, 2.9),
+    QtGui.QTransform(3.1, 0, 0, 2.9, -11.6, -7.3).rotate(13),
+]
+
+
+@pytest.mark.parametrize('smooth', [False, True])
+@pytest.mark.parametrize('device_format', [Format.Format_ARGB32_Premultiplied, Format.Format_RGB32])
+@pytest.mark.parametrize('nans', [False, True])
+def test_repeated_paints_use_converted_copy(smooth, device_format, nans):
+    data = _float_image_with_nans((90, 110)) if nans else _float_image((90, 110))
+    item = pg.ImageItem(axisOrder='row-major')
+    item.setImage(data, levels=(0, 1), lut=pg.colormap.get('viridis').getLookupTable(nPts=256))
+    item.render()
+    assert item.qimage.format() == Format.Format_Indexed8
+    first = [_paint_item(item, tr, smooth, device_format) for tr in _TRANSFORMS]
+    # the first paint draws the Indexed8 image, the second one converts it once
+    converted = item._convertedQImage[1]
+    assert converted.format() == Format.Format_ARGB32
+    again = [_paint_item(item, tr, smooth, device_format) for tr in _TRANSFORMS]
+    assert item._convertedQImage[1] is converted
+    for a, b in zip(first, again):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_single_paint_does_not_convert():
+    item = pg.ImageItem(_float_image(), axisOrder='row-major', levels=(0, 1),
+                        lut=pg.colormap.get('viridis').getLookupTable(nPts=256))
+    for k in range(3):
+        item.setImage(_float_image(seed=k), levels=(0, 1))
+        _paint_item(item, _TRANSFORMS[0])
+        assert item._convertedQImage is None
+
+
+def test_converted_copy_invalidated_by_changes():
+    lut = pg.colormap.get('viridis').getLookupTable(nPts=256)
+    item = pg.ImageItem(_float_image(), axisOrder='row-major', levels=(0, 1), lut=lut)
+    tr = _TRANSFORMS[0]
+
+    def reference(**opts):
+        ref = pg.ImageItem(_float_image(), axisOrder='row-major', levels=(0, 1), lut=lut)
+        ref.setOpts(**opts)
+        return _paint_item(ref, tr)
+
+    for _ in range(2):
+        _paint_item(item, tr)
+    assert item._convertedQImage is not None
+
+    item.setLevels((0.3, 0.6))
+    np.testing.assert_array_equal(_paint_item(item, tr), reference(levels=(0.3, 0.6)))
+    np.testing.assert_array_equal(_paint_item(item, tr), reference(levels=(0.3, 0.6)))
+
+    plasma = pg.colormap.get('plasma').getLookupTable(nPts=256)
+    item.setLookupTable(plasma)
+    np.testing.assert_array_equal(_paint_item(item, tr), reference(levels=(0.3, 0.6), lut=plasma))
+
+    item.clear()
+    assert item._convertedQImage is None
+
+
+def test_images_sharing_data_memory_are_not_converted():
+    data = (np.arange(64 * 48).reshape(64, 48) % 256).astype(np.uint8)
+    item = pg.ImageItem(data, axisOrder='row-major', levels=(10, 200),
+                        lut=pg.colormap.get('viridis').getLookupTable(nPts=256))
+    item.render()
+    assert item.qimage.format() == Format.Format_Indexed8
+    for _ in range(3):
+        _paint_item(item, _TRANSFORMS[0])
+    assert item._convertedQImage is None
+    # changes made to the data in place are still shown by a repaint
+    before = _paint_item(item, _TRANSFORMS[0])
+    data[:] = 255 - data
+    assert (_paint_item(item, _TRANSFORMS[0]) != before).any()
+
+
+def test_large_images_are_not_converted(monkeypatch):
+    monkeypatch.setattr(pg.ImageItem, '_maxConvertedPixels', 100)
+    item = pg.ImageItem(_float_image(), axisOrder='row-major', levels=(0, 1),
+                        lut=pg.colormap.get('viridis').getLookupTable(nPts=256))
+    for _ in range(3):
+        _paint_item(item, _TRANSFORMS[0])
+    assert item._convertedQImage is None
+
+
+def test_other_formats_are_not_converted():
+    rgb = np.random.default_rng(0).integers(0, 256, size=(40, 30, 3), dtype=np.uint8)
+    item = pg.ImageItem(rgb.astype(np.float32), axisOrder='row-major', levels=(0, 255))
+    for _ in range(3):
+        _paint_item(item, _TRANSFORMS[0])
+    assert item.qimage.format() != Format.Format_Indexed8
+    assert item._convertedQImage is None
