@@ -20,7 +20,7 @@ from pyqtgraph.graphicsItems.ScatterPlotItem import (
     renderSymbol,
 )
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, paints_per_update, process_events
 
 app = pg.mkQApp()
 
@@ -695,4 +695,66 @@ def test_paint_all_inside_skips_culling():
         scatter._prepareFragments(QtGui.QTransform(), QtCore.QRectF(1.5, 0, 4, 4), 1.0)
         assert lengths.count == 1
     assert len(scatter._pixmapFragments) == 2
+
+
+# --------------------------------------------------------------------------------------
+# T4.1: opt-in DeviceCoordinateCache
+# --------------------------------------------------------------------------------------
+
+def _scatterUnderCrosshair(**kwargs):
+    rng = np.random.default_rng(0)
+    pw = pg.PlotWidget()
+    pw.resize(400, 300)
+    scatter = pg.ScatterPlotItem(x=rng.normal(size=2000), y=rng.normal(size=2000), size=7,
+                                 pen=None, brush=(255, 0, 0, 120), **kwargs)
+    pw.addItem(scatter)
+    line = pg.InfiniteLine(angle=90)
+    pw.addItem(line, ignoreBounds=True)
+    return pw, scatter, line
+
+
+def test_device_cache_off_by_default():
+    scatter = pg.ScatterPlotItem(x=[0], y=[0])
+    assert scatter.opts['useDeviceCache'] is False
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.NoCache
+    scatter.setUseDeviceCache(True)
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache
+    scatter.setData(x=[1], y=[1], useDeviceCache=False)
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.NoCache
+
+
+def test_device_cache_not_used_with_other_composition_modes():
+    plus = QtGui.QPainter.CompositionMode.CompositionMode_Plus
+    sourceOver = QtGui.QPainter.CompositionMode.CompositionMode_SourceOver
+    scatter = pg.ScatterPlotItem(x=[0], y=[0], useDeviceCache=True, compositionMode=plus)
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.NoCache
+    scatter.setData(x=[0], y=[0], compositionMode=sourceOver)
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache
+
+
+def test_device_cache_spares_repaints_under_crosshair():
+    rates = {}
+    images = {}
+    for cached in (False, True):
+        pw, scatter, line = _scatterUnderCrosshair(useDeviceCache=cached)
+        rates[cached] = paints_per_update(pw, pg.ScatterPlotItem,
+                                          lambda i: line.setValue(-1 + 0.1 * i), n=10)
+        line.setValue(0.0)
+        process_events()
+        images[cached] = pw.grab().toImage()
+        pw.close()
+    assert rates[False] >= 1
+    assert rates[True] == 0
+    assert images[True] == images[False]
+
+
+def test_device_cache_repaints_on_data_change():
+    pw, scatter, line = _scatterUnderCrosshair(useDeviceCache=True)
+    rng = np.random.default_rng(1)
+
+    def update(i):
+        scatter.setData(x=rng.normal(size=100), y=rng.normal(size=100), size=7)
+
+    assert paints_per_update(pw, pg.ScatterPlotItem, update, n=5) >= 1
+    pw.close()
 
