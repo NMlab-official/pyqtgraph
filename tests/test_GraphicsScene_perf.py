@@ -182,3 +182,247 @@ def test_itemsNearEvent_queries_scene_once(mixed_scene):
             hovered += len(scene.itemsNearEvent(_Event(point), hoverable=True)) > 1
     assert hovered > 0
     assert queries.count == len(points)
+
+
+# --------------------------------------------------------------------------------------
+# T2.1: the scene prepares (auto-range, view transformations) before Qt computes the
+# regions to repaint, so that each update is painted once.
+# --------------------------------------------------------------------------------------
+
+class _PaintLog(QtCore.QObject):
+    """Event filter logging the paint events of a viewport, binding agnostic."""
+
+    def __init__(self, log):
+        super().__init__()
+        self.log = log
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QtCore.QEvent.Type.Paint:
+            self.log.append('paint')
+        return False
+
+
+def viewport_paints_per_update(widget, update, n=20, warmup=3):
+    """Mean number of viewport paint events per update, events processed after each."""
+    widget.show()
+    process_events(5)
+    for i in range(warmup):
+        update(i)
+        process_events()
+    log = []
+    paintLog = _PaintLog(log)
+    widget.viewport().installEventFilter(paintLog)
+    try:
+        for i in range(warmup, warmup + n):
+            update(i)
+            process_events()
+    finally:
+        widget.viewport().removeEventFilter(paintLog)
+    return len(log) / n
+
+
+def _fixed_axes(plotItem):
+    # The width of a vertical axis follows its tick labels, which AxisItem measures
+    # while painting: a new width relayouts the plot, which costs another paint.
+    plotItem.getAxis('left').setWidth(45)
+
+
+def test_streaming_with_autorange_paints_once():
+    pw = pg.PlotWidget(size=(400, 300))
+    _fixed_axes(pw.getPlotItem())
+    curve = pw.plot(np.zeros(100))
+    rng = np.random.default_rng(0)
+
+    def update(i):
+        # growing amplitude: the auto-range changes the y range on every update
+        curve.setData(rng.normal(size=100) * (1 + i))
+
+    try:
+        assert viewport_paints_per_update(pw, update) <= 1.05
+    finally:
+        pw.close()
+
+
+@pytest.mark.parametrize('axis', ['x', 'y'])
+def test_pan_paints_once(axis):
+    pw = pg.PlotWidget(size=(400, 300))
+    _fixed_axes(pw.getPlotItem())
+    pw.plot(np.random.default_rng(0).normal(size=1000))
+    vb = pw.getViewBox()
+
+    def update(i):
+        vb.translateBy(**{axis: 0.5})
+
+    try:
+        assert viewport_paints_per_update(pw, update) <= 1.05
+    finally:
+        pw.close()
+
+
+def test_linked_plots_streaming_paints_once():
+    win = pg.GraphicsLayoutWidget(size=(600, 500))
+    plots = []
+    for row in range(3):
+        p = win.addPlot(row=row, col=0)
+        _fixed_axes(p)
+        if plots:
+            p.setXLink(plots[0])
+        plots.append(p)
+    rng = np.random.default_rng(1)
+    curves = [p.plot(rng.normal(size=200)) for p in plots for _ in range(3)]
+    line = pg.InfiniteLine(pos=0, angle=0)
+    plots[0].addItem(line, ignoreBounds=True)
+
+    def update(i):
+        x = np.arange(200) + i
+        for c in curves:
+            c.setData(x, rng.normal(size=200))
+        line.setPos(rng.normal())
+
+    try:
+        assert viewport_paints_per_update(win, update) <= 1.05
+    finally:
+        win.close()
+
+
+def test_requested_prepare_runs_before_the_paint():
+    pw = pg.PlotWidget(size=(300, 200))
+    curve = pw.plot(np.arange(10.0))
+    pw.show()
+    process_events(5)
+    scene = pw.scene()
+    log = []
+    scene.sigPrepareForPaint.connect(lambda: log.append('prepare'))
+    paintLog = _PaintLog(log)
+    pw.viewport().installEventFilter(paintLog)
+    try:
+        # no request: only the prepare made by GraphicsView.paintEvent, after the
+        # paint event is received
+        curve.curve.update()
+        process_events()
+        assert log == ['paint', 'prepare']
+
+        # a request is served before the dirty items are processed
+        del log[:]
+        scene.requestPrepare()
+        curve.curve.update()
+        process_events()
+        assert log[0] == 'prepare'
+        assert log.count('paint') == 1
+        assert not scene._prepareRequested
+    finally:
+        pw.viewport().removeEventFilter(paintLog)
+        pw.close()
+
+
+def test_autorange_is_applied_before_the_paint():
+    pw = pg.PlotWidget(size=(300, 200))
+    _fixed_axes(pw.getPlotItem())
+    curve = pw.plot(np.arange(10.0))
+    pw.show()
+    process_events(5)
+    vb = pw.getViewBox()
+    ranges = []
+    paintLog = _PaintLog([])
+    original = paintLog.eventFilter
+
+    def eventFilter(obj, ev):
+        if ev.type() == QtCore.QEvent.Type.Paint:
+            ranges.append(vb.viewRange()[1][1])
+        return original(obj, ev)
+
+    paintLog.eventFilter = eventFilter
+    pw.viewport().installEventFilter(paintLog)
+    try:
+        curve.setData(np.arange(10.0) * 10)
+        process_events()
+        assert len(ranges) == 1
+        assert ranges[0] >= 90  # the paint already shows the new auto-range
+    finally:
+        pw.viewport().removeEventFilter(paintLog)
+        pw.close()
+
+
+def test_hidden_view_defers_the_prepare():
+    pw = pg.PlotWidget(size=(300, 200))
+    curve = pw.plot(np.arange(10.0))
+    pw.show()
+    process_events(5)
+    pw.hide()
+    vb = pw.getViewBox()
+    before = vb.viewRange()
+    calls = []
+    pw.scene().sigPrepareForPaint.connect(lambda: calls.append(1))
+    try:
+        curve.setData(np.arange(10.0) * 10)
+        process_events()
+        # as before, a hidden plot does not auto-range until it is painted again
+        assert calls == []
+        assert vb.viewRange() == before
+        pw.show()
+        process_events(5)
+        assert vb.viewRange()[1][1] >= 90
+    finally:
+        pw.close()
+
+
+@pytest.mark.skipif(
+    QtWidgets.QApplication.platformName() != 'offscreen',
+    reason="reads back the backing store with QScreen.grabWindow",
+)
+def test_single_paint_renders_like_a_full_repaint():
+    # What was painted incrementally, once per update, equals a full repaint.
+    win = pg.GraphicsLayoutWidget(size=(500, 400))
+    p1 = win.addPlot(row=0, col=0)
+    p2 = win.addPlot(row=1, col=0)
+    p2.setXLink(p1)
+    rng = np.random.default_rng(2)
+    curves = [p1.plot(rng.normal(size=100), pen=k) for k in range(5)]
+    curves.append(p2.plot(rng.random(100), fillLevel=0, brush=(50, 50, 200, 100)))
+    text = pg.TextItem('label', anchor=(0, 0.5))
+    p1.addItem(text)
+    win.show()
+    process_events(5)
+
+    def image(qimage):
+        qimage = qimage.convertToFormat(pg.QtGui.QImage.Format.Format_ARGB32)
+        return pg.functions.ndarray_from_qimage(qimage).copy()
+
+    try:
+        for i in range(8):
+            x = np.arange(100) + 10 * i
+            for k, c in enumerate(curves):
+                c.setData(x, rng.normal(size=100) * (1 + i) + k)
+            text.setPos(x[-1], 0)
+            process_events()
+            painted = image(win.screen().grabWindow(win.winId()).toImage())
+            full = image(win.grab().toImage())
+            np.testing.assert_array_equal(painted, full)
+    finally:
+        win.close()
+
+
+def test_layout_invalidated_while_preparing_is_applied_before_the_paint():
+    # An item resizing itself while preparing, as an axis measuring its tick labels
+    # would, relayouts the plot before the paint instead of after it.
+    pw = pg.PlotWidget(size=(400, 300))
+    axis = pw.getPlotItem().getAxis('left')
+    axis.setWidth(40)
+    curve = pw.plot(np.zeros(100))
+    vb = pw.getViewBox()
+    rng = np.random.default_rng(0)
+
+    def measureLabels():
+        axis.setWidth(40 + 5 * (int(vb.viewRange()[1][1]) % 3))
+
+    pw.scene().sigPrepareForPaint.connect(measureLabels)
+
+    def update(i):
+        curve.setData(rng.normal(size=100) * (1 + i))
+
+    widths = set()
+    try:
+        assert viewport_paints_per_update(pw, lambda i: (update(i), widths.add(axis.width()))) <= 1.05
+        assert len(widths) == 3  # the layout did change
+    finally:
+        pw.close()
