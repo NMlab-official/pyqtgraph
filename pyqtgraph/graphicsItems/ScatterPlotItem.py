@@ -1,9 +1,10 @@
+import enum
 import itertools
 import math
 import operator
 import weakref
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -123,8 +124,7 @@ def renderSymbol(symbol, size, pen, brush, device=None, dpr=1.0):
 def _mkPen(*args, **kwargs):
     """
     Wrapper for fn.mkPen which avoids creating a new QPen object if passed one as its
-    sole argument. This is used to avoid unnecessary cache misses in SymbolAtlas which
-    uses the QPen object id in its key.
+    sole argument, so that the pens given by the user are stored as they are.
     """
     if len(args) == 1 and isinstance(args[0], QtGui.QPen):
         return args[0]
@@ -135,8 +135,7 @@ def _mkPen(*args, **kwargs):
 def _mkBrush(*args, **kwargs):
     """
     Wrapper for fn.mkBrush which avoids creating a new QBrush object if passed one as its
-    sole argument. This is used to avoid unnecessary cache misses in SymbolAtlas which
-    uses the QBrush object id in its key.
+    sole argument, so that the brushes given by the user are stored as they are.
     """
     if len(args) == 1 and isinstance(args[0], QtGui.QBrush):
         return args[0]
@@ -167,6 +166,182 @@ def _isNoneMask(col: np.ndarray) -> np.ndarray:
                        dtype=bool, count=len(col))
 
 
+def _mkMany(values: Iterable, qtype: type, make: Callable[[object], object]) -> list:
+    """
+    Convert each value with ``make``, building one object per unique hashable value.
+
+    Values that are already instances of ``qtype`` are kept as they are. The other
+    values are converted once per distinct ``(type, value)`` pair (the type keeps, for
+    example, ``1`` and ``1.0`` apart, which ``mkColor`` interprets differently); equal
+    values then share the same object, which keeps the symbol atlas small. Unhashable
+    values (dicts, lists, arrays) are converted one by one.
+
+    Parameters
+    ----------
+    values : iterable
+        Values accepted by ``make``, such as colors or ``QBrush`` objects.
+    qtype : type
+        Type of the objects produced, ``QtGui.QPen`` or ``QtGui.QBrush``.
+    make : callable
+        Conversion function, such as :func:`~pyqtgraph.mkBrush`.
+
+    Returns
+    -------
+    list
+        One ``qtype`` object per value, in the same order.
+    """
+    cache = {}
+    out = []
+    append = out.append
+    for value in values:
+        if isinstance(value, qtype):
+            append(value)
+            continue
+        key = (type(value), value)
+        try:
+            obj = cache.get(key)
+        except TypeError:  # unhashable value
+            append(make(value))
+            continue
+        if obj is None:
+            obj = cache[key] = make(value)
+        append(obj)
+    return out
+
+
+def _quantizeSize(size: float, step: float) -> float:
+    """
+    Round a symbol size to a multiple of ``1 / step``.
+
+    Integral sizes are returned unchanged, so that they render exactly as requested
+    whatever the device pixel ratio. Non-finite sizes are returned unchanged.
+
+    Parameters
+    ----------
+    size : float
+        Symbol size in pixels.
+    step : float
+        Number of quantization steps per pixel.
+
+    Returns
+    -------
+    float
+        The quantized size.
+    """
+    size = float(size)
+    if size.is_integer() or not math.isfinite(size):
+        return size
+    return round(size * step) / step
+
+
+def _quantizeSizes(sizes: np.ndarray, step: float) -> np.ndarray:
+    """
+    Vectorized :func:`_quantizeSize`, giving the same values.
+
+    Parameters
+    ----------
+    sizes : numpy.ndarray
+        Symbol sizes in pixels.
+    step : float
+        Number of quantization steps per pixel.
+
+    Returns
+    -------
+    numpy.ndarray
+        The quantized sizes, as a new float64 array.
+    """
+    sizes = np.array(sizes, dtype=np.float64)
+    rounded = np.rint(sizes * step) / step
+    change = np.isfinite(sizes) & (sizes != np.trunc(sizes))
+    sizes[change] = rounded[change]
+    return sizes
+
+
+def _enumValue(value: enum.Enum | int) -> int:
+    """
+    Return the integer value of a Qt enum member, whatever the Qt binding.
+
+    Integers hash much faster than ``enum.Enum`` members, whose ``__hash__`` is
+    implemented in Python.
+
+    Parameters
+    ----------
+    value : enum.Enum or int
+        Enum member (PyQt6, PySide6) or integer-like enum value (PyQt5).
+
+    Returns
+    -------
+    int
+        The value.
+    """
+    return value.value if isinstance(value, enum.Enum) else int(value)
+
+
+# brush styles whose rendering is not fully described by the color and the style
+_SHAPED_BRUSH_STYLES = frozenset((
+    QtCore.Qt.BrushStyle.LinearGradientPattern,
+    QtCore.Qt.BrushStyle.RadialGradientPattern,
+    QtCore.Qt.BrushStyle.ConicalGradientPattern,
+    QtCore.Qt.BrushStyle.TexturePattern,
+))
+# brush styles whose rendering does not depend on the brush transform
+_PLAIN_BRUSH_STYLES = frozenset((
+    QtCore.Qt.BrushStyle.NoBrush,
+    QtCore.Qt.BrushStyle.SolidPattern,
+))
+
+
+def _brushValueKey(brush: QtGui.QBrush) -> tuple | None:
+    """
+    Return a hashable key describing how a brush renders, if it can be built.
+
+    Parameters
+    ----------
+    brush : QtGui.QBrush
+        The brush.
+
+    Returns
+    -------
+    tuple or None
+        ``(rgba, style)`` as integers, or ``None`` for gradient and texture brushes
+        and for transformed hatch patterns, which must be keyed by identity.
+    """
+    style = brush.style()
+    if style in _SHAPED_BRUSH_STYLES:
+        return None
+    if style not in _PLAIN_BRUSH_STYLES and not brush.transform().isIdentity():
+        return None
+    return (brush.color().rgba(), _enumValue(style))
+
+
+def _penValueKey(pen: QtGui.QPen) -> tuple | None:
+    """
+    Return a hashable key describing how a pen renders, if it can be built.
+
+    Besides the color, width, style and cosmetic flag, the key holds the cap and join
+    styles, the miter limit and the dash pattern, which all change the rendered
+    symbol.
+
+    Parameters
+    ----------
+    pen : QtGui.QPen
+        The pen.
+
+    Returns
+    -------
+    tuple or None
+        The key, or ``None`` when the pen brush cannot be keyed by value.
+    """
+    brushKey = _brushValueKey(pen.brush())
+    if brushKey is None:
+        return None
+    style = pen.style()
+    dash = tuple(pen.dashPattern()) if style == QtCore.Qt.PenStyle.CustomDashLine else ()
+    return (brushKey, pen.widthF(), _enumValue(style), pen.isCosmetic(),
+            _enumValue(pen.capStyle()), _enumValue(pen.joinStyle()), pen.miterLimit(),
+            dash, pen.dashOffset())
+
+
 class SymbolAtlas(object):
     """
     Used to efficiently construct a single QPixmap containing all rendered symbols
@@ -178,6 +353,11 @@ class SymbolAtlas(object):
         sc2 = atlas[[('t', 10, QPen(..), QBrush(..))]]
         pm = atlas.pixmap
 
+    Symbols are keyed by value: pens and brushes that render the same share one
+    entry, whatever the Python objects. Gradient and texture brushes, and custom
+    ``QPainterPath`` symbols, are keyed by identity. Non-integral sizes are rounded
+    to a quarter of a device pixel (``1 / (4 * devicePixelRatio)`` logical pixel),
+    and the symbol is rendered at the rounded size.
     """
     _idGenerator = itertools.count()
 
@@ -190,13 +370,14 @@ class SymbolAtlas(object):
         Given a list of tuples, (symbol, size, pen, brush), return a list of coordinates of
         corresponding symbols within the atlas. Note that these coordinates may change if the atlas is rebuilt.
         """
-        keys = self._keys(styles)
-        new = {key: style for key, style in zip(keys, styles) if key not in self._coords}
+        keys, inverse, renderStyles = self._uniqueKeys(styles)
+        new = {key: style for key, style in zip(keys, renderStyles) if key not in self._coords}
 
         if new:
             self._extend(new)
 
-        return list(map(self._coords.__getitem__, keys))
+        coords = [self._coords[key] for key in keys]
+        return [coords[i] for i in inverse]
 
     def __len__(self):
         return len(self._coords)
@@ -223,7 +404,7 @@ class SymbolAtlas(object):
         if styles is None:
             data = []
         else:
-            keys = set(self._keys(styles))
+            keys = self._uniqueKeys(styles)[0]
             data = list(self._itemData(keys))
 
         self.clear()
@@ -251,18 +432,89 @@ class SymbolAtlas(object):
                     area_used=1.0 if n == 0 else a / (w * h),
                     squareness=1.0 if n == 0 else 2 * w * h / (w**2 + h**2))
 
-    def _keys(self, styles):
-        def getId(obj):
-            try:
-                return obj._id
-            except AttributeError:
-                obj._id = next(SymbolAtlas._idGenerator)
-                return obj._id
+    @staticmethod
+    def _identityKey(obj: object) -> tuple[str, int]:
+        """
+        Return a key identifying an object for the lifetime of the program.
 
-        return [
-            (symbol if isinstance(symbol, (str, int)) else getId(symbol), size, getId(pen), getId(brush))
-            for symbol, size, pen, brush in styles
-        ]
+        A counter value is stored on the object: unlike ``id()``, it is never reused by
+        another object.
+
+        Parameters
+        ----------
+        obj : object
+            Object accepting new attributes, such as a Qt object.
+
+        Returns
+        -------
+        tuple
+            ``('id', n)``, which never equals a value key.
+        """
+        try:
+            return ('id', obj._id)
+        except AttributeError:
+            obj._id = next(SymbolAtlas._idGenerator)
+            return ('id', obj._id)
+
+    def _uniqueKeys(self, styles: Sequence[tuple]) -> tuple[list[tuple], list[int], list[tuple]]:
+        """
+        Compute the distinct atlas keys of a sequence of styles.
+
+        The key of a style is ``(symbolKey, quantizedSize, penKey, brushKey)``: pens and
+        brushes are described by value (see :func:`_penValueKey` and
+        :func:`_brushValueKey`) when possible, by identity otherwise, and the size is
+        quantized (see :func:`_quantizeSize`).
+
+        Parameters
+        ----------
+        styles : sequence of tuple
+            ``(symbol, size, pen, brush)`` tuples.
+
+        Returns
+        -------
+        keys : list of tuple
+            The distinct keys, in order of first appearance.
+        inverse : list of int
+            For each style, the index of its key in ``keys``.
+        renderStyles : list of tuple
+            For each key, the ``(symbol, size, pen, brush)`` style to render, with the
+            quantized size.
+        """
+        step = 4 * self._dpr
+        identityKey = self._identityKey
+        keys = []
+        inverse = []
+        renderStyles = []
+        append = inverse.append
+        # Styles are first grouped by object identity, which is cheap; the value keys
+        # are then computed once per group. The identities are only valid during this
+        # call, while ``styles`` holds the objects: a pen or brush modified between two
+        # calls is keyed by its new value.
+        byIdentity = {}
+        byValue = {}
+        penKeys = {}
+        brushKeys = {}
+        for symbol, size, pen, brush in styles:
+            groupKey = (id(symbol), size, id(pen), id(brush))
+            index = byIdentity.get(groupKey)
+            if index is None:
+                penKey = penKeys.get(id(pen))
+                if penKey is None:
+                    penKey = penKeys[id(pen)] = _penValueKey(pen) or identityKey(pen)
+                brushKey = brushKeys.get(id(brush))
+                if brushKey is None:
+                    brushKey = brushKeys[id(brush)] = (_brushValueKey(brush)
+                                                       or identityKey(brush))
+                symbolKey = symbol if isinstance(symbol, (str, int)) else identityKey(symbol)
+                key = (symbolKey, _quantizeSize(size, step), penKey, brushKey)
+                index = byValue.get(key)
+                if index is None:
+                    index = byValue[key] = len(keys)
+                    keys.append(key)
+                    renderStyles.append((symbol, key[1], pen, brush))
+                byIdentity[groupKey] = index
+            append(index)
+        return keys, inverse, renderStyles
 
     def _itemData(self, keys):
         for key in keys:
@@ -396,6 +648,9 @@ class ScatterPlotItem(GraphicsObject):
         self.fragmentAtlas = SymbolAtlas()
         if screen := QtGui.QGuiApplication.primaryScreen():
             self.fragmentAtlas.setDevicePixelRatio(screen.devicePixelRatio())
+        # The atlas is rebuilt with the styles in use when it holds more entries than
+        # this, unless at least half of its entries are in use.
+        self._atlasMaxEntries = 4096
 
         dtype = [
             ('x', float),
@@ -636,11 +891,26 @@ class ScatterPlotItem(GraphicsObject):
     def name(self):
         return self.opts.get('name', None)
 
-    def setPen(self, *args, **kwargs):
-        """Set the pen(s) used to draw the outline around each spot.
-        If a list or array is provided, then the pen for each spot will be set separately.
-        Otherwise, the arguments are passed to pg.mkPen and used as the default pen for
-        all spots which do not have a pen explicitly set."""
+    def setPen(self, *args, **kwargs) -> None:
+        """
+        Set the pen(s) used to draw the outline around each spot.
+
+        If a list or array is provided, then the pen for each spot will be set
+        separately; equal hashable specifications (such as color tuples) share one
+        ``QPen``. Otherwise, the arguments are passed to :func:`~pyqtgraph.mkPen` and
+        used as the default pen for all spots which do not have a pen explicitly set.
+
+        Parameters
+        ----------
+        *args
+            A list or array holding one pen specification per spot, or the arguments
+            of :func:`~pyqtgraph.mkPen`.
+        **kwargs
+            Keyword arguments of :func:`~pyqtgraph.mkPen`, and the internal options
+            ``update`` (bool, default True: update the spots now), ``dataSet``
+            (structured array of the spots to change, default all spots) and ``mask``
+            (selection applied to a per-spot list or array).
+        """
         update = kwargs.pop('update', True)
         dataSet = kwargs.pop('dataSet', self.data)
 
@@ -650,7 +920,7 @@ class ScatterPlotItem(GraphicsObject):
                 pens = pens[kwargs['mask']]
             if len(pens) != len(dataSet):
                 raise Exception("Number of pens does not match number of points (%d != %d)" % (len(pens), len(dataSet)))
-            dataSet['pen'] = list(map(_mkPen, pens))
+            dataSet['pen'] = _mkMany(pens, QtGui.QPen, fn.mkPen)
         else:
             self.opts['pen'] = _mkPen(*args, **kwargs)
 
@@ -658,11 +928,27 @@ class ScatterPlotItem(GraphicsObject):
         if update:
             self.updateSpots(dataSet)
 
-    def setBrush(self, *args, **kwargs):
-        """Set the brush(es) used to fill the interior of each spot.
-        If a list or array is provided, then the brush for each spot will be set separately.
-        Otherwise, the arguments are passed to pg.mkBrush and used as the default brush for
-        all spots which do not have a brush explicitly set."""
+    def setBrush(self, *args, **kwargs) -> None:
+        """
+        Set the brush(es) used to fill the interior of each spot.
+
+        If a list or array is provided, then the brush for each spot will be set
+        separately; equal hashable specifications (such as color tuples) share one
+        ``QBrush``. Otherwise, the arguments are passed to :func:`~pyqtgraph.mkBrush`
+        and used as the default brush for all spots which do not have a brush
+        explicitly set.
+
+        Parameters
+        ----------
+        *args
+            A list or array holding one brush specification per spot, or the
+            arguments of :func:`~pyqtgraph.mkBrush`.
+        **kwargs
+            Keyword arguments of :func:`~pyqtgraph.mkBrush`, and the internal options
+            ``update`` (bool, default True: update the spots now), ``dataSet``
+            (structured array of the spots to change, default all spots) and ``mask``
+            (selection applied to a per-spot list or array).
+        """
         update = kwargs.pop('update', True)
         dataSet = kwargs.pop('dataSet', self.data)
 
@@ -672,7 +958,7 @@ class ScatterPlotItem(GraphicsObject):
                 brushes = brushes[kwargs['mask']]
             if len(brushes) != len(dataSet):
                 raise Exception("Number of brushes does not match number of points (%d != %d)" % (len(brushes), len(dataSet)))
-            dataSet['brush'] = list(map(_mkBrush, brushes))
+            dataSet['brush'] = _mkMany(brushes, QtGui.QBrush, fn.mkBrush)
         else:
             self.opts['brush'] = _mkBrush(*args, **kwargs)
 
@@ -808,9 +1094,7 @@ class ScatterPlotItem(GraphicsObject):
             mask = dataSet['sourceRect']['w'] == 0
             if np.any(mask):
                 invalidate = True
-                coords = self.fragmentAtlas[
-                    list(zip(*self._style(['symbol', 'size', 'pen', 'brush'], data=dataSet, idx=mask)))
-                ]
+                coords = self.fragmentAtlas[self._atlasStyles(data=dataSet, idx=mask)]
                 dataSet['sourceRect'][mask] = coords
 
             self._maybeRebuildAtlas()
@@ -822,12 +1106,69 @@ class ScatterPlotItem(GraphicsObject):
         if invalidate:
             self.invalidate()
 
-    def _maybeRebuildAtlas(self, threshold=4, minlen=1000):
+    def _atlasStyles(self, data: np.ndarray | None = None,
+                     idx: np.ndarray | slice | None = None) -> list[tuple]:
+        """
+        Return the symbol atlas styles of a set of spots.
+
+        The sizes are quantized as the atlas does (see :func:`_quantizeSize`), so that
+        spots whose sizes round to the same value form a single group in the atlas
+        lookup.
+
+        Parameters
+        ----------
+        data : numpy.ndarray, optional
+            Structured spot array; defaults to ``self.data``.
+        idx : numpy.ndarray or slice, optional
+            Boolean mask or index selecting the spots; defaults to all spots.
+
+        Returns
+        -------
+        list of tuple
+            One ``(symbol, size, pen, brush)`` tuple per selected spot.
+        """
+        symbol, size, pen, brush = self._style(['symbol', 'size', 'pen', 'brush'],
+                                               data=data, idx=idx)
+        size = _quantizeSizes(size, 4 * self.fragmentAtlas.devicePixelRatio())
+        return list(zip(symbol.tolist(), size.tolist(), pen.tolist(), brush.tolist()))
+
+    def _atlasEntriesInUse(self) -> int:
+        """
+        Count the symbol atlas entries used by the spots.
+
+        Returns
+        -------
+        int
+            Number of distinct atlas positions referenced by the spots.
+        """
+        sr = self.data['sourceRect']
+        sr = sr[sr['w'] != 0]
+        return len(np.unique((sr['x'].astype(np.int64) << 32) | sr['y'].astype(np.int64)))
+
+    def _maybeRebuildAtlas(self, threshold: int = 4, minlen: int = 1000) -> None:
+        """
+        Rebuild the symbol atlas with the styles in use when it holds too many entries.
+
+        The atlas is rebuilt when it holds more than ``minlen`` entries and more than
+        ``threshold`` entries per spot, or when it holds more than
+        ``self._atlasMaxEntries`` entries of which less than half are in use. The
+        second rule bounds the atlas when the styles keep changing, for instance with
+        colors that follow a live value; requiring half of the entries to be unused
+        avoids rebuilding at every update when the styles in use alone exceed the cap.
+
+        Parameters
+        ----------
+        threshold : int, default 4
+            Maximum number of atlas entries per spot.
+        minlen : int, default 1000
+            Number of atlas entries below which the per-spot rule does not apply.
+        """
         n = len(self.fragmentAtlas)
-        if (n > minlen) and (n > threshold * len(self.data)):
-            self.fragmentAtlas.rebuild(
-                list(zip(*self._style(['symbol', 'size', 'pen', 'brush'])))
-            )
+        rebuild = n > minlen and n > threshold * len(self.data)
+        if not rebuild and n > self._atlasMaxEntries:
+            rebuild = n > 2 * self._atlasEntriesInUse()
+        if rebuild:
+            self.fragmentAtlas.rebuild(self._atlasStyles())
             self.data['sourceRect'] = 0
             self.updateSpots()
 
