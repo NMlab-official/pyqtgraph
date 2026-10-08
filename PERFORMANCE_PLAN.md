@@ -153,7 +153,7 @@ Référence à `cc94092` : `pytest tests/graphicsItems tests/test_functions.py` 
 | T3.2 | Nouvel élément `CandlestickItem` (OHLC) vectorisé | 3 | L | F | bougies natives, LOD par agrégation OHLC | T3.1 | ☑ |
 | T3.3 | `FillBetweenItem` reconstruit seulement au rendu, depuis numpy | 3 | M | F | 200k : 60 → < 5 ms/image | — | ☑ |
 | T3.4 | `NonUniformImage` réécrit (QImage + table d'index) | 3 | L | M | 2000×1000 : 7,2 s → < 50 ms | T2.12 | ☑ |
-| T4.x | Optionnels (voir §7) | 4 | — | — | — | — | ☐ |
+| T4.x | Optionnels (voir §7) | 4 | — | — | — | — | ◐ |
 
 **Ordre recommandé :**
 1. T0.1 → T0.2
@@ -1038,6 +1038,14 @@ Tâches à petit gain ou à arbitrage nécessaire. Ne pas les démarrer avant la
 | T4.5 | Mettre en cache le `QPixmap` converti d'une image `Indexed8` | `ImageItem.paint` | 2,0 → 0,64 ms par rendu. |
 | T4.6 | Mettre en cache `np.arange(len(y))` quand x est omis | `PlotDataItem.setData` (l. 1296), `PlotCurveItem.updateData` (l. 612) | 20 ms à 1e7. |
 | T4.7 | `DontSavePainterState` sur `GraphicsView` | `widgets/GraphicsView.py` | −10 % avec plus de 400 objets, **mais** plusieurs `paint()` ne restaurent pas l'état du painter (`TextItem`, marqueurs d'`InfiniteLine`) : audit préalable obligatoire. |
+
+**Statut de la phase 4** (détails dans les messages de commit) :
+- ☑ T4.1 (option `useDeviceCache`), T4.5 (copie ARGB32 en cache), T4.6 (cache de `np.arange`).
+- ◐ T4.2 (rendu partiel limité aux pinceaux cosmétiques ≤ 1 px), T4.3 (construction des
+  morceaux accélérée et morceaux hors de la zone exposée sautés ; un chemin unique change les
+  pixels), T4.4 (limité à `connect='pairs'` ; les autres cas changent les pixels).
+- ☒ T4.7 écartée après audit : `DontSavePainterState` change 14 % des pixels d'une image S05,
+  car de nombreuses méthodes `paint()` ne restaurent pas l'état du painter.
 
 ---
 
