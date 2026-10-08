@@ -144,6 +144,201 @@ def _resample_lut(
     return xp.asarray(resampled.reshape((size,) + lut.shape[1:]))
 
 
+# index of the transparent color of Indexed8 images of float mono images with NaNs
+_NAN_INDEX = 255
+
+
+def _nan_index_lut(
+    xp: ModuleType, lut: numpy.ndarray | None, max_deviation: int = 1
+) -> tuple[numpy.ndarray, int | None] | None:
+    """
+    Make a lookup table of at most 255 entries, leaving index 255 free for NaN pixels.
+
+    A table of N <= 255 entries is used as is: a value normalized to ``u`` in [0, 1) by
+    the levels is displayed with entry ``floor(u * N)``. Otherwise, the value falls in
+    bin ``j = floor(u * 256)`` of the 256-entry table (``lut`` itself or its
+    resampled equivalent, see :func:`_resample_lut`), and two adjacent bins ``m`` and
+    ``m + 1`` share one entry: bin ``j`` is displayed with entry ``j - (j > m)``. The
+    pair whose merge changes the colors least is chosen, preferring ``m = 254``, which
+    costs nothing at render time. Every other color is unchanged.
+
+    Parameters
+    ----------
+    xp : module
+        Array module of ``lut``, either numpy or cupy.
+    lut : numpy.ndarray or cupy.ndarray or None
+        Lookup table of dtype uint8 and shape (N,) or (N, C). None stands for the
+        256-level grayscale ramp used for images without lookup table.
+    max_deviation : int, default 1
+        Largest accepted difference, in levels of 255 and per channel, between the
+        color of any value and its color through ``lut``.
+
+    Returns
+    -------
+    tuple of (numpy.ndarray or cupy.ndarray, int or None) or None
+        The table of at most 255 entries and the merged bin ``m`` (None if ``lut`` is
+        used as is), or None if no table meets ``max_deviation``.
+    """
+    if lut is None:
+        lut = xp.arange(256, dtype=xp.uint8)
+    n = lut.shape[0]
+    if n <= _NAN_INDEX:
+        return lut, None
+
+    if n == 256:
+        base = lut
+    else:
+        base = _resample_lut(xp, lut, 256, max_deviation)
+        if base is None:
+            return None
+    if xp != numpy:
+        lut, base = lut.get(), base.get()
+    table = lut.reshape(n, -1).astype(numpy.int16)
+    base = base.reshape(256, -1)
+
+    # range of the original entries covered by each bin: entries start[j] to end[j]
+    j = numpy.arange(256)
+    start = (j * n) // 256
+    end = -((-(j + 1) * n) // 256) - 1
+    lo = numpy.minimum(numpy.minimum.reduceat(table, start, axis=0), table[end])
+    hi = numpy.maximum(numpy.maximum.reduceat(table, start, axis=0), table[end])
+
+    # merging bins m and m + 1: the middle of their color range minimizes the deviation
+    pair_lo = numpy.minimum(lo[:-1], lo[1:])
+    pair_hi = numpy.maximum(hi[:-1], hi[1:])
+    merged_colors = numpy.rint((pair_lo + pair_hi) / 2)
+    deviation = numpy.maximum(pair_hi - merged_colors, merged_colors - pair_lo).max(axis=1)
+    m = _NAN_INDEX - 1
+    if deviation[m] > max_deviation:
+        m = int(numpy.argmin(deviation))
+        if deviation[m] > max_deviation:
+            return None
+    merged = numpy.concatenate(
+        [base[:m], merged_colors[m:m + 1].astype(numpy.uint8), base[m + 2:]]
+    )
+    return xp.asarray(merged.reshape((_NAN_INDEX,) + lut.shape[1:])), m
+
+
+def _nan_index_mask(xp: ModuleType, image: numpy.ndarray) -> numpy.ndarray:
+    """
+    Return the mask of the NaN pixels of a mono image, as uint8 values ``_NAN_INDEX``.
+
+    Parameters
+    ----------
+    xp : module
+        Array module of ``image``, either numpy or cupy.
+    image : numpy.ndarray or cupy.ndarray
+        2-D floating point image.
+
+    Returns
+    -------
+    numpy.ndarray or cupy.ndarray
+        uint8 array of the shape of ``image``: ``_NAN_INDEX`` at NaN pixels, 0 elsewhere.
+    """
+    mask = xp.isnan(image).view(xp.uint8)
+    mask *= _NAN_INDEX
+    return mask
+
+
+def _rescale_float_to_index(
+    xp: ModuleType, image: numpy.ndarray, levels: numpy.ndarray, num_colors: int,
+    max_index: int,
+) -> numpy.ndarray:
+    """
+    Rescale a floating point image to uint8 color indices.
+
+    Value ``v`` gets index ``floor((v - min) * num_colors / (max - min))`` clipped to
+    ``[0, max_index]``, the indexing used by :func:`_rescale_and_lookup_float`.
+
+    Parameters
+    ----------
+    xp : module
+        Array module of ``image``, either numpy or cupy.
+    image : numpy.ndarray or cupy.ndarray
+        Floating point image.
+    levels : numpy.ndarray or cupy.ndarray
+        ``[min, max]`` levels.
+    num_colors : int
+        Number of indices the levels range is divided into.
+    max_index : int
+        Largest index, at most 255.
+
+    Returns
+    -------
+    numpy.ndarray or cupy.ndarray
+        New uint8 array of indices. NaN pixels get unspecified indices.
+    """
+    minVal, maxVal = levels
+    rng = maxVal - minVal
+    rng = 1 if rng == 0 else rng
+    scale = num_colors / rng
+    if xp == numpy and (fn_numba := getNumbaFunctions()) is not None:
+        return fn_numba.rescale_and_clip(image, scale, minVal, 0, max_index)
+    return functions.rescaleData(image, scale, minVal, dtype=xp.uint8, clip=(0, max_index))
+
+
+def try_make_qimage_with_nan_index(
+    image: numpy.ndarray, *, levels: numpy.ndarray | None, lut: numpy.ndarray,
+    merged: int | None, nanMask: numpy.ndarray,
+) -> QtGui.QImage | None:
+    """
+    Make an Indexed8 QImage of a float mono image, with transparent NaN pixels.
+
+    The NaN pixels get index ``_NAN_INDEX`` (255), which is transparent in the color
+    table, so that the image needs no conversion to RGBA nor alpha channel.
+
+    Parameters
+    ----------
+    image : numpy.ndarray or cupy.ndarray
+        2-D floating point image.
+    levels : numpy.ndarray or cupy.ndarray or None
+        ``[min, max]`` levels.
+    lut : numpy.ndarray or cupy.ndarray
+        Lookup table of at most 255 entries, as returned by :func:`_nan_index_lut`.
+    merged : int or None
+        Merged bin returned by :func:`_nan_index_lut` with ``lut``.
+    nanMask : numpy.ndarray or cupy.ndarray
+        Mask of the NaN pixels, as returned by :func:`_nan_index_mask`.
+
+    Returns
+    -------
+    QtGui.QImage or None
+        The Indexed8 image, or None if ``levels`` is not a single ``[min, max]`` pair.
+    """
+    cp = getCupy()
+    xp = cp.get_array_module(image) if cp else numpy
+
+    if levels is None:
+        return None
+    levels = xp.asarray(levels)
+    if levels.ndim != 1:
+        return None
+    if lut.shape[0] > _NAN_INDEX:
+        raise ValueError("lut must have at most 255 entries")
+
+    if merged is None:
+        index = _rescale_float_to_index(xp, image, levels, lut.shape[0], lut.shape[0] - 1)
+    elif merged == _NAN_INDEX - 1:
+        # merging the last two bins is clipping to the last entry
+        index = _rescale_float_to_index(xp, image, levels, 256, _NAN_INDEX - 1)
+    else:
+        index = _rescale_float_to_index(xp, image, levels, 256, 255)
+        # shift the bins above the merged pair down (uint8 operands: fast loop)
+        xp.subtract(index, (index > merged).view(xp.uint8), out=index)
+    index |= nanMask
+
+    if xp == cp:
+        index = index.get()
+    index = numpy.ascontiguousarray(index)
+
+    rgba = _convert_lut_to_rgba(xp, lut)
+    ctbl = [QtGui.qRgba(*color) for color in rgba.tolist()]
+    ctbl += [0] * (_NAN_INDEX + 1 - len(ctbl))  # unused entries, then transparent NaNs
+    qimage = functions.ndarray_to_qimage(index, QtGui.QImage.Format.Format_Indexed8)
+    qimage.setColorTable(ctbl)
+    return qimage
+
+
 def _rescale_and_lookup_float(xp, image, levels, lut, *, forceApplyLut):
     # It is usually more performant to _not_ apply the lut and
     # instead use it as an Indexed8 ColorTable. This is only
