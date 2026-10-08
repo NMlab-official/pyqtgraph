@@ -55,6 +55,7 @@ examples_ = OrderedDict([
         ('Non-uniform Image', 'NonUniformImage.py'),
         ('Region-of-Interest', 'ROIExamples.py'),
         ('Bar Graph', 'BarGraphItem.py'),
+        ('Candlestick (OHLC)', 'CandlestickItem.py'),
         ('GraphicsLayout', 'GraphicsLayout.py'),
         ('LegendItem', 'Legend.py'),
         ('Text Item', 'text.py'),

@@ -149,10 +149,10 @@ Référence à `cc94092` : `pytest tests/graphicsItems tests/test_functions.py` 
 | T2.10 | `AxisItem` : cache des libellés et de leur géométrie | 2 | M | F | −35 % par régénération d'axe | — | ☑ |
 | T2.11 | `TextItem` : plus de slot par élément sur le signal de rendu | 2 | M | M | ~×3 par élément | T2.1 | ☑ |
 | T2.12 | `ImageItem` : NaN gérés via un index réservé, sans masque RGBA | 2 | M | F | NaN : 15-29 → ~3 ms | — | ☑ |
-| T3.1 | `BarGraphItem` : découpage à la vue et LOD | 3 | M | F | 500k barres zoomées : 30 → ~2 ms | T0.1 | ☐ |
-| T3.2 | Nouvel élément `CandlestickItem` (OHLC) vectorisé | 3 | L | F | bougies natives, LOD par agrégation OHLC | T3.1 | ☐ |
-| T3.3 | `FillBetweenItem` reconstruit seulement au rendu, depuis numpy | 3 | M | F | 200k : 60 → < 5 ms/image | — | ☐ |
-| T3.4 | `NonUniformImage` réécrit (QImage + table d'index) | 3 | L | M | 2000×1000 : 7,2 s → < 50 ms | T2.12 | ☐ |
+| T3.1 | `BarGraphItem` : découpage à la vue et LOD | 3 | M | F | 500k barres zoomées : 30 → ~2 ms | T0.1 | ☑ |
+| T3.2 | Nouvel élément `CandlestickItem` (OHLC) vectorisé | 3 | L | F | bougies natives, LOD par agrégation OHLC | T3.1 | ☑ |
+| T3.3 | `FillBetweenItem` reconstruit seulement au rendu, depuis numpy | 3 | M | F | 200k : 60 → < 5 ms/image | — | ☑ |
+| T3.4 | `NonUniformImage` réécrit (QImage + table d'index) | 3 | L | M | 2000×1000 : 7,2 s → < 50 ms | T2.12 | ☑ |
 | T4.x | Optionnels (voir §7) | 4 | — | — | — | — | ☐ |
 
 **Ordre recommandé :**
