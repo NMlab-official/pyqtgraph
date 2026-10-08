@@ -762,3 +762,46 @@ def test_clipped_peaks_show_the_newest_points(plot_widget):
     process_events()
     x_disp, _ = item.getData()
     assert x_disp[-1] < 20_100
+
+
+# --------------------------------------------------------------------------------------
+# Auto-downsampling factor recomputed when the view is resized
+# --------------------------------------------------------------------------------------
+
+def _expected_ds(item: pg.PlotDataItem, view_width: float) -> int:
+    pixels = item.getViewBox().width() * item.opts['autoDownsampleFactor']
+    return max(1, int(view_width / pixels))
+
+
+@pytest.mark.parametrize('clip', [False, True])
+def test_auto_downsample_follows_view_resize(plot_widget, clip):
+    n = 200_000
+    item = plot_widget.plot(np.random.default_rng(0).normal(size=n),
+                            autoDownsample=True, clipToView=clip)
+    plot_widget.setRange(xRange=(0, n), yRange=(-5, 5), padding=0)
+    process_events()
+    assert item._adsLastValue == _expected_ds(item, n)
+    for width in (800, 300, 600):
+        before = item._adsLastValue
+        with count_calls(pg.PlotDataItem, 'updateItems') as updates:
+            plot_widget.resize(width, 300)
+            process_events()
+        # the range is unchanged, the factor follows the pixel size: one update
+        assert plot_widget.getViewBox().viewRange()[0] == [0, n]
+        assert item._adsLastValue == _expected_ds(item, n) != before
+        assert updates.count == 1
+        # two points per block, the incomplete last block included
+        assert len(item.getData()[0]) == 2 * -(-n // item._adsLastValue)
+
+
+def test_pan_without_factor_change_does_not_update(plot_widget):
+    n = 200_000
+    item = plot_widget.plot(np.random.default_rng(0).normal(size=n), autoDownsample=True)
+    plot_widget.setRange(xRange=(0, n // 2), yRange=(-5, 5), padding=0)
+    process_events()
+    vb = plot_widget.getViewBox()
+    with count_calls(pg.PlotDataItem, 'updateItems') as updates:
+        for _ in range(10):
+            vb.translateBy(x=1000)
+            process_events()
+    assert updates.count == 0
