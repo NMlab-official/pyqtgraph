@@ -886,15 +886,33 @@ class ScatterPlotItem(GraphicsObject):
 
             yield col
 
-    def _updateMaxSpotSizes(self, **kwargs):
+    def _updateMaxSpotSizes(self, **kwargs) -> None:
+        """
+        Update the maximum spot sizes, which pad the data bounds and bounding rect.
+
+        When they change, the geometry change is announced to the scene and the data
+        bounds change to the view (which caches the data bounds of its items).
+
+        Parameters
+        ----------
+        **kwargs
+            Arguments of :meth:`_style` selecting the spots measured (``data``,
+            ``idx``).
+        """
         if self.opts['pxMode'] and self.opts['useCache']:
             w, pw = 0, self.fragmentAtlas.maxWidth
         else:
             w, pw = max(itertools.chain([(self._maxSpotWidth, self._maxSpotPxWidth)],
                               self._measureSpotSizes(**kwargs)))
+        changed = (w, pw) != (self._maxSpotWidth, self._maxSpotPxWidth)
+        boundsChanged = w != self._maxSpotWidth
+        if changed:
+            self.prepareGeometryChange()  # before the bounding rect changes
         self._maxSpotWidth = w
         self._maxSpotPxWidth = pw
         self.bounds = [None, None]
+        if boundsChanged:
+            self.informViewBoundsChanged()
 
     def _measureSpotSizes(self, **kwargs):
         """Generate pairs (width, pxWidth) for spots in data"""
