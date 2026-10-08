@@ -206,7 +206,7 @@ def test_polyline_memory_released_after_shrink():
 
 
 @pytest.mark.parametrize('setup', ['aliased thin pen', 'shadow pen', 'fill level',
-                                   'step mode', 'connect pairs', 'finite with NaN',
+                                   'step mode', 'connect array', 'finite with NaN',
                                    'export', 'painter brush'])
 def test_path_still_drawn(setup):
     # cases where the polyline is not used: the path is built and drawn as before
@@ -222,8 +222,8 @@ def test_path_still_drawn(setup):
         kwargs['fillLevel'] = 0.0
     elif setup == 'step mode':
         kwargs['stepMode'] = 'left'
-    elif setup == 'connect pairs':
-        kwargs['connect'] = 'pairs'
+    elif setup == 'connect array':
+        kwargs['connect'] = np.arange(len(x)) % 3 != 0
     elif setup == 'finite with NaN':
         y[::10] = np.nan
         kwargs['connect'] = 'finite'
@@ -635,3 +635,121 @@ def test_view_partial_repaint_filled():
     process_events()
     assert (partial == screen()).all()
     pw.close()
+
+
+# --------------------------------------------------------------------------------------
+# T4.4: connect='pairs' drawn with drawLines instead of a QDataStream-built path
+# --------------------------------------------------------------------------------------
+
+def pairs_data(kind, n=4001):
+    """
+    Return the data of a ``connect='pairs'`` curve.
+
+    Parameters
+    ----------
+    kind : str
+        ``'walk'``, ``'nan'`` (with non-finite values), ``'bars'`` (vertical
+        segments, as error bars) or ``'zero length'`` (some segments of length 0).
+    n : int, default 4001
+        Number of points; an odd number leaves the last point unpaired.
+
+    Returns
+    -------
+    x, y : np.ndarray
+        Coordinates of the points.
+    """
+    x, y = random_walk(n)
+    if kind == 'nan':
+        y[rng_indices(n, 0.05)] = np.nan
+    elif kind == 'bars':
+        x = np.repeat(np.arange((n + 1) // 2, dtype=np.float64), 2)[:n]
+    elif kind == 'zero length':
+        x[1::4] = x[0::4][:len(x[1::4])]
+        y[1::4] = y[0::4][:len(y[1::4])]
+    return x, y
+
+
+def render_with_pairs_path(item, rect, size=(400, 300)):
+    """
+    Paint ``item`` like :func:`render_item`, forcing the drawing of its path.
+
+    Parameters
+    ----------
+    item : PlotCurveItem
+        Curve to paint.
+    rect : QtCore.QRectF
+        Rectangle, in item coordinates, mapped onto the image.
+    size : tuple of int, default (400, 300)
+        Image size.
+
+    Returns
+    -------
+    np.ndarray
+        The ARGB32 pixels, of shape (height, width).
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(PlotCurveItem, '_shouldDrawPairsAsLines', lambda *args: False)
+        return render_item(item, rect, size)
+
+
+@pytest.mark.parametrize('pen', [dict(color='w'), dict(color=(255, 255, 0, 100)),
+                                 dict(color='w', width=0),
+                                 dict(color='c', style=QtCore.Qt.PenStyle.DashLine)])
+@pytest.mark.parametrize('antialias', [False, True])
+@pytest.mark.parametrize('kind', ['walk', 'nan', 'bars'])
+def test_pairs_drawn_as_lines_pixel_identical(pen, antialias, kind):
+    x, y = pairs_data(kind)
+    curves = [pg.PlotCurveItem(x=x, y=y, pen=pg.mkPen(**pen), antialias=antialias,
+                               connect='pairs') for _ in range(2)]
+    for rect in data_rects(x, y):
+        with count_calls(fn, 'arrayToQPath') as path_builds:
+            lines = render_item(curves[0], rect)
+        assert path_builds.count == 0
+        assert curves[0].path is None
+        assert (lines == render_with_pairs_path(curves[1], rect)).all()
+
+
+@pytest.mark.parametrize('setup', ['zero length', 'flat cap', 'wide antialiased pen',
+                                   'non-cosmetic pen', 'segmented mode off',
+                                   'unchecked non-finite', 'export', 'tiny on screen'])
+def test_pairs_path_still_drawn(setup):
+    x, y = pairs_data('zero length' if setup == 'zero length' else 'walk')
+    pen = pg.mkPen('w')
+    kwargs = dict(connect='pairs')
+    rect = data_rects(x, y)[0]
+    if setup == 'flat cap':
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.FlatCap)
+    elif setup == 'wide antialiased pen':
+        pen = pg.mkPen('w', width=2)
+        kwargs['antialias'] = True
+    elif setup == 'non-cosmetic pen':
+        pen.setCosmetic(False)
+    elif setup == 'unchecked non-finite':
+        y[::7] = np.nan
+        kwargs['skipFiniteCheck'] = True
+    elif setup == 'tiny on screen':
+        # segments far below a pixel: Qt may see their ends as equal
+        x[1::2] = x[0::2][:len(x[1::2])] + 1e-9
+        y[1::2] = y[0::2][:len(y[1::2])]
+        rect = QtCore.QRectF(-1e6, rect.top(), 2e6, rect.height())
+    curve = pg.PlotCurveItem(x=x, y=y, pen=pen, **kwargs)
+    if setup == 'segmented mode off':
+        curve.setSegmentedLineMode('off')
+    elif setup == 'export':
+        curve.setExportMode(True, {'antialias': False})
+    with count_calls(fn, 'arrayToQPath') as path_builds:
+        render_item(curve, rect)
+    assert path_builds.count == 1
+
+
+def test_pairs_lengths_cached():
+    x, y = pairs_data('walk')
+    curve = pg.PlotCurveItem(x=x, y=y, connect='pairs')
+    rect = data_rects(x, y)[0]
+    with count_calls(np, 'isfinite') as finite_checks:
+        render_item(curve, rect)
+        first = finite_checks.count
+        render_item(curve, rect)
+        render_item(curve, rect)
+        assert finite_checks.count == first
+    assert curve._vertexCache.pairLengths is not None
