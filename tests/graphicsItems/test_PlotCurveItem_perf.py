@@ -378,7 +378,7 @@ def test_exposed_slice_is_small():
 
 
 @pytest.mark.parametrize('setup', ['whole item exposed', 'wide pen', 'dashed pen',
-                                   'decreasing x', 'fill', 'large part exposed',
+                                   'decreasing x', 'fill outline', 'large part exposed',
                                    'no exposed rectangle', 'painter brush'])
 def test_exposed_whole_curve_drawn(setup):
     x, y = random_walk(20000)
@@ -392,8 +392,8 @@ def test_exposed_whole_curve_drawn(setup):
         kwargs['pen'] = pg.mkPen('w', style=QtCore.Qt.PenStyle.DashLine)
     elif setup == 'decreasing x':
         x = x[::-1].copy()
-    elif setup == 'fill':
-        kwargs.update(fillLevel=0.0, brush='b')
+    elif setup == 'fill outline':
+        kwargs.update(fillLevel=0.0, brush='b', fillOutline=True)
     elif setup == 'large part exposed':
         clip = QtCore.QRect(50, 0, 250, 300)
     elif setup == 'whole item exposed':
@@ -439,6 +439,197 @@ def test_view_partial_repaint():
     # each move repaints the old and new positions of the line, 500 points apart
     assert len(slices) == 3
     assert max(slices) < len(x) // 10
+    partial = screen()
+    pw.viewport().repaint()
+    process_events()
+    assert (partial == screen()).all()
+    pw.close()
+
+
+# --------------------------------------------------------------------------------------
+# T4.3: fill paths built faster, and skipped outside the exposed rectangle
+# --------------------------------------------------------------------------------------
+
+def reference_fill_paths(x, y, baseline, chunksize=150):
+    """
+    Build the fill paths of a run of finite points as before T4.3.
+
+    Parameters
+    ----------
+    x, y : np.ndarray
+        Finite coordinates of the run.
+    baseline : float
+        Fill level.
+    chunksize : int, default 150
+        Number of curve points per chunk.
+
+    Returns
+    -------
+    list of QtGui.QPainterPath
+        One path per chunk.
+    """
+    paths = []
+    offset = 0
+    xybuf = np.empty((chunksize + 3, 2))
+    while offset < len(x) - 1:
+        subx = x[offset:offset + chunksize]
+        suby = y[offset:offset + chunksize]
+        size = len(subx)
+        xyview = xybuf[:size + 3]
+        xyview[:-3, 0] = subx
+        xyview[:-3, 1] = suby
+        xyview[-3:, 0] = subx[[-1, 0, 0]]
+        xyview[-3:, 1] = [baseline, baseline, suby[0]]
+        offset += size - 1
+        paths.append(
+            fn._arrayToQPath_all(xyview[:, 0], xyview[:, 1], finiteCheck=False))
+    return paths
+
+
+def path_elements(path):
+    """
+    Return the elements of a path as an array of (type, x, y) rows.
+
+    Parameters
+    ----------
+    path : QtGui.QPainterPath
+        The path.
+
+    Returns
+    -------
+    np.ndarray
+        The elements, of shape (elementCount, 3).
+    """
+    elements = np.empty((path.elementCount(), 3))
+    for i in range(path.elementCount()):
+        element = path.elementAt(i)
+        elements[i] = (0.0 if element.isMoveTo() else 1.0, element.x, element.y)
+    return elements
+
+
+@pytest.mark.parametrize('n', [2, 3, 149, 150, 151, 299, 1000, 1789])
+@pytest.mark.parametrize('dtype', [np.float64, np.int32])
+def test_fill_paths_identical_to_reference(n, dtype):
+    rng = np.random.default_rng(n)
+    x = np.arange(n).astype(dtype)
+    y = (rng.standard_normal(n) * 10).astype(dtype)
+    paths, bounds = [], []
+    PlotCurveItem._construct_finite_segment_FillPaths(x, y, 1.5, 150, paths, bounds)
+    reference = reference_fill_paths(x, y, 1.5)
+    assert len(paths) == len(reference)
+    for path, expected, box in zip(paths, reference, np.concatenate(bounds)):
+        np.testing.assert_array_equal(path_elements(path), path_elements(expected))
+        rect = expected.controlPointRect()
+        expected_box = (rect.left(), rect.right(), rect.top(), rect.bottom())
+        np.testing.assert_allclose(box, expected_box, rtol=1e-12)
+
+
+def test_fill_paths_cached():
+    x, y = random_walk(5000)
+    curve = pg.PlotCurveItem(x=x, y=y, fillLevel=0.0, brush='b')
+    rect = data_rects(x, y)[0]
+    render_item(curve, rect)
+    fill = curve._fillPathList
+    assert len(fill.paths) == len(fill.bounds) == 34
+    render_item(curve, rect)
+    assert curve._fillPathList is fill
+    curve.setData(x, y + 1)
+    render_item(curve, rect)
+    assert curve._fillPathList is not fill
+
+
+@contextlib.contextmanager
+def recorded_fill_paths():
+    """
+    Record how many fill paths ``PlotCurveItem.paint`` fills.
+
+    Yields
+    ------
+    list of int
+        Number of paths filled by each paint.
+    """
+    original = PlotCurveItem._getVisibleFillPaths
+    counts = []
+
+    def wrapper(self, *args):
+        paths = original(self, *args)
+        counts.append(len(paths))
+        return paths
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(PlotCurveItem, '_getVisibleFillPaths', wrapper)
+        yield counts
+
+
+@pytest.mark.parametrize('antialias', [False, True])
+@pytest.mark.parametrize('pen', [None, 'w'])
+@pytest.mark.parametrize('zoom', [1, 25])
+def test_fill_exposed_pixel_identical(antialias, pen, zoom):
+    x, y = random_walk(20000)
+    y[rng_indices(20000, 0.01)] = np.nan
+    curve = pg.PlotCurveItem(x=x, y=y, pen=pen, fillLevel=0.0,
+                             brush=(80, 120, 250, 100), antialias=antialias,
+                             connect='finite')
+    view = zoomed_view(x, y, zoom)
+    total = len(curve._getFillPathList(None).paths)
+    for left, width in [(0, 400), (0, 3), (150, 5), (397, 3)]:
+        clip = QtCore.QRect(left, 0, width, 300)
+        with recorded_fill_paths() as filled:
+            partial = render_exposed(curve, view, clip)
+        if width < 10:
+            assert filled[0] < total // 10
+        assert (partial == render_exposed(curve, view, clip, exposed=False)).all()
+
+
+def rng_indices(n, fraction, seed=1):
+    """
+    Return random indices of an array.
+
+    Parameters
+    ----------
+    n : int
+        Length of the array.
+    fraction : float
+        Fraction of the indices to return.
+    seed : int, default 1
+        Seed of the random generator.
+
+    Returns
+    -------
+    np.ndarray
+        The indices.
+    """
+    return np.flatnonzero(np.random.default_rng(seed).random(n) < fraction)
+
+
+def test_view_partial_repaint_filled():
+    # a cursor line over a filled curve fills a few chunks and draws a few vertices,
+    # and the screen shows the same pixels as after a full repaint
+    pw = pg.PlotWidget()
+    pw.resize(400, 300)
+    pw.show()
+    x, y = random_walk(100_000)
+    curve = pw.plot(x, y, pen='w', fillLevel=0.0, brush=(80, 120, 250, 100)).curve
+    line = pg.InfiniteLine(pos=30_000, angle=90, pen='r')
+    pw.addItem(line, ignoreBounds=True)
+    process_events(5)
+    pw.getViewBox().disableAutoRange()
+    process_events(5)
+    total = len(curve._getFillPathList(None).paths)
+
+    def screen():
+        image = pw.screen().grabWindow(pw.winId()).toImage()
+        if image.isNull():
+            pytest.skip('the platform cannot grab the window')
+        image = image.convertToFormat(QtGui.QImage.Format.Format_ARGB32)
+        return pg.functions.ndarray_from_qimage(image).copy()
+
+    with recorded_fill_paths() as filled, recorded_slices() as slices:
+        for pos in (30_500, 31_000, 31_500):
+            line.setPos(pos)
+            process_events()
+    assert len(filled) == 3 and max(filled) < total // 10
+    assert len(slices) == 3 and max(slices) < len(x) // 10
     partial = screen()
     pw.viewport().repaint()
     process_events()

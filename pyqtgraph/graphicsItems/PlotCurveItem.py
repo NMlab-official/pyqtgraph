@@ -267,6 +267,26 @@ class _VertexCache:
         )
 
 
+class _FillPaths:
+    """
+    Paths filling the area between a curve and its fill level, by chunks.
+
+    Parameters
+    ----------
+    paths : list of QtGui.QPainterPath
+        Closed paths, one per chunk of consecutive points.
+    bounds : np.ndarray
+        Bounding box of each path, of shape (len(paths), 4): x min, x max, y min,
+        y max.
+    """
+
+    __slots__ = ('paths', 'bounds')
+
+    def __init__(self, paths: list[QtGui.QPainterPath], bounds: np.ndarray) -> None:
+        self.paths = paths
+        self.bounds = bounds
+
+
 class PlotCurveItem(GraphicsObject):
     """
     Class representing a single plot curve. Instances of this class are created
@@ -903,15 +923,24 @@ class PlotCurveItem(GraphicsObject):
             finiteCheck=not self.opts['skipFiniteCheck']
         )
 
-    def getPath(self):
+    def getPath(self) -> QtGui.QPainterPath:
+        """
+        Return the path of the curve, built on first request after a data change.
+
+        Returns
+        -------
+        QtGui.QPainterPath
+            The path through the data points, following the ``connect`` option.
+        """
         if self.path is None:
             x,y = self.getData()
             if x is None or len(x) == 0 or y is None or len(y) == 0:
                 self.path = QtGui.QPainterPath()
             else:
                 self.path = self.generatePath(*self.getData())
+            # shapes derived from the path; the fill path list is built from the data
+            # and invalidated with it
             self.fillPath = None
-            self._fillPathList = None
             self._mouseShape = None
 
         return self.path
@@ -1303,7 +1332,23 @@ class PlotCurveItem(GraphicsObject):
             and brush.style() == QtCore.Qt.BrushStyle.SolidPattern
         )
 
-    def _getFillPathList(self, widget):
+    def _getFillPathList(self, widget: QtWidgets.QWidget | None) -> _FillPaths:
+        """
+        Return the paths filling the area under the curve, by chunks of points.
+
+        Filling many small paths is faster than filling a single large one with Qt's
+        raster engine. The paths are cached until the data or the fill level change.
+
+        Parameters
+        ----------
+        widget : QtWidgets.QWidget or None
+            Widget being painted on; larger chunks are used for OpenGL widgets.
+
+        Returns
+        -------
+        _FillPaths
+            The paths and their bounding boxes.
+        """
         if self._fillPathList is not None:
             return self._fillPathList
 
@@ -1331,7 +1376,8 @@ class PlotCurveItem(GraphicsObject):
             connect_kind = "array"
 
         fillLevel = self.opts['fillLevel']
-        self._fillPathList = []
+        paths = []
+        bounds = []
         sidx = []
         slen = []
 
@@ -1357,31 +1403,136 @@ class PlotCurveItem(GraphicsObject):
                 continue
             xchunk = x[s:s+l]
             ychunk = y[s:s+l]
-            pathlist = self._construct_finite_segment_FillPathList(xchunk, ychunk, fillLevel, chunksize)
-            self._fillPathList.extend(pathlist)
+            self._construct_finite_segment_FillPaths(
+                xchunk, ychunk, fillLevel, chunksize, paths, bounds)
 
+        self._fillPathList = _FillPaths(
+            paths, np.concatenate(bounds) if bounds else np.empty((0, 4)))
         return self._fillPathList
 
-    def _construct_finite_segment_FillPathList(self, x, y, baseline, chunksize):
-        paths = []
-        offset = 0
-        xybuf = np.empty((chunksize+3, 2))
+    @staticmethod
+    def _construct_finite_segment_FillPaths(
+        x: np.ndarray,
+        y: np.ndarray,
+        baseline: float,
+        chunksize: int,
+        paths: list[QtGui.QPainterPath],
+        bounds: list[np.ndarray],
+    ) -> None:
+        """
+        Append the fill paths of a run of finite points, by chunks.
 
-        while offset < len(x) - 1:
-            subx = x[offset:offset + chunksize]
-            suby = y[offset:offset + chunksize]
-            size = len(subx)
-            xyview = xybuf[:size+3]
-            xyview[:-3, 0] = subx
-            xyview[:-3, 1] = suby
-            xyview[-3:, 0] = subx[[-1, 0, 0]]
-            xyview[-3:, 1] = [baseline, baseline, suby[0]]
-            offset += size - 1  # last point is re-used for next chunk
-            # data was either declared to be all-finite OR was sanitized
-            path = fn._arrayToQPath_all(xyview[:, 0], xyview[:, 1], finiteCheck=False)
+        Consecutive chunks share their boundary point. Each path goes through the
+        points of its chunk, down to the baseline and back to its first point.
+
+        Parameters
+        ----------
+        x, y : np.ndarray
+            Finite coordinates of the run, at least 2 points.
+        baseline : float
+            Fill level.
+        chunksize : int
+            Number of curve points per chunk, at least 2.
+        paths : list of QtGui.QPainterPath
+            List the paths are appended to.
+        bounds : list of np.ndarray
+            List the bounding boxes of the paths are appended to, as one array of
+            shape (number of paths, 4): x min, x max, y min, y max.
+        """
+        size = len(x)
+        starts = np.arange(0, size - 1, chunksize - 1)
+        ends = np.minimum(starts + chunksize - 1, size - 1)
+
+        # bounding boxes: the runs reduced from each start exclude the shared end point
+        box = np.empty((len(starts), 4))
+        box[:, 0] = np.minimum(np.minimum.reduceat(x, starts), x[ends])
+        box[:, 1] = np.maximum(np.maximum.reduceat(x, starts), x[ends])
+        box[:, 2] = np.minimum(np.minimum.reduceat(y, starts), y[ends])
+        box[:, 3] = np.maximum(np.maximum.reduceat(y, starts), y[ends])
+        box[:, 2] = np.minimum(box[:, 2], baseline)
+        box[:, 3] = np.maximum(box[:, 3], baseline)
+        bounds.append(box)
+
+        # the points of the run, and the 3 points closing each chunk via the baseline
+        points = np.empty((size, 2))
+        points[:, 0] = x
+        points[:, 1] = y
+        closing = np.empty((len(starts), 3, 2))
+        closing[:, 0, 0] = x[ends]
+        closing[:, 1:, 0] = x[starts, np.newaxis]
+        closing[:, :2, 1] = baseline
+        closing[:, 2, 1] = y[starts]
+
+        # one polygon buffer for all the chunks, copied by QPainterPath.addPolygon
+        polygon = fn.create_qpolygonf(min(chunksize, size) + 3)
+        memory = fn.ndarray_from_qpolygonf(polygon)
+        for chunk, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
+            count = end - start + 1
+            if len(memory) != count + 3:
+                # last chunk, shorter
+                if hasattr(polygon, 'resize'):
+                    polygon.resize(count + 3)
+                else:
+                    polygon.fill(QtCore.QPointF(), count + 3)
+                memory = fn.ndarray_from_qpolygonf(polygon)
+            memory[:count] = points[start:end + 1]
+            memory[count:] = closing[chunk]
+            path = QtGui.QPainterPath()
+            path.reserve(count + 3)
+            path.addPolygon(polygon)
             paths.append(path)
 
-        return paths
+    def _getVisibleFillPaths(
+        self,
+        painter: QtGui.QPainter,
+        option: QtWidgets.QStyleOptionGraphicsItem | None,
+        fill: _FillPaths,
+    ) -> list[QtGui.QPainterPath]:
+        """
+        Return the fill paths that may cover a part of the exposed area.
+
+        A path whose bounding box lies outside ``option.exposedRect`` by more than 1
+        pixel draws no pixel inside it, antialiased or not, so it is skipped. This
+        saves most of the paths when zoomed in, or when a small part of the item is
+        repainted.
+
+        Parameters
+        ----------
+        painter : QtGui.QPainter
+            The active painter.
+        option : QtWidgets.QStyleOptionGraphicsItem or None
+            Style options passed to :meth:`paint`.
+        fill : _FillPaths
+            All the fill paths.
+
+        Returns
+        -------
+        list of QtGui.QPainterPath
+            The paths to fill.
+        """
+        if option is None or option.exposedRect.isEmpty() or len(fill.paths) < 2:
+            return fill.paths
+        transform = painter.transform()
+        if (
+            not transform.isAffine()
+            or transform.isRotating()
+            or transform.m11() == 0.0
+            or transform.m22() == 0.0
+        ):
+            return fill.paths
+        exposed = option.exposedRect
+        marginX = 2.0 / abs(transform.m11())
+        marginY = 2.0 / abs(transform.m22())
+        xmin, xmax, ymin, ymax = fill.bounds.T
+        visible = (
+            (xmax >= exposed.left() - marginX)
+            & (xmin <= exposed.right() + marginX)
+            & (ymax >= exposed.top() - marginY)
+            & (ymin <= exposed.bottom() + marginY)
+        )
+        if visible.all():
+            return fill.paths
+        return [fill.paths[index] for index in np.flatnonzero(visible).tolist()]
 
     @debug.warnOnException  ## raising an exception here causes crash
     def paint(self, p: QtGui.QPainter, opt: QtWidgets.QStyleOptionGraphicsItem,
@@ -1479,18 +1630,19 @@ class PlotCurveItem(GraphicsObject):
                     path_transform is None
                     and self._shouldUseFillPathList(brush)
                 ):
-                    paths = self._getFillPathList(widget)
-                else:
                     # The fill path list is a painting throughput optimization.
+                    paths = self._getVisibleFillPaths(
+                        p, opt, self._getFillPathList(widget))
+                    profiler('generate fill path')
+                    for path in paths:
+                        p.fillPath(path, brush)
+                else:
                     # SVG export prefers the single path while applying a
                     # path-local coordinate offset for precision.
-                    paths = [self._getFillPath()]
-
-                if path_transform is not None:
-                    paths = [path_transform.map(path) for path in paths]
-
-                profiler('generate fill path')
-                for path in paths:
+                    path = self._getFillPath()
+                    if path_transform is not None:
+                        path = path_transform.map(path)
+                    profiler('generate fill path')
                     p.fillPath(path, brush)
                 profiler('draw fill path')
 
@@ -1499,7 +1651,8 @@ class PlotCurveItem(GraphicsObject):
                 if pen is not None and pen.style() != QtCore.Qt.PenStyle.NoPen
             ]
             # only the vertices needed to repaint the exposed area, if they are few
-            vertexRange = None if do_fill else self._getExposedVertexRange(p, opt, pens)
+            vertexRange = (
+                None if do_fill_outline else self._getExposedVertexRange(p, opt, pens))
 
             for pen in pens:
                 p.setPen(pen)
