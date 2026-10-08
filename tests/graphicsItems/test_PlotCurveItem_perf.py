@@ -5,6 +5,7 @@ They check deterministic properties (which drawing primitive is used, which cach
 built) and that the faster drawing code renders pixel-identical images.
 """
 import contextlib
+import gc
 
 import numpy as np
 import pytest
@@ -753,3 +754,23 @@ def test_pairs_lengths_cached():
         render_item(curve, rect)
         assert finite_checks.count == first
     assert curve._vertexCache.pairLengths is not None
+
+
+def test_slice_segments_buffer_outlives_the_draw_call():
+    # With PySide, the drawLines arguments of a slice are a bare pointer to the
+    # segment buffer: the buffer must belong to the item, not to a temporary freed
+    # before QPainter.drawLines runs (drawing from freed memory, then crashes).
+    x, y = random_walk(20000)
+    curve = pg.PlotCurveItem(x=x, y=y, pen=pg.mkPen('w', width=0))
+    curve.setSegmentedLineMode('on')
+    vx, vy = curve._getPolylineVertices()
+    curve._getVertexSliceSegments(100, 200)
+    buffer = curve._sliceSegments
+    assert len(buffer) == 99
+    gc.collect()
+    lines = buffer.ndarray()
+    np.testing.assert_array_equal(lines[:, 0], vx[100:199])
+    np.testing.assert_array_equal(lines[:, 3], vy[101:200])
+    # the buffer is reused by the next slice
+    curve._getVertexSliceSegments(300, 400)
+    assert curve._sliceSegments is buffer
