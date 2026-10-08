@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 
 import pyqtgraph as pg
 from tests.perf_helpers import count_calls, paints_per_update
@@ -45,8 +44,6 @@ def test_count_calls_on_instance():
     assert 'method' not in vars(obj)
 
 
-# Not strict: an update is painted twice only when the width of the left axis changes.
-@pytest.mark.xfail(strict=False, reason="an axis resized while painting repaints the plot")
 def test_paints_per_update_autorange_streaming():
     pw = pg.PlotWidget()
     pw.resize(400, 300)
