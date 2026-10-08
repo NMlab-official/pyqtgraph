@@ -502,18 +502,38 @@ class PlotItem(GraphicsWidget):
         self.paramList[name] = (item.checkState() == QtCore.Qt.CheckState.Checked)
         self.recomputeAverages()
         
-    def recomputeAverages(self):
+    def recomputeAverages(self) -> None:
+        """
+        Recompute the average curves, if averaging is enabled in the context menu.
+        """
         if not self.ctrl.averageGroup.isChecked():
             return
         for k in self.avgCurves:
             self.removeItem(self.avgCurves[k][1])
         self.avgCurves = {}
-        for c in self.curves:
+        # iterate over a copy: the average curves are appended to self.curves, and
+        # must not be averaged themselves
+        for c in self.curves[:]:
             self.addAvgCurve(c)
         self.replot()
         
-    def addAvgCurve(self, curve):
-        ## Add a single curve into the pool of curves averaged together
+    def addAvgCurve(self, curve: QtWidgets.QGraphicsItem) -> None:
+        """
+        Add a curve into the pool of curves averaged together.
+
+        Items without ``getData`` (or without data) are not averaged.
+
+        Parameters
+        ----------
+        curve : GraphicsItem
+            The data item to average, see :meth:`addItem`.
+        """
+        getData = getattr(curve, 'getData', None)
+        if not callable(getData):
+            return
+        (x, y) = getData()
+        if x is None or y is None:
+            return
 
         ## If there are plot parameters, then we need to determine which to average together.
         remKeys = []
@@ -558,8 +578,7 @@ class PlotItem(GraphicsWidget):
         (n, plot) = self.avgCurves[key]
 
         ### Average data together
-        (x, y) = curve.getData()
-        stepMode = curve.opts['stepMode']
+        stepMode = getattr(curve, 'opts', {}).get('stepMode')
         if plot.yData is not None and y.shape == plot.yData.shape:
             # note that if shapes do not match, then the average resets.
             newData = plot.yData * (n-1) / float(n) + y * 1.0 / float(n)
@@ -622,7 +641,7 @@ class PlotItem(GraphicsWidget):
         self.vb.addItem(item, *args, **vbargs)
         name = None
         if hasattr(item, 'implements') and item.implements('plotData'):
-            name = item.name()
+            name = item.name() if callable(getattr(item, 'name', None)) else None
             self.dataItems.append(item)            
             params = kwargs.get('params', {})
             self.itemMeta[item] = params
@@ -667,6 +686,27 @@ class PlotItem(GraphicsWidget):
             A copy of a list of the data items.
         """
         return self.dataItems[:]
+
+    def _curvesWith(self, method: str) -> list[QtWidgets.QGraphicsItem]:
+        """
+        Get the data items that implement a method.
+
+        The data items (see :meth:`addItem`) include :class:`~pyqtgraph.PlotDataItem`,
+        but also :class:`~pyqtgraph.PlotCurveItem`, :class:`~pyqtgraph.ScatterPlotItem`,
+        :class:`~pyqtgraph.BarGraphItem` and any item implementing ``'plotData'``,
+        which do not offer the data transformations of :class:`~pyqtgraph.PlotDataItem`.
+
+        Parameters
+        ----------
+        method : str
+            Name of the method.
+
+        Returns
+        -------
+        list of GraphicsItem
+            The data items with a callable attribute named `method`, in order.
+        """
+        return [c for c in self.curves if callable(getattr(c, method, None))]
 
     def addLine(self, x=None, y=None, z=None, **kwargs):
         """
@@ -1041,9 +1081,12 @@ class PlotItem(GraphicsWidget):
         ex = ImageExporter(self)
         ex.export(fileName)
         
-    def writeCsv(self, fileName=None):
+    def writeCsv(self, fileName: str | None = None) -> None:
         """
         Write the plot data to a CSV file.
+
+        The data of the items with a ``getData`` method returning `x` and `y` arrays
+        is written, two columns per item.
 
         Parameters
         ----------
@@ -1058,7 +1101,8 @@ class PlotItem(GraphicsWidget):
         fileName = str(fileName)
         PlotItem.lastFileDir = os.path.dirname(fileName)
         
-        data = [c.getData() for c in self.curves]
+        data = [c.getData() for c in self._curvesWith('getData')]
+        data = [d for d in data if d[0] is not None and d[1] is not None]
         with open(fileName, 'w') as fd:
             i = 0
             while True:
@@ -1114,10 +1158,18 @@ class PlotItem(GraphicsWidget):
         return (None, PlotItem.saveState, PlotItem.restoreState)
       
     @QtCore.Slot(bool)
-    def updateSpectrumMode(self, b=None):
+    def updateSpectrumMode(self, b: bool | None = None) -> None:
+        """
+        Apply the FFT mode of the context menu to the data items supporting it.
+
+        Parameters
+        ----------
+        b : bool or None, default None
+            The FFT mode, the state of the context menu if ``None``.
+        """
         if b is None:
             b = self.ctrl.fftCheck.isChecked()
-        for c in self.curves:
+        for c in self._curvesWith('setFftMode'):
             c.setFftMode(b)
         self.enableAutoRange()
         self.recomputeAverages()
@@ -1221,11 +1273,18 @@ class PlotItem(GraphicsWidget):
                 )
             
     @QtCore.Slot()
-    def updateDownsampling(self):
+    def updateDownsampling(self) -> None:
+        """
+        Apply the downsampling and clip-to-view settings of the context menu.
+
+        Only data items supporting them (:class:`~pyqtgraph.PlotDataItem`) are
+        updated.
+        """
         ds, auto, method = self.downsampleMode()
         clip = self.ctrl.clipToViewCheck.isChecked()
-        for c in self.curves:
+        for c in self._curvesWith('setDownsampling'):
             c.setDownsampling(ds, auto, method)
+        for c in self._curvesWith('setClipToView'):
             c.setClipToView(clip)
         self.recomputeAverages()
         
@@ -1285,7 +1344,7 @@ class PlotItem(GraphicsWidget):
                 curve.show()
     
     @QtCore.Slot()
-    def updateDecimation(self):
+    def updateDecimation(self) -> None:
         """
         Update the number of visible curves.
 
@@ -1310,7 +1369,8 @@ class PlotItem(GraphicsWidget):
 
         if self.ctrl.forgetTracesCheck.isChecked():
             for curve in self.curves[:-numCurves]:
-                curve.clear()
+                if callable(getattr(curve, 'clear', None)):
+                    curve.clear()
                 self.removeItem(curve)
 
         for i, curve in enumerate(reversed(self.curves)):
@@ -1321,9 +1381,17 @@ class PlotItem(GraphicsWidget):
       
     @QtCore.Slot(bool)
     @QtCore.Slot(int)
-    def updateAlpha(self, *args):
+    def updateAlpha(self, *args) -> None:
+        """
+        Apply the transparency of the context menu to the data items supporting it.
+
+        Parameters
+        ----------
+        *args
+            Ignored, the arguments of the signals connected to this slot.
+        """
         (alpha, auto) = self.alphaState()
-        for c in self.curves:
+        for c in self._curvesWith('setAlpha'):
             c.setAlpha(alpha**2, auto)
      
     def alphaState(self):
