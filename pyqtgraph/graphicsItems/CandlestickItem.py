@@ -5,10 +5,9 @@ import math
 
 import numpy as np
 
-from .. import Qt
 from .. import functions as fn
 from ..Qt import QtCore, QtGui
-from .BarGraphItem import _visibleRect
+from .BarGraphItem import _GrowableArray, _PrimitiveBuffer, _visibleRect
 from .GraphicsObject import GraphicsObject
 
 __all__ = ['CandlestickItem']
@@ -20,134 +19,6 @@ _DEFAULT_WIDTH_RATIO = 0.8
 # Levels aggregating at least this many candles per block are computed for all candles
 # and cached; smaller blocks are computed for the visible candles only, which are few.
 _CACHED_MIN_K = 16
-
-
-class _GrowableArray:
-    """
-    One-dimensional float array with a logical length and a geometric capacity.
-
-    Parameters
-    ----------
-    dtype : numpy.dtype, default numpy.float64
-        Element type.
-    """
-
-    def __init__(self, dtype=np.float64) -> None:
-        self._data = np.empty(0, dtype=dtype)
-        self._size = 0
-
-    def __len__(self) -> int:
-        return self._size
-
-    @property
-    def view(self) -> np.ndarray:
-        """numpy.ndarray: The ``len(self)`` valid elements (a view, not a copy)."""
-        return self._data[:self._size]
-
-    def clear(self) -> None:
-        """Remove all elements, keeping the capacity."""
-        self._size = 0
-
-    def extend(self, values: np.ndarray) -> None:
-        """
-        Append elements, growing the capacity geometrically when needed.
-
-        Parameters
-        ----------
-        values : numpy.ndarray
-            Elements to append.
-        """
-        need = self._size + len(values)
-        if need > len(self._data):
-            data = np.empty(max(need, len(self._data) * 3 // 2), dtype=self._data.dtype)
-            data[:self._size] = self._data[:self._size]
-            self._data = data
-        self._data[self._size:need] = values
-        self._size = need
-
-    def pop(self) -> None:
-        """Remove the last element."""
-        self._size -= 1
-
-
-class _PrimitiveBuffer:
-    """
-    ``PrimitiveArray`` with a logical length and a geometric capacity.
-
-    The underlying array is only ever resized to its capacity, and drawn through
-    ``drawargs(start, stop)``, so that appending keeps the existing primitives.
-
-    Parameters
-    ----------
-    klass : type
-        ``QtCore.QRectF`` or ``QtCore.QLineF``.
-    """
-
-    def __init__(self, klass: type) -> None:
-        self._array = Qt.internals.PrimitiveArray(klass, 4)
-        self._size = 0
-
-    def __len__(self) -> int:
-        return self._size
-
-    def ndarray(self) -> np.ndarray:
-        """
-        Coordinates of the primitives.
-
-        Returns
-        -------
-        numpy.ndarray
-            View of shape ``(len(self), 4)``.
-        """
-        return self._array.ndarray()[:self._size]
-
-    def clear(self) -> None:
-        """Remove all primitives, keeping the capacity."""
-        self._size = 0
-
-    def pop(self) -> None:
-        """Remove the last primitive."""
-        self._size -= 1
-
-    def reserve(self, count: int) -> np.ndarray:
-        """
-        Append ``count`` primitives and return their coordinates, to be filled.
-
-        Parameters
-        ----------
-        count : int
-            Number of primitives to append.
-
-        Returns
-        -------
-        numpy.ndarray
-            Writable view of shape ``(count, 4)``.
-        """
-        need = self._size + count
-        capacity = len(self._array)
-        if need > capacity:
-            kept = self._array.ndarray()[:self._size].copy()
-            self._array.resize(max(need, capacity * 3 // 2))
-            self._array.ndarray()[:self._size] = kept
-        view = self._array.ndarray()[self._size:need]
-        self._size = need
-        return view
-
-    def drawargs(self, start: int, stop: int) -> tuple:
-        """
-        Arguments to draw primitives ``start`` to ``stop - 1``.
-
-        Parameters
-        ----------
-        start, stop : int
-            Range of primitives, within ``len(self)``.
-
-        Returns
-        -------
-        tuple
-            Arguments for ``QPainter.drawRects`` or ``QPainter.drawLines``.
-        """
-        return self._array.drawargs(start, stop)
 
 
 def _union(a: tuple[float | None, float | None],
