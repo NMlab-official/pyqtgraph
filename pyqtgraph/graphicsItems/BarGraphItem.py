@@ -454,9 +454,37 @@ def _normalizedCoords(opts: Mapping) -> tuple[np.ndarray, ...]:
     return x0, y0, x1, y1
 
 
+def _finiteBounds(x0: np.ndarray, y0: np.ndarray, x1: np.ndarray,
+                  y1: np.ndarray) -> tuple[tuple[float, float], tuple[float, float]]:
+    """
+    Bounds of the bars whose edges are all finite.
+
+    Parameters
+    ----------
+    x0, y0, x1, y1 : numpy.ndarray
+        Edges of the bars, ``x0 <= x1`` and ``y0 <= y1`` (or NaN), one value per bar.
+
+    Returns
+    -------
+    tuple of tuple of float
+        ``((xmin, xmax), (ymin, ymax))``; NaN when no bar has finite edges.
+    """
+    bounds = (float(np.min(x0)), float(np.max(x1)), float(np.min(y0)), float(np.max(y1)))
+    if not all(map(math.isfinite, bounds)):
+        # a NaN propagates to the bounds, and as x0 <= x1 and y0 <= y1, so does an
+        # infinite edge: only then are bars left out
+        finite = np.isfinite(x0) & np.isfinite(x1) & np.isfinite(y0) & np.isfinite(y1)
+        if finite.any():
+            bounds = (float(np.min(x0[finite])), float(np.max(x1[finite])),
+                      float(np.min(y0[finite])), float(np.max(y1[finite])))
+        else:
+            bounds = (math.nan,) * 4
+    return (bounds[0], bounds[1]), (bounds[2], bounds[3])
+
+
 def _lower(a: float, b: float) -> float:
     """
-    Lower of two bounds, as :func:`numpy.minimum`.
+    Lower of two bounds, NaN standing for no bound (as :func:`numpy.fmin`).
 
     Parameters
     ----------
@@ -466,14 +494,14 @@ def _lower(a: float, b: float) -> float:
     Returns
     -------
     float
-        The smaller one; NaN when either is NaN.
+        The smaller one; the other one when one is NaN.
     """
-    return math.nan if math.isnan(a) or math.isnan(b) else min(a, b)
+    return b if math.isnan(a) else a if math.isnan(b) else min(a, b)
 
 
 def _upper(a: float, b: float) -> float:
     """
-    Upper of two bounds, as :func:`numpy.maximum`.
+    Upper of two bounds, NaN standing for no bound (as :func:`numpy.fmax`).
 
     Parameters
     ----------
@@ -483,9 +511,9 @@ def _upper(a: float, b: float) -> float:
     Returns
     -------
     float
-        The larger one; NaN when either is NaN.
+        The larger one; the other one when one is NaN.
     """
-    return math.nan if math.isnan(a) or math.isnan(b) else max(a, b)
+    return b if math.isnan(a) else a if math.isnan(b) else max(a, b)
 
 
 class _BarStats:
@@ -501,7 +529,8 @@ class _BarStats:
     count : int
         Number of bars.
     bounds : tuple of tuple of float
-        ``((xmin, xmax), (ymin, ymax))``, NaN when an edge of a bar is NaN.
+        ``((xmin, xmax), (ymin, ymax))`` of the bars whose edges are all finite,
+        NaN when there is none.
     finite : bool
         Whether the left and right edges of all rectangles are finite.
     x0Sorted, x1Sorted : bool
@@ -549,8 +578,7 @@ class _BarStats:
         if count == 0:
             return stats
         stats.count = count
-        stats.bounds = ((float(np.min(x0)), float(np.max(x1))),
-                        (float(np.min(y0)), float(np.max(y1))))
+        stats.bounds = _finiteBounds(x0, y0, x1, y1)
         stats.finite = bool(np.isfinite(right).all())
         if stats.finite:
             stats.widthSum, stats.widthCount = float(widths.sum()), count
@@ -1423,10 +1451,10 @@ class BarGraphItem(GraphicsObject):
         """
         self._headStats = head
         self._stats = stats
-        if stats.count:
-            self._dataBounds = stats.bounds
-        else:
-            self._dataBounds = (None, None), (None, None)
+        # None (NaN in the summary) when no bar has finite edges, e.g. without bars
+        self._dataBounds = tuple(
+            tuple(None if math.isnan(bound) else bound for bound in pair)
+            for pair in stats.bounds)
         self._meanWidth = stats.widthSum / stats.widthCount if stats.widthCount else math.nan
         self._xSorted = bool(stats.count) and stats.finite and stats.x0Sorted
         # whether the right edges are sorted too, i.e. self._x1 holds the right edges
@@ -1950,14 +1978,15 @@ class BarGraphItem(GraphicsObject):
         Returns
         -------
         tuple of float or None
-            ``(min, max)``, or ``(None, None)`` without data or when no bar is
-            considered.
+            ``(min, max)``, or ``(None, None)`` without data or when no bar with
+            finite edges is considered.
 
         Notes
         -----
-        The full range (``frac=1`` without ``orthoRange``) is computed once per data
-        change; it is NaN when a coordinate of a bar is NaN. The restricted and
-        percentile ranges ignore the bars with a NaN coordinate.
+        All ranges ignore the bars with a non-finite coordinate (e.g. a NaN height),
+        along both axes. The full range (``frac=1`` without ``orthoRange``) is
+        computed once per data change, and updated incrementally by
+        :meth:`appendData`.
         """
         if ax not in (0, 1):
             raise ValueError(f'ax must be 0 or 1, got {ax}')
@@ -1997,41 +2026,42 @@ class BarGraphItem(GraphicsObject):
             is considered.
         """
         memory = self._rectarray.ndarray()
+        searched = orthoRange is not None and ax == 1 and self._xSorted
         if orthoRange is not None:
             lo, hi = sorted(float(value) for value in orthoRange)
-            if ax == 1 and self._xSorted:
-                # first bar whose right edge reaches lo, first bar starting after hi
-                start = int(np.searchsorted(self._x1, lo, side='left'))
-                stop = int(np.searchsorted(self._x0, hi, side='right'))
-                if frac >= 1.0 and self._x1Sorted and stop - start == len(memory):
-                    # all bars, e.g. a zoomed out view: reuse the full range if finite
-                    ymin, ymax = self._dataBounds[1]
-                    if math.isfinite(ymin) and math.isfinite(ymax):
-                        return float(ymin), float(ymax)
-                memory = memory[start:stop]
-                if not self._x1Sorted:
-                    # self._x1 is the running maximum of the right edges: a bar
-                    # within the slice can still end before lo
-                    memory = memory[memory[:, 0] + memory[:, 2] >= lo]
-            else:
-                other = 1 - ax
-                low = memory[:, other]
-                memory = memory[(low <= hi) & (low + memory[:, other + 2] >= lo)]
+        if searched:
+            # first bar whose right edge reaches lo, first bar starting after hi
+            start = int(np.searchsorted(self._x1, lo, side='left'))
+            stop = int(np.searchsorted(self._x0, hi, side='right'))
+            if frac >= 1.0 and self._x1Sorted and stop - start == len(memory):
+                # all bars, e.g. a zoomed out view: reuse the full range
+                ymin, ymax = self._dataBounds[1]
+                if ymin is None or ymax is None:
+                    return None, None
+                return ymin, ymax
+            memory = memory[start:stop]
+        # bars with a non-finite coordinate are ignored, as by the full range
+        finite = np.isfinite(memory).all(axis=1)
+        if not finite.all():
+            memory = memory[finite]
+        if searched:
+            if not self._x1Sorted:
+                # self._x1 is the running maximum of the right edges: a bar within
+                # the slice can still end before lo
+                memory = memory[memory[:, 0] + memory[:, 2] >= lo]
+        elif orthoRange is not None:
+            other = 1 - ax
+            low = memory[:, other]
+            memory = memory[(low <= hi) & (low + memory[:, other + 2] >= lo)]
         if len(memory) == 0:
             return None, None
         low = memory[:, ax]
         high = low + memory[:, ax + 2]
         if frac >= 1.0:
-            bmin, bmax = np.fmin.reduce(low), np.fmax.reduce(high)
+            bmin, bmax = np.min(low), np.max(high)
         else:
-            low = low[np.isfinite(low)]
-            high = high[np.isfinite(high)]
-            if len(low) == 0 or len(high) == 0:
-                return None, None
             bmin = np.percentile(low, 50 * (1 - frac))
             bmax = np.percentile(high, 50 * (1 + frac))
-        if math.isnan(bmin) or math.isnan(bmax):
-            return None, None
         return float(bmin), float(bmax)
 
     def pixelPadding(self):
@@ -2039,7 +2069,16 @@ class BarGraphItem(GraphicsObject):
         pw = (self._penWidth[1] or 1) * 0.5
         return pw
 
-    def boundingRect(self):
+    def boundingRect(self) -> QtCore.QRectF:
+        """
+        Bounds of the bars, including their pens; bars with non-finite edges are
+        ignored, see :meth:`dataBounds`.
+
+        Returns
+        -------
+        QtCore.QRectF
+            Rectangle in item coordinates; empty without bars with finite edges.
+        """
         xmn, xmx = self.dataBounds(ax=0)
         if xmn is None or xmx is None:
             return QtCore.QRectF()

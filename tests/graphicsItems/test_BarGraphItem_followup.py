@@ -112,7 +112,7 @@ def test_orthoRange_ignores_bars_with_nan():
     heights = HEIGHTS.copy()
     heights[[4, 9]] = np.nan
     item = pg.BarGraphItem(x=np.arange(10.), height=heights, width=0.6)
-    assert np.isnan(item.dataBounds(1)).all()  # full range: unchanged behaviour
+    assert item.dataBounds(1) == pytest.approx((0, 8))  # full range: NaN bars ignored
     assert item.dataBounds(1, orthoRange=(-100, 100)) == pytest.approx((0, 8))
     assert item.dataBounds(1, orthoRange=(2.5, 5.2)) == pytest.approx((0, 3))
     assert item.dataBounds(1, orthoRange=(3.8, 4.2)) == (None, None)
