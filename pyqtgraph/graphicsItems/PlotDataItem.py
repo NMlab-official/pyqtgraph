@@ -556,7 +556,7 @@ class PlotDataItem(GraphicsObject):
     sigPointsClicked = QtCore.Signal(object, object, object)
     sigPointsHovered = QtCore.Signal(object, object, object)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__()
         self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemHasNoContents)
         # Original data, mapped data, and data processed for display is now all held in
@@ -587,6 +587,10 @@ class PlotDataItem(GraphicsObject):
 
         # holds last clipping points of dynamic range limiter
         self._drlLastClip = (0.0, 0.0)
+        # True while the displayed y data is clipped by the dynamic range limiter
+        self._drlClipActive = False
+        # x and y arrays last forwarded to the curve and scatter plot items
+        self._sentDisplayData: tuple[np.ndarray, np.ndarray] | None = None
         self._adsLastValue = 1
         # self.clear()
         self.opts = {
@@ -1155,7 +1159,7 @@ class PlotDataItem(GraphicsObject):
         self,
         *args,
         **kwargs
-    ):
+    ) -> None:
         """
         Clear any data displayed by this item and display new data.
 
@@ -1310,6 +1314,8 @@ class PlotDataItem(GraphicsObject):
         self._datasetMapped  = None
         # invalidate display data, will be generated in getData() / _getDisplayDataset()
         self._datasetDisplay = None
+        # new data is always forwarded to the curve and scatter plot items
+        self._sentDisplayData = None
         # reset auto-downsample value
         self._adsLastValue   = 1
 
@@ -1325,7 +1331,7 @@ class PlotDataItem(GraphicsObject):
         self.sigPlotChanged.emit(self)
         profiler('emit')
 
-    def updateItems(self, styleUpdate: bool = True):
+    def updateItems(self, styleUpdate: bool = True) -> None:
         """
         Update the displayed curve and scatter plot.
 
@@ -1333,11 +1339,32 @@ class PlotDataItem(GraphicsObject):
         data or graphics style has been updated. It is not usually necessary to call this
         from user code. 
 
+        When `styleUpdate` is ``False`` and the displayed `x` and `y` arrays are the
+        same objects as those last forwarded, the curve and scatter plot are already up
+        to date and are left untouched.
+
         Parameters
         ----------
         styleUpdate : bool, default True
             Indicates if the style was updated in addition to the data.
         """
+        dataset = self._getDisplayDataset()
+        if dataset is None:  # then we have nothing to show
+            self._sentDisplayData = None
+            self.curve.hide()
+            self.scatter.hide()
+            return
+
+        if (
+            not styleUpdate
+            and self._sentDisplayData is not None
+            and self._sentDisplayData[0] is dataset.x
+            and self._sentDisplayData[1] is dataset.y
+        ):
+            # Neither the style nor the displayed arrays changed (e.g. a vertical pan
+            # without dynamic range clipping): forwarding them again would only discard
+            # the cached path of the curve and the styles of the scatter plot.
+            return
 
         # override styleUpdate request and always enforce update until we have a
         # better solution for:
@@ -1378,12 +1405,7 @@ class PlotDataItem(GraphicsObject):
                 if k in self.opts:
                     scatterArgs[v] = self.opts[k]
 
-        dataset = self._getDisplayDataset()
-        if dataset is None:  # then we have nothing to show
-            self.curve.hide()
-            self.scatter.hide()
-            return
-
+        self._sentDisplayData = (dataset.x, dataset.y)
         x = dataset.x
         y = dataset.y
         if dataset.connect is not None:
@@ -1512,12 +1534,7 @@ class PlotDataItem(GraphicsObject):
         yAllFinite = self._datasetMapped.yAllFinite
 
         view = self.getViewBox()
-        if view is None:
-            view_range = None
-        else:
-            view_range = view.viewRect()  # this is always up-to-date
-        if view_range is None:
-            view_range = self.viewRect()
+        view_range = self._displayViewRange()
 
         ds = self.opts['downsample']
         if not isinstance(ds, int):
@@ -1615,50 +1632,125 @@ class PlotDataItem(GraphicsObject):
                     c[1::2] = connect[:n*ds].reshape(n,ds).all(axis=1)
                     connect = c
 
+        clip_active = False
         if self.opts['dynamicRangeLimit'] is not None and view_range is not None:
             data_range = self._datasetMapped.dataRect()
-            if data_range is not None:
+            # never clip data if it fits into +/- (extended) limit * view height
+            if data_range is not None and self._drlClipRequired(data_range, view_range):
+                clip_active = True
                 view_height = view_range.height()
                 limit = self.opts['dynamicRangeLimit']
                 hyst  = self.opts['dynamicRangeHyst']
-                # never clip data if it fits into +/- (extended) limit * view height
-                if (
-                    # note that "bottom" is the larger number, and "top" is the smaller
-                    # one. Never clip if the view does not show anything and would cause
-                    # division by zero
-                    view_height > 0                               
-                    # never clip if all data is too small to see
-                    and not data_range.bottom() < view_range.top()
-                    # never clip if all data is too large to see
-                    and not data_range.top() > view_range.bottom()
-                    and data_range.height() > 2 * hyst * limit * view_height
-                ):
-                    cache_is_good = False
-                    # check if cached display data can be reused:
-                    if self._datasetDisplay is not None:
-                        # top is minimum value, bottom is maximum value
-                        # how many multiples of the current view height does the clipped
-                        # plot extend to the top and bottom?
-                        top_exc = -(self._drlLastClip[0]-view_range.bottom()) / view_height
-                        bot_exc =  (self._drlLastClip[1]-view_range.top()   ) / view_height
-                        if (
-                            limit / hyst <= top_exc <= limit * hyst and
-                            limit / hyst <= bot_exc <= limit * hyst
-                        ):
-                            # restore cached values
-                            x = self._datasetDisplay.x
-                            y = self._datasetDisplay.y
-                            cache_is_good = True
-                    if not cache_is_good:
-                        min_val = view_range.bottom() - limit * view_height
-                        max_val = view_range.top()    + limit * view_height
-                        y = fn.clip_array(y, min_val, max_val)
-                        self._drlLastClip = (min_val, max_val)
+                cache_is_good = False
+                # check if cached display data can be reused. This is only valid if
+                # the cached data was clipped itself.
+                if self._datasetDisplay is not None and self._drlClipActive:
+                    # top is minimum value, bottom is maximum value
+                    # how many multiples of the current view height does the clipped
+                    # plot extend to the top and bottom?
+                    top_exc = -(self._drlLastClip[0]-view_range.bottom()) / view_height
+                    bot_exc =  (self._drlLastClip[1]-view_range.top()   ) / view_height
+                    if (
+                        limit / hyst <= top_exc <= limit * hyst and
+                        limit / hyst <= bot_exc <= limit * hyst
+                    ):
+                        # restore cached values
+                        x = self._datasetDisplay.x
+                        y = self._datasetDisplay.y
+                        cache_is_good = True
+                if not cache_is_good:
+                    min_val = view_range.bottom() - limit * view_height
+                    max_val = view_range.top()    + limit * view_height
+                    y = fn.clip_array(y, min_val, max_val)
+                    self._drlLastClip = (min_val, max_val)
+        self._drlClipActive = clip_active
         self._datasetDisplay = PlotDataset(x, y, xAllFinite, yAllFinite, connect)
         self.setProperty('xViewRangeWasChanged', False)
         self.setProperty('yViewRangeWasChanged', False)
 
         return self._datasetDisplay
+
+    def _displayViewRange(self) -> QtCore.QRectF | None:
+        """
+        Get the visible range used to clip and limit the displayed data.
+
+        Returns
+        -------
+        :class:`QRectF` or None
+            The view rectangle of the containing :class:`~pyqtgraph.ViewBox`, or the
+            visible bounds of this item if that is not available. ``None`` if the item
+            is not displayed in a view.
+        """
+        view = self.getViewBox()
+        view_range = None if view is None else view.viewRect()  # always up-to-date
+        if view_range is None:
+            view_range = self.viewRect()
+        return view_range
+
+    def _drlClipRequired(
+        self,
+        data_range: QtCore.QRectF,
+        view_range: QtCore.QRectF
+    ) -> bool:
+        """
+        Test whether the dynamic range limit requires clipping the displayed `y` data.
+
+        Clipping is never applied when the data fits into ``2 * hysteresis * limit``
+        view heights, when the view has no height, or when all data lies outside of
+        the view on the same side.
+
+        Parameters
+        ----------
+        data_range : :class:`QRectF`
+            Bounding rectangle of the finite data, see :meth:`PlotDataset.dataRect`.
+        view_range : :class:`QRectF`
+            Visible range, see :meth:`_displayViewRange`.
+
+        Returns
+        -------
+        bool
+            ``True`` if the data must be clipped, ``False`` otherwise.
+        """
+        view_height = view_range.height()
+        limit = self.opts['dynamicRangeLimit']
+        hyst = self.opts['dynamicRangeHyst']
+        # note that "bottom" is the larger number, and "top" is the smaller one.
+        return bool(
+            # never clip if the view does not show anything (avoids division by zero)
+            view_height > 0
+            # never clip if all data is too small to see
+            and not data_range.bottom() < view_range.top()
+            # never clip if all data is too large to see
+            and not data_range.top() > view_range.bottom()
+            # never clip data if it fits into +/- (extended) limit * view height
+            and data_range.height() > 2 * hyst * limit * view_height
+        )
+
+    def _drlUpdateRequired(self) -> bool:
+        """
+        Test whether a change of the vertical view range requires new display data.
+
+        The dynamic range limiter only modifies the displayed data while it clips it,
+        or when the new view range requires clipping. The test is O(1), since the data
+        bounds are cached by the mapped :class:`PlotDataset`.
+
+        Returns
+        -------
+        bool
+            ``True`` if the displayed data has to be recomputed, ``False`` if it stays
+            valid for the current vertical view range.
+        """
+        if self.opts['dynamicRangeLimit'] is None or self._dataset is None:
+            return False
+        if self._drlClipActive or self._datasetMapped is None:
+            return True
+        view_range = self._displayViewRange()
+        if view_range is None:
+            return False
+        data_range = self._datasetMapped.dataRect()
+        if data_range is None:
+            return False
+        return self._drlClipRequired(data_range, view_range)
 
     def getData(self) -> tuple[None, None] | tuple[np.ndarray, np.ndarray]:
         """
@@ -1764,8 +1856,13 @@ class PlotDataItem(GraphicsObject):
             pad = max(pad, self.scatter.pixelPadding())
         return pad
 
-    def clear(self):
+    def clear(self) -> None:
+        """
+        Remove all data from this item and from its curve and scatter plot.
+        """
         self._dataset = self._datasetMapped = self._datasetDisplay = None
+        self._sentDisplayData = None
+        self._drlClipActive = False
         self.curve.clear()
         self.scatter.clear()
 
@@ -1806,7 +1903,29 @@ class PlotDataItem(GraphicsObject):
         
     @QtCore.Slot(object, object)
     @QtCore.Slot(object, object, object)
-    def viewRangeChanged(self, vb=None, ranges=None, changed=None):
+    def viewRangeChanged(
+        self,
+        vb: QtCore.QObject | None = None,
+        ranges: list[list[float]] | QtCore.QRectF | None = None,
+        changed: list[bool] | None = None
+    ) -> None:
+        """
+        Update the displayed data after a change of the view range, if needed.
+
+        A horizontal change requires new display data with `clipToView` or
+        `autoDownsample`. A vertical change requires it only while the dynamic range
+        limiter clips the data, or when the new range requires clipping.
+
+        Parameters
+        ----------
+        vb : :class:`~pyqtgraph.ViewBox` or :class:`~pyqtgraph.GraphicsView` or None
+            The view whose range changed.
+        ranges : list of list of float or :class:`QRectF` or None, default None
+            The new view range, ``[[xmin, xmax], [ymin, ymax]]`` for a
+            :class:`~pyqtgraph.ViewBox`.
+        changed : list of bool or None, default None
+            Flags indicating which axes changed. ``None`` means both.
+        """
         # view range has changed; re-plot if needed 
         update_needed = False
         if changed is None or changed[0]: 
@@ -1819,13 +1938,12 @@ class PlotDataItem(GraphicsObject):
             ):
                 self._datasetDisplay = None
                 update_needed = True
-        if changed is None or changed[1]:
-            # if ranges is not None:
-            #     print('ver:', ranges[1])
+        if (changed is None or changed[1]) and self._drlUpdateRequired():
+            # The dynamic range limiter clips the data, or has to start doing so:
+            # update, but do not discard cached display data.
+            # Otherwise, the displayed data does not depend on the vertical range.
             self.setProperty('yViewRangeWasChanged', True)
-            if self.opts['dynamicRangeLimit'] is not None:
-                # update, but do not discard cached display data
-                update_needed = True
+            update_needed = True
         if update_needed:
             self.updateItems(styleUpdate=False)
 
