@@ -4,6 +4,8 @@ Performance-oriented regression tests of ``PlotCurveItem`` rendering.
 They check deterministic properties (which drawing primitive is used, which caches are
 built) and that the faster drawing code renders pixel-identical images.
 """
+import contextlib
+
 import numpy as np
 import pytest
 
@@ -11,7 +13,7 @@ import pyqtgraph as pg
 from pyqtgraph import functions as fn
 from pyqtgraph.graphicsItems.PlotCurveItem import PlotCurveItem
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from tests.perf_helpers import count_calls
+from tests.perf_helpers import count_calls, process_events
 
 app = pg.mkQApp()
 
@@ -234,3 +236,211 @@ def test_path_still_drawn(setup):
         render_item(curve, data_rects(x, y)[0], brush=brush)
     assert path_builds.count == 1
     assert curve._polyline is None
+
+
+# --------------------------------------------------------------------------------------
+# T4.2: partial repaints draw only the vertices around the exposed rectangle
+# --------------------------------------------------------------------------------------
+
+
+def render_exposed(item, view, device_clip, exposed=True, brush=None, size=(400, 300)):
+    """
+    Paint ``item`` like ``QGraphicsView`` repainting a part of the viewport.
+
+    The painter is clipped to ``device_clip`` and, if ``exposed`` is True, the style
+    option exposes that rectangle only, as with ``ItemUsesExtendedStyleOption``.
+
+    Parameters
+    ----------
+    item : QtWidgets.QGraphicsItem
+        Item to paint.
+    view : QtCore.QRectF
+        Rectangle, in item coordinates, mapped onto the whole image.
+    device_clip : QtCore.QRect
+        Repainted rectangle, in pixels.
+    exposed : bool, default True
+        Set ``exposedRect`` to the repainted rectangle; otherwise it stays empty, as
+        for an item without ``ItemUsesExtendedStyleOption``.
+    brush : QtGui.QBrush or None
+        Brush set on the painter before painting, if any.
+    size : tuple of int, default (400, 300)
+        Image size.
+
+    Returns
+    -------
+    np.ndarray
+        The ARGB32 pixels, of shape (height, width).
+    """
+    img = QtGui.QImage(size[0], size[1],
+                       QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(0)
+    painter = QtGui.QPainter(img)
+    painter.setClipRect(device_clip)
+    painter.scale(size[0] / view.width(), size[1] / view.height())
+    painter.translate(-view.left(), -view.top())
+    if brush is not None:
+        painter.setBrush(brush)
+    option = QtWidgets.QStyleOptionGraphicsItem()
+    if exposed:
+        option.exposedRect = painter.transform().inverted()[0].mapRect(
+            QtCore.QRectF(device_clip))
+    item.paint(painter, option, None)
+    painter.end()
+    return pg.functions.ndarray_from_qimage(img).view(np.uint32)[..., 0].copy()
+
+
+def zoomed_view(x, y, zoom):
+    """
+    Return a view rectangle showing a fraction ``1 / zoom`` of the x range.
+
+    Parameters
+    ----------
+    x, y : np.ndarray
+        Data of the curve.
+    zoom : float
+        Zoom factor along x.
+
+    Returns
+    -------
+    QtCore.QRectF
+        The view rectangle.
+    """
+    x0, x1 = float(np.nanmin(x)), float(np.nanmax(x))
+    y0, y1 = float(np.nanmin(y)), float(np.nanmax(y))
+    return QtCore.QRectF(x0 + 0.37 * (x1 - x0), y0 - 1, (x1 - x0) / zoom, y1 - y0 + 2)
+
+
+@contextlib.contextmanager
+def recorded_slices(method='_getVertexSlicePolyline'):
+    """
+    Record the sizes of the vertex slices drawn by ``PlotCurveItem.paint``.
+
+    Parameters
+    ----------
+    method : str, default '_getVertexSlicePolyline'
+        Private method building the slices, called with ``(start, stop)``.
+
+    Yields
+    ------
+    list of int
+        Number of vertices of each slice drawn.
+    """
+    original = getattr(PlotCurveItem, method)
+    sizes = []
+
+    def wrapper(self, start, stop):
+        sizes.append(stop - start)
+        return original(self, start, stop)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(PlotCurveItem, method, wrapper)
+        yield sizes
+
+
+EXPOSED_CASES = [
+    # pen, antialias, connect, segmentedLineMode, number of points, zoom
+    (dict(color='w'), False, 'all', 'auto', 20000, 1),
+    (dict(color='w'), True, 'all', 'auto', 20000, 20),
+    (dict(color=(255, 255, 0, 100)), True, 'finite', 'auto', 3000, 150),
+    (dict(color=(255, 255, 0, 100), width=0), False, 'all', 'on', 20000, 5),
+    (dict(color='w'), True, 'all', 'on', 3000, 1000),
+]
+
+
+@pytest.mark.parametrize('pen, antialias, connect, segmented, n, zoom', EXPOSED_CASES)
+def test_exposed_slice_pixel_identical(pen, antialias, connect, segmented, n, zoom):
+    x, y = random_walk(n)
+    curve = pg.PlotCurveItem(x=x, y=y, pen=pg.mkPen(**pen), antialias=antialias,
+                             connect=connect)
+    curve.setSegmentedLineMode(segmented)
+    view = zoomed_view(x, y, zoom)
+    method = ('_getVertexSliceSegments' if segmented == 'on'
+              else '_getVertexSlicePolyline')
+    for left, width in [(0, 3), (150, 5), (233, 40), (397, 3)]:
+        clip = QtCore.QRect(left, 0, width, 300)
+        with recorded_slices(method) as slices:
+            partial = render_exposed(curve, view, clip)
+        assert len(slices) == 1 and slices[0] < n // 2
+        assert (partial == render_exposed(curve, view, clip, exposed=False)).all()
+
+
+def test_exposed_slice_is_small():
+    x, y = random_walk(100_000)
+    curve = pg.PlotCurveItem(x=x, y=y)
+    view = zoomed_view(x, y, 1)
+    with recorded_slices() as slices, count_calls(fn, 'arrayToQPath') as path_builds:
+        render_exposed(curve, view, QtCore.QRect(200, 0, 5, 300))
+    # 5 pixels of 400 at 250 points per pixel, plus margins
+    assert len(slices) == 1 and slices[0] < 5000
+    # the path of the whole curve was not built
+    assert path_builds.count == 0
+    assert curve.path is None
+
+
+@pytest.mark.parametrize('setup', ['whole item exposed', 'wide pen', 'dashed pen',
+                                   'decreasing x', 'fill', 'large part exposed',
+                                   'no exposed rectangle', 'painter brush'])
+def test_exposed_whole_curve_drawn(setup):
+    x, y = random_walk(20000)
+    kwargs = {}
+    clip = QtCore.QRect(150, 0, 5, 300)
+    exposed = True
+    brush = None
+    if setup == 'wide pen':
+        kwargs['pen'] = pg.mkPen('w', width=2)
+    elif setup == 'dashed pen':
+        kwargs['pen'] = pg.mkPen('w', style=QtCore.Qt.PenStyle.DashLine)
+    elif setup == 'decreasing x':
+        x = x[::-1].copy()
+    elif setup == 'fill':
+        kwargs.update(fillLevel=0.0, brush='b')
+    elif setup == 'large part exposed':
+        clip = QtCore.QRect(50, 0, 250, 300)
+    elif setup == 'whole item exposed':
+        clip = QtCore.QRect(0, 0, 400, 300)
+    elif setup == 'no exposed rectangle':
+        exposed = False
+    elif setup == 'painter brush':
+        brush = pg.mkBrush('b')
+    curve = pg.PlotCurveItem(x=x, y=y, **kwargs)
+    view = zoomed_view(x, y, 1)
+    with recorded_slices() as slices:
+        render_exposed(curve, view, clip, exposed=exposed, brush=brush)
+    assert slices == []
+
+
+def test_view_partial_repaint():
+    # a cursor line moving over a long curve repaints a few vertices of it, and the
+    # screen shows the same pixels as after a full repaint
+    pw = pg.PlotWidget()
+    pw.resize(400, 300)
+    pw.show()
+    x, y = random_walk(100_000)
+    curve = pw.plot(x, y, pen='w').curve
+    line = pg.InfiniteLine(pos=30_000, angle=90, pen='r')
+    pw.addItem(line, ignoreBounds=True)
+    process_events(5)
+    pw.getViewBox().disableAutoRange()
+    process_events(5)
+    flag = QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption
+    assert curve.flags() & flag
+
+    def screen():
+        image = pw.screen().grabWindow(pw.winId()).toImage()
+        if image.isNull():
+            pytest.skip('the platform cannot grab the window')
+        image = image.convertToFormat(QtGui.QImage.Format.Format_ARGB32)
+        return pg.functions.ndarray_from_qimage(image).copy()
+
+    with recorded_slices() as slices:
+        for pos in (30_500, 31_000, 31_500):
+            line.setPos(pos)
+            process_events()
+    # each move repaints the old and new positions of the line, 500 points apart
+    assert len(slices) == 3
+    assert max(slices) < len(x) // 10
+    partial = screen()
+    pw.viewport().repaint()
+    process_events()
+    assert (partial == screen()).all()
+    pw.close()
