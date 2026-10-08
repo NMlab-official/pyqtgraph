@@ -882,6 +882,26 @@ def _mapPoints(transform: QtGui.QTransform, x: np.ndarray, y: np.ndarray,
         out[:, col] = mapped
 
 
+def _screensHaveIntegralPixelRatio() -> bool:
+    """
+    Tell whether every screen has an integral device pixel ratio.
+
+    ``QGraphicsItem.DeviceCoordinateCache`` renders the item into a pixmap that is not
+    aware of fractional device pixel ratios (e.g. a 125 % display scale): the cached
+    rendering then differs visibly from a direct paint.
+
+    Returns
+    -------
+    bool
+        True if no screen has a fractional device pixel ratio, or if there is no GUI
+        application yet.
+    """
+    if QtGui.QGuiApplication.instance() is None:
+        return True
+    return all(float(screen.devicePixelRatio()).is_integer()
+               for screen in QtGui.QGuiApplication.screens())
+
+
 class ScatterPlotItem(GraphicsObject):
     """
     Displays a set of x/y points. Instances of this class are created
@@ -1621,7 +1641,11 @@ class ScatterPlotItem(GraphicsObject):
         (about +8 % at 1e5 spots), and each view holds one more pixmap of its size.
         Composition modes other than ``CompositionMode_SourceOver`` would compose the
         spots with a transparent pixmap instead of the scene, so the cache is not used
-        with them. (On curves, such a cache was measured to slow a crosshair down.)
+        with them. Qt's device cache is not aware of fractional device pixel ratios
+        (e.g. a 125 % display scale), where the cached rendering visibly differs from
+        a direct paint: the cache is not used either when a screen has a fractional
+        device pixel ratio at the time the option is set. (On curves, such a cache was
+        measured to slow a crosshair down.)
 
         Parameters
         ----------
@@ -1634,8 +1658,11 @@ class ScatterPlotItem(GraphicsObject):
     def _applyDeviceCache(self) -> None:
         """Set the cache mode of the item from the ``useDeviceCache`` and composition mode options."""
         cmode = self.opts['compositionMode']
-        cached = self.opts['useDeviceCache'] and cmode in (
-            None, QtGui.QPainter.CompositionMode.CompositionMode_SourceOver)
+        cached = (
+            self.opts['useDeviceCache']
+            and cmode in (None, QtGui.QPainter.CompositionMode.CompositionMode_SourceOver)
+            and _screensHaveIntegralPixelRatio()
+        )
         self.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache if cached
                           else QtWidgets.QGraphicsItem.CacheMode.NoCache)
 
