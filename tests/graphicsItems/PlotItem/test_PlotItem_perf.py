@@ -64,3 +64,47 @@ def test_remove_item_param_list():
     assert _param_list_state(plot) == [('only', False)]
     plot.removeItem(tagged)
     assert _param_list_state(plot) == []
+
+
+# --------------------------------------------------------------------------------------
+# T1.11: options set on a data item are not overwritten by PlotItem.addItem
+# --------------------------------------------------------------------------------------
+
+def _display_opts(item: pg.PlotDataItem) -> tuple:
+    return tuple(item.opts[k] for k in
+                 ('downsample', 'autoDownsample', 'downsampleMethod', 'clipToView'))
+
+
+def test_plot_keeps_explicit_clip_and_downsampling_options():
+    plot = pg.PlotItem()
+    y = np.arange(100.0)
+    item = plot.plot(y, clipToView=True, autoDownsample=True)
+    assert _display_opts(item) == (1, True, 'peak', True)
+    item = plot.plot(y, downsample=4, downsampleMethod='mean')
+    assert _display_opts(item) == (4, False, 'mean', False)
+
+
+def test_plot_defaults_apply_to_unset_options():
+    plot = pg.PlotItem()
+    plot.setDownsampling(ds=3, auto=True, mode='subsample')
+    plot.setClipToView(True)
+    y = np.arange(100.0)
+    assert _display_opts(plot.plot(y)) == (3, True, 'subsample', True)
+    # explicit values win, including values equal to the item defaults
+    item = plot.plot(y, autoDownsample=False, clipToView=False)
+    assert _display_opts(item) == (3, False, 'subsample', False)
+    # options set through the setters before adding the item are kept as well
+    item = pg.PlotDataItem(y)
+    item.setClipToView(False)
+    item.setDownsampling(ds=2)
+    plot.addItem(item)
+    assert _display_opts(item) == (2, True, 'peak', False)
+
+
+def test_plot_menu_still_applies_to_all_curves():
+    plot = pg.PlotItem()
+    y = np.arange(100.0)
+    items = [plot.plot(y, clipToView=True), plot.plot(y)]
+    plot.ctrl.clipToViewCheck.setChecked(True)
+    plot.ctrl.clipToViewCheck.setChecked(False)
+    assert [item.opts['clipToView'] for item in items] == [False, False]

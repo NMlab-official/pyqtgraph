@@ -643,8 +643,8 @@ class PlotItem(GraphicsWidget):
             item.setAlpha(alpha, auto)
             item.setSubtractMeanMode(self.ctrl.subtractMeanCheck.isChecked())
             item.setFftMode(self.ctrl.fftCheck.isChecked())
-            item.setDownsampling(*self.downsampleMode())
-            item.setClipToView(self.clipToViewMode())
+            # options set explicitly on the item are kept
+            item._applyPlotDefaults(*self.downsampleMode(), self.clipToViewMode())
             
             ## Hide older plots if needed
             self.updateDecimation()

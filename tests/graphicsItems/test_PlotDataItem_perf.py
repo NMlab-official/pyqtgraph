@@ -193,3 +193,35 @@ def test_finite_index_range():
     assert _finiteIndexRange(a) == (10, 20)
     assert _finiteIndexRange(np.array([1.0])) is None
     assert _finiteIndexRange(np.arange(5)) == (0, 4)
+
+
+# --------------------------------------------------------------------------------------
+# T1.11: API bugs that disabled optimizations
+# --------------------------------------------------------------------------------------
+
+def test_clip_to_view_while_parenting_does_not_raise(plot_widget):
+    # the view is the PlotWidget while the item is being parented; this raised
+    # "AttributeError: autoRangeEnabled" inside a Qt virtual method
+    item = plot_widget.plot(np.arange(100.0), clipToView=True, autoDownsample=True)
+    process_events()
+    assert len(item.getData()[0]) == 100
+
+
+def test_clip_to_view_in_graphics_view_without_viewbox():
+    view = pg.GraphicsView()
+    item = pg.PlotDataItem(np.arange(100.0), clipToView=True)
+    view.addItem(item)
+    try:
+        # no ViewBox to clip to: the full data is displayed
+        assert len(item.getData()[0]) == 100
+    finally:
+        view.close()
+
+
+def test_data_bounds_upper_limit_with_step_mode_and_symbols():
+    x = np.arange(11.0)
+    y = np.arange(10.0)
+    item = pg.PlotDataItem(x, y, stepMode='center', symbol='o')
+    # the curve spans the step boundaries, the symbols sit at the step centers
+    assert item.dataBounds(0) == (0.0, 10.0)
+    assert item.dataBounds(1) == (0.0, 9.0)
