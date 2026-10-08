@@ -209,7 +209,8 @@ def arrayToLineSegments(x, y, connect, finiteCheck, out=None):
 
 class _VertexCache:
     """
-    Per-data cache of the vertices of a curve drawn as a single polyline.
+    Per-data cache of the drawing geometry of a curve: the vertices of a curve
+    drawn as a single polyline, or the lengths of its ``'pairs'`` segments.
 
     ``PlotCurveItem.updateData`` stores new array views on every call, so the cache is
     bound to the identity of the data arrays. Only weak references to them are kept,
@@ -226,7 +227,8 @@ class _VertexCache:
     """
 
     __slots__ = ('_xref', '_yref', '_connect', '_skipFiniteCheck',
-                 'computed', 'vertices', 'polylineFilled', 'increasing')
+                 'computed', 'vertices', 'polylineFilled', 'increasing',
+                 'pairLengthsComputed', 'pairLengths')
 
     def __init__(self, x: np.ndarray, y: np.ndarray, connect: str,
                  skipFiniteCheck: bool) -> None:
@@ -239,6 +241,10 @@ class _VertexCache:
         self.polylineFilled = False
         # whether the x values of the vertices never decrease; None until needed
         self.increasing: bool | None = None
+        # smallest nonzero |dx| and |dy| of the 'pairs' segments, None if a segment
+        # has a zero length or a non-finite coordinate
+        self.pairLengthsComputed = False
+        self.pairLengths: tuple[float, float] | None = None
 
     def matches(self, x: np.ndarray, y: np.ndarray, connect: str,
                 skipFiniteCheck: bool) -> bool:
@@ -309,7 +315,7 @@ class PlotCurveItem(GraphicsObject):
     sigPlotChanged = QtCore.Signal(object)
     sigClicked = QtCore.Signal(object, object)
 
-    # Private caches of the polyline drawing of paint(), created on first use.
+    # Private caches of the drawing geometry used by paint(), created on first use.
     _vertexCache: _VertexCache | None = None
     _polyline: QtGui.QPolygonF | None = None
     _polylineMaxSize: int = 0
@@ -1011,6 +1017,26 @@ class PlotCurveItem(GraphicsObject):
 
         return self._lineSegments.drawargs()
 
+    def _getDataCache(self) -> _VertexCache | None:
+        """
+        Return the cache of the drawing geometry for the current data and options.
+
+        Returns
+        -------
+        _VertexCache or None
+            The cache, created empty when the data, ``connect`` or ``skipFiniteCheck``
+            changed; None without data or with a ``connect`` array.
+        """
+        x, y = self.xData, self.yData
+        connect = self.opts['connect']
+        if x is None or y is None or not isinstance(connect, str):
+            return None
+        skipFiniteCheck = bool(self.opts['skipFiniteCheck'])
+        cache = self._vertexCache
+        if cache is None or not cache.matches(x, y, connect, skipFiniteCheck):
+            cache = self._vertexCache = _VertexCache(x, y, connect, skipFiniteCheck)
+        return cache
+
     def _getPolylineVertices(self) -> tuple[np.ndarray, np.ndarray] | None:
         """
         Return the vertices of the curve when it is drawn as a single polyline.
@@ -1026,21 +1052,18 @@ class PlotCurveItem(GraphicsObject):
             ``(x, y)`` coordinates of the vertices, or None if the curve is not a single
             polyline. Fewer than 2 vertices means that nothing is drawn.
         """
-        x, y = self.xData, self.yData
         connect = self.opts['connect']
         if (
-            x is None
-            or y is None
-            or self.opts['stepMode']
+            self.opts['stepMode']
             or not isinstance(connect, str)
             or connect not in ('all', 'finite')
         ):
             return None
-
+        cache = self._getDataCache()
+        if cache is None:
+            return None
+        x, y = self.xData, self.yData
         skipFiniteCheck = bool(self.opts['skipFiniteCheck'])
-        cache = self._vertexCache
-        if cache is None or not cache.matches(x, y, connect, skipFiniteCheck):
-            cache = self._vertexCache = _VertexCache(x, y, connect, skipFiniteCheck)
         if not cache.computed:
             if connect == 'all':
                 cache.vertices = fn._arrayToQPath_all_vertices(
@@ -1133,6 +1156,78 @@ class PlotCurveItem(GraphicsObject):
         if painter.brush().style() != QtCore.Qt.BrushStyle.NoBrush:
             return False
         return self._getPolylineVertices() is not None
+
+    def _shouldDrawPairsAsLines(self, painter: QtGui.QPainter, pen: QtGui.QPen) -> bool:
+        """
+        Tell whether ``pen`` can stroke a ``connect='pairs'`` curve with ``drawLines``.
+
+        The path of such a curve is built through ``QDataStream`` and is slow to
+        create; :meth:`_getLineSegments` holds the same segments. The raster engine's
+        cosmetic stroker draws a 2-point subpath of the path and a line alike, except
+        for a zero-length segment (a dot for a line only) and with flat caps, so these
+        cases and wider pens keep drawing the path.
+
+        Parameters
+        ----------
+        painter : QtGui.QPainter
+            The active painter.
+        pen : QtGui.QPen
+            The pen about to stroke the curve.
+
+        Returns
+        -------
+        bool
+            True if the line segments can be drawn instead of the path.
+        """
+        connect = self.opts['connect']
+        if (
+            not isinstance(connect, str)
+            or connect != 'pairs'
+            or self._exportOpts is not False
+            or self.opts['fillLevel'] is not None
+            or self.opts['stepMode']
+            or self.opts['segmentedLineMode'] == 'off'
+        ):
+            return False
+        if (
+            not pen.isCosmetic()
+            or pen.widthF() > 1.0
+            or pen.capStyle() == QtCore.Qt.PenCapStyle.FlatCap
+        ):
+            return False
+        if painter.paintEngine().type() != QtGui.QPaintEngine.Type.Raster:
+            return False
+        # drawPath also fills the path with the brush of the painter
+        if painter.brush().style() != QtCore.Qt.BrushStyle.NoBrush:
+            return False
+        transform = painter.transform()
+        if not transform.isAffine() or transform.isRotating():
+            return False
+
+        cache = self._getDataCache()
+        if not cache.pairLengthsComputed:
+            self._getLineSegments()  # fills self._lineSegments
+            lines = self._lineSegments.ndarray()
+            dx = np.abs(lines[:, 2] - lines[:, 0])
+            dy = np.abs(lines[:, 3] - lines[:, 1])
+            if np.isfinite(dx).all() and np.isfinite(dy).all() and not (
+                (dx == 0.0) & (dy == 0.0)
+            ).any():
+                positive_dx = dx[dx > 0.0]
+                positive_dy = dy[dy > 0.0]
+                cache.pairLengths = (
+                    float(positive_dx.min()) if len(positive_dx) else math.inf,
+                    float(positive_dy.min()) if len(positive_dy) else math.inf,
+                )
+            else:
+                cache.pairLengths = None
+            cache.pairLengthsComputed = True
+        if cache.pairLengths is None:
+            return False
+        # Qt compares the ends of a line in device coordinates, with qFuzzyCompare:
+        # every segment must stay clearly longer than zero there.
+        minDx, minDy = cache.pairLengths
+        return min(minDx * abs(transform.m11()), minDy * abs(transform.m22())) > 1e-6
 
     def _polylineVerticesAreData(self) -> bool:
         """
@@ -1667,6 +1762,8 @@ class PlotCurveItem(GraphicsObject):
                         p.drawLines(*self._getLineSegments())
                     if do_fill_outline:
                         p.drawLines(self._getClosingSegments())
+                elif self._shouldDrawPairsAsLines(p, pen):
+                    p.drawLines(*self._getLineSegments())
                 elif self._shouldUseDrawPolyline(p, pen, aa):
                     if vertexRange is None:
                         polyline = self._getPolyline()
