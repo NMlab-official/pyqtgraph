@@ -129,7 +129,9 @@ class ImageItem(GraphicsObject):
         self._deferredLevels = None
         self._imageHasNans = None    # None : not yet known
         self._imageNanLocations = None
+        self._imageNanMask = None  # uint8, 255 at the NaN pixels of a mono image
         self._resampledLutCache = _LutDerivedCache()  # 256-entry equivalents of luts
+        self._nanIndexLutCache = _LutDerivedCache()  # luts leaving index 255 free
         self._defaultAutoLevels = True
 
         self.axisOrder = getConfigOption('imageAxisOrder')
@@ -472,6 +474,10 @@ class ImageItem(GraphicsObject):
             val = kwargs['axisOrder']            
             if val not in ('row-major', 'col-major'):
                 raise ValueError("axisOrder must be either 'row-major' or 'col-major'")
+            if val != self.axisOrder:
+                # nan locations are computed in display order
+                self._imageNanLocations = None
+                self._imageNanMask = None
             self.axisOrder = val
             self._update_data_transforms(self.axisOrder) # update cached transforms
         if 'colorMap' in kwargs:
@@ -649,6 +655,7 @@ class ImageItem(GraphicsObject):
             self.image = image
             self._imageHasNans = None
             self._imageNanLocations = None
+            self._imageNanMask = None
             if 'autoDownsample' not in kwargs and (
                 self.image.shape[0] > 2**15-1 or self.image.shape[1] > 2**15-1
             ):
@@ -812,6 +819,7 @@ class ImageItem(GraphicsObject):
                 self._xp.isnan(self.image.min())
             )
             self._imageNanLocations = None
+            self._imageNanMask = None
 
         image = self.image
 
@@ -829,6 +837,7 @@ class ImageItem(GraphicsObject):
             # changes in view transform cause changes in downsampling factors,
             # which invalidates any previously calculated nan locations
             self._imageNanLocations = None
+            self._imageNanMask = None
 
             # Check if downsampling reduced the image size to zero due to inf values.
             if image.size == 0:
@@ -844,6 +853,7 @@ class ImageItem(GraphicsObject):
             image = image.swapaxes(0, 1)
 
         levels = self.levels
+        fullLut = lut
 
         if (
             lut is not None
@@ -875,20 +885,25 @@ class ImageItem(GraphicsObject):
         elif not self._imageHasNans:
             qimage = functions_qimage.try_make_qimage(image, levels=levels, lut=lut)
 
-        elif image.ndim in (2, 3):
+        else:
             # float images with nans
-            if self._imageNanLocations is None:
-                # the number of nans is expected to be small
-                nanmask = self._xp.isnan(image)
-                if nanmask.ndim == 3:
-                    nanmask = nanmask.any(axis=2)
-                self._imageNanLocations = nanmask.nonzero()
-            qimage = functions_qimage.try_make_qimage(
-                image,
-                levels=levels,
-                lut=lut,
-                transparentLocations=self._imageNanLocations
-            )
+            if image.ndim == 2:
+                # Indexed8 image with a transparent color for the nans
+                qimage = self._makeQImageWithNanIndex(image, levels, fullLut)
+            if qimage is None and image.ndim in (2, 3):
+                # RGBA image with transparent nans
+                if self._imageNanLocations is None:
+                    # the number of nans is expected to be small
+                    nanmask = self._xp.isnan(image)
+                    if nanmask.ndim == 3:
+                        nanmask = nanmask.any(axis=2)
+                    self._imageNanLocations = nanmask.nonzero()
+                qimage = functions_qimage.try_make_qimage(
+                    image,
+                    levels=levels,
+                    lut=lut,
+                    transparentLocations=self._imageNanLocations
+                )
 
         if qimage is not None:
             self._processingBuffer = None
@@ -939,6 +954,45 @@ class ImageItem(GraphicsObject):
             lut, lambda table: functions_qimage._resample_lut(self._xp, table, 256)
         )
         return lut if resampled is None else resampled
+
+    def _makeQImageWithNanIndex(
+        self, image: np.ndarray, levels: np.ndarray | None, lut: np.ndarray | None
+    ) -> QtGui.QImage | None:
+        """
+        Make an Indexed8 QImage of a float mono image with NaNs, if possible.
+
+        The NaN pixels get color index 255, which is transparent. The image keeps the
+        colors given by `lut` within one level per channel; otherwise, or for levels
+        other than a single ``[min, max]`` pair, None is returned and the caller falls
+        back to an RGBA image.
+
+        Parameters
+        ----------
+        image : np.ndarray
+            2-D floating point image with NaNs, in display order.
+        levels : np.ndarray or None
+            Levels of the image.
+        lut : np.ndarray or None
+            Lookup table of dtype uint8, or None for a grayscale image.
+
+        Returns
+        -------
+        QtGui.QImage or None
+            The Indexed8 image, or None if this representation is not applicable.
+        """
+        if levels is None:
+            return None
+        nanIndexLut = self._nanIndexLutCache.get(
+            lut, lambda table: functions_qimage._nan_index_lut(self._xp, table)
+        )
+        if nanIndexLut is None:
+            return None
+        if self._imageNanMask is None or self._imageNanMask.shape != image.shape:
+            self._imageNanMask = functions_qimage._nan_index_mask(self._xp, image)
+        table, merged = nanIndexLut
+        return functions_qimage.try_make_qimage_with_nan_index(
+            image, levels=levels, lut=table, merged=merged, nanMask=self._imageNanMask
+        )
 
     def paint(self, painter: QtGui.QPainter, *args):
         profile = debug.Profiler()

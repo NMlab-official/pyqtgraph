@@ -131,6 +131,10 @@ class GraphicsView(QtWidgets.QGraphicsView):
         self.setBackgroundBrush(brush)
     
     def paintEvent(self, ev):
+        # Fallback: the scene normally prepares as soon as it is requested, before Qt
+        # computes the regions to repaint (see GraphicsScene.requestPrepare). Pending
+        # work is then done already, and preparing again is cheap; listeners relying
+        # on sigPrepareForPaint before each paint still get it.
         self.scene().prepareForPaint()
         return super().paintEvent(ev)
     

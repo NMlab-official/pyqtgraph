@@ -1,5 +1,6 @@
 import math
 import warnings
+import weakref
 import bisect
 
 from typing import TypedDict
@@ -103,7 +104,7 @@ class PlotDataset:
         xAllFinite: bool | None = None,
         yAllFinite: bool | None = None,
         connect: np.ndarray | None = None
-    ):
+    ) -> None:
         super().__init__()
         self.x = x
         self.y = y
@@ -111,6 +112,9 @@ class PlotDataset:
         self.yAllFinite = yAllFinite
         self.connect = connect
         self._dataRect = None
+        # (xmin, xmax, ymin, ymax) of the finite values, as float (NaN for an axis
+        # without finite value). None if not computed yet.
+        self._bounds: tuple[float, float, float, float] | None = None
 
         if isinstance(x, np.ndarray) and x.dtype.kind in 'iu':
             self.xAllFinite = True
@@ -124,42 +128,134 @@ class PlotDataset:
             return None
         return not (self.xAllFinite and self.yAllFinite)
 
-    def _updateDataRect(self):
+    def _updateDataRect(self) -> None:
         """ 
         Identify plottable bounds and presence of non-finite data.
+
+        Each array is scanned by a single minimum and maximum search. ``NaN``
+        propagates through them and infinite values show up as extremes, so a second
+        pass to locate non-finite values is only needed when the extremes are not
+        finite.
         """
         if self.y is None or self.x is None:
             return None
         xmin, xmax, self.xAllFinite = self._getArrayBounds(self.x, self.xAllFinite)
         ymin, ymax, self.yAllFinite = self._getArrayBounds(self.y, self.yAllFinite)
+        self._setBounds(xmin, xmax, ymin, ymax)
+
+    def _setBounds(self, xmin: float, xmax: float, ymin: float, ymax: float) -> None:
+        """
+        Store the bounds of the finite values and the derived bounding rectangle.
+
+        Parameters
+        ----------
+        xmin, xmax : float
+            Bounds of the finite `x` values, ``NaN`` if there are none.
+        ymin, ymax : float
+            Bounds of the finite `y` values, ``NaN`` if there are none.
+        """
+        self._bounds = (float(xmin), float(xmax), float(ymin), float(ymax))
         self._dataRect = QtCore.QRectF(
-            QtCore.QPointF(xmin, ymin),
-            QtCore.QPointF(xmax, ymax)
+            QtCore.QPointF(self._bounds[0], self._bounds[2]),
+            QtCore.QPointF(self._bounds[1], self._bounds[3])
         )
+
+    def _appended(self, x: np.ndarray, y: np.ndarray) -> 'PlotDataset':
+        """
+        Create the dataset of this data followed by more points.
+
+        If the bounds of this dataset are known, those of the new dataset are derived
+        from them and from the new points only.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            All `x` values. The leading values must be equal to ``self.x``.
+        y : np.ndarray
+            All `y` values. The leading values must be equal to ``self.y``.
+
+        Returns
+        -------
+        PlotDataset
+            The dataset of the extended data.
+        """
+        dataset = PlotDataset(x, y, self.xAllFinite, self.yAllFinite)
+        if self._bounds is None:
+            return dataset
+        n = len(self.x)
+        xmin, xmax, x_finite = self._getArrayBounds(x[n:], None)
+        ymin, ymax, y_finite = self._getArrayBounds(y[n:], None)
+        # fmin and fmax ignore NaN, the bound of an axis without finite values
+        dataset.xAllFinite = bool(self.xAllFinite and x_finite)
+        dataset.yAllFinite = bool(self.yAllFinite and y_finite)
+        dataset._setBounds(
+            np.fmin(self._bounds[0], xmin), np.fmax(self._bounds[1], xmax),
+            np.fmin(self._bounds[2], ymin), np.fmax(self._bounds[3], ymax)
+        )
+        return dataset
 
     def _getArrayBounds(
         self,
         arr: np.ndarray,
         all_finite: bool | None
     ) -> tuple[float, float, bool]:
-        # here all_finite could be [None, False, True]
-        if not all_finite:  # This may contain NaN or inf values.
-            # We are looking for the bounds of the plottable data set. Infinite and Nan
-            # are ignored.
-            selection = np.isfinite(arr)
-            # True if all values are finite, False if there are any non-finites
-            all_finite = bool(selection.all())
-            if not all_finite:
-                arr = arr[selection]
-        
-        # here all_finite could be [False, True]
-        try:
-            amin = np.min( arr )  # find minimum of all finite values
-            amax = np.max( arr )  # find maximum of all finite values
-        except ValueError:  # is raised when there are no finite values
-            amin = np.nan
-            amax = np.nan
-        return amin, amax, all_finite
+        """
+        Find the bounds of the finite values of an array, and whether all are finite.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            Data array.
+        all_finite : bool or None
+            Previously known finiteness. It is verified, at no extra cost.
+
+        Returns
+        -------
+        amin : float
+            Minimum of the finite values, ``NaN`` if there are none.
+        amax : float
+            Maximum of the finite values, ``NaN`` if there are none.
+        all_finite : bool
+            ``True`` if all values are finite.
+        """
+        if arr.size == 0:
+            return np.nan, np.nan, True if all_finite is None else all_finite
+        with warnings.catch_warnings():
+            # comparisons involving NaN may warn for some dtypes
+            warnings.simplefilter("ignore", RuntimeWarning)
+            amin = np.min(arr)
+            amax = np.max(arr)
+        if np.isfinite(amin) and np.isfinite(amax):
+            # NaN would have propagated, +-inf would be an extreme: all values are finite
+            return amin, amax, True
+        # We are looking for the bounds of the plottable data set. Infinite and NaN
+        # values are ignored.
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:  # there are no finite values
+            return np.nan, np.nan, False
+        return np.min(arr), np.max(arr), False
+
+    def _finiteBounds(self) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        """
+        Get the bounds of the finite values along both axes.
+
+        The bounds are computed together with :meth:`dataRect` and cached. They are
+        the values that :meth:`PlotCurveItem.dataBounds
+        <pyqtgraph.PlotCurveItem.dataBounds>` computes for the full data range.
+
+        Returns
+        -------
+        tuple of tuple of float or None
+            ``((xmin, xmax), (ymin, ymax))`` of the finite values, or ``None`` if an
+            axis holds no finite value.
+        """
+        if self._bounds is None:
+            self._updateDataRect()
+            if self._bounds is None:
+                return None
+        if not all(math.isfinite(b) for b in self._bounds):
+            return None
+        return self._bounds[:2], self._bounds[2:]
 
     def dataRect(self) -> QtCore.QRectF | None:
         """
@@ -213,6 +309,104 @@ class PlotDataset:
             else:
                 all_y_finite = True
             self.yAllFinite = all_y_finite
+
+
+class _PeakBlockCache:
+    """
+    Cache of the extremes of fixed-size blocks of an array.
+
+    Block ``b`` covers the values ``b * ds`` to ``(b + 1) * ds - 1``. Only complete
+    blocks are cached. The extremes are computed on demand for a contiguous range of
+    blocks, which grows as further blocks are requested, e.g. while panning or while
+    data is appended.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        The data.
+    ds : int
+        Number of values per block.
+    """
+
+    def __init__(self, y: np.ndarray, ds: int) -> None:
+        self.y = y
+        self.ds = ds
+        # computed range of blocks [_lo, _hi)
+        self._lo = 0
+        self._hi = 0
+        self._max = np.empty(0, dtype=y.dtype)
+        self._min = np.empty(0, dtype=y.dtype)
+        self.computedBlocks = 0  # total number of block extremes computed
+
+    def extend(self, y: np.ndarray) -> None:
+        """
+        Replace the data by a longer array starting with the same values.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            The extended data. Its leading values must be equal to the current data.
+        """
+        self.y = y
+
+    def blocks(self, first: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Get the maxima and minima of a range of complete blocks.
+
+        Parameters
+        ----------
+        first : int
+            First block.
+        end : int
+            End of the range, excluded. ``end * ds`` must not exceed the data length.
+
+        Returns
+        -------
+        maxima, minima : np.ndarray
+            Extremes of the blocks ``first`` to ``end - 1``. These are views of the
+            cache.
+        """
+        if end <= first:
+            return self._max[:0], self._min[:0]
+        if end > len(self._max):
+            # grow the storage geometrically; untouched pages are not committed
+            size = max(end, 2 * len(self._max))
+            for name in ('_max', '_min'):
+                old = getattr(self, name)
+                new = np.empty(size, dtype=old.dtype)
+                new[self._lo:self._hi] = old[self._lo:self._hi]
+                setattr(self, name, new)
+        if end < self._lo or first > self._hi:
+            # disjoint from the computed range: restart from the requested range
+            self._compute(first, end)
+            self._lo, self._hi = first, end
+        else:
+            if first < self._lo:
+                self._compute(first, self._lo)
+                self._lo = first
+            if end > self._hi:
+                self._compute(self._hi, end)
+                self._hi = end
+        return self._max[first:end], self._min[first:end]
+
+    def _compute(self, first: int, end: int) -> None:
+        """
+        Compute the extremes of a range of blocks.
+
+        Parameters
+        ----------
+        first : int
+            First block.
+        end : int
+            End of the range, excluded.
+        """
+        if end <= first:
+            return
+        ds = self.ds
+        blocks = self.y[first * ds:end * ds].reshape(end - first, ds)
+        np.max(blocks, axis=1, out=self._max[first:end])
+        np.min(blocks, axis=1, out=self._min[first:end])
+        self.computedBlocks += end - first
 
 
 class PlotDataItem(GraphicsObject):
@@ -559,6 +753,8 @@ class PlotDataItem(GraphicsObject):
     sigClicked = QtCore.Signal(object, object)
     sigPointsClicked = QtCore.Signal(object, object, object)
     sigPointsHovered = QtCore.Signal(object, object, object)
+    # private: queued request to apply a deferred display update
+    _sigFlushDisplay = QtCore.Signal()
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
@@ -574,14 +770,21 @@ class PlotDataItem(GraphicsObject):
         # will hold a PlotDataset for data downsampled and limited for display,
         # accessed by getData()
         self._datasetDisplay = None
-        self.curve = PlotCurveItem()
-        self.scatter = ScatterPlotItem()
-        self.curve.setParentItem(self)
-        self.scatter.setParentItem(self)
+        # True while a data update of the curve and scatter plot is deferred to the
+        # next paint, see _requestDisplayUpdate
+        self._displayDirty = False
+        self._flushScene: weakref.ref | None = None
+        self._sigFlushDisplay.connect(
+            self._flushDisplay, QtCore.Qt.ConnectionType.QueuedConnection
+        )
+        self._curve = PlotCurveItem()
+        self._scatter = ScatterPlotItem()
+        self._curve.setParentItem(self)
+        self._scatter.setParentItem(self)
 
-        self.curve.sigClicked.connect(self.sigClicked)
-        self.scatter.sigClicked.connect(self.scatterClicked)
-        self.scatter.sigHovered.connect(self.sigPointsHovered)
+        self._curve.sigClicked.connect(self.sigClicked)
+        self._scatter.sigClicked.connect(self.scatterClicked)
+        self._scatter.sigHovered.connect(self.sigPointsHovered)
         
         # update-required notifications are handled through properties to allow future 
         # management through the QDynamicPropertyChangeEvent sent on any change.
@@ -597,6 +800,17 @@ class PlotDataItem(GraphicsObject):
         self._sentDisplayData: tuple[np.ndarray, np.ndarray] | None = None
         # names of the _PLOT_DEFAULT_OPTS options set explicitly on this item
         self._explicitOpts: set[str] = set()
+        # True while a style change has not been forwarded to the curve and scatter
+        # plot yet (they are only updated when there is data to show)
+        self._styleDirty = True
+        # extremes of the blocks of the 'peak' downsampling
+        self._peakCache: _PeakBlockCache | None = None
+        # (ds, start, end) of the current display data, see _displaySelection
+        self._displayKey: tuple[int, int, int] | None = None
+        # growth buffers of appendData, and the views of them in use
+        self._appendBuffers: tuple[np.ndarray, np.ndarray] | None = None
+        # True if the x values were generated as the index of the y values
+        self._implicitX = False
         self._adsLastValue = 1
         # self.clear()
         self.opts = {
@@ -644,6 +858,28 @@ class PlotDataItem(GraphicsObject):
     def paint(self, *args):
         ...
     
+    @property
+    def curve(self) -> PlotCurveItem:
+        """
+        :class:`~pyqtgraph.PlotCurveItem`: The item drawing the line.
+
+        A deferred data update is applied first, so that the curve is always
+        consistent with the data of this item.
+        """
+        self._flushDisplay()
+        return self._curve
+
+    @property
+    def scatter(self) -> ScatterPlotItem:
+        """
+        :class:`~pyqtgraph.ScatterPlotItem`: The item drawing the points.
+
+        A deferred data update is applied first, so that the scatter plot is always
+        consistent with the data of this item.
+        """
+        self._flushDisplay()
+        return self._scatter
+
     # Compatibility with direct property access to previous xData and yData structures:
     @property
     def xData(self):
@@ -683,7 +919,7 @@ class PlotDataItem(GraphicsObject):
         width : int 
             The distance tolerance margin in pixels to recognize the mouse click.
         """
-        self.curve.setClickable(state, width)
+        self._curve.setClickable(state, width)
 
     def curveClickable(self) -> bool:
         """
@@ -694,7 +930,7 @@ class PlotDataItem(GraphicsObject):
         bool
             Return if the curve is set to be clickable.
         """
-        return self.curve.clickable
+        return self._curve.clickable
 
     def boundingRect(self):
         return QtCore.QRectF()  # let child items handle this
@@ -1012,7 +1248,7 @@ class PlotDataItem(GraphicsObject):
         if self.opts['symbolBrush'] == brush:
             return
         self.opts['symbolBrush'] = brush
-        #self.scatter.setSymbolBrush(brush)
+        #self._scatter.setSymbolBrush(brush)
         self.updateItems(styleUpdate=True)
 
     def setSymbolSize(self, size: int | list[int]):
@@ -1386,6 +1622,7 @@ class PlotDataItem(GraphicsObject):
             if not isinstance(y, np.ndarray):
                 y = np.array(y)
             yData = y.view(np.ndarray)
+            implicit_x = x is None
             if x is None:
                 x = np.arange(len(y))
                 
@@ -1398,20 +1635,25 @@ class PlotDataItem(GraphicsObject):
 
         if xData is None or yData is None:
             self._dataset = None
+            self._implicitX = False
         else:
             self._dataset = PlotDataset( xData, yData )
+            self._implicitX = implicit_x
         # invalidate mapped data , will be generated in getData() / _getDisplayDataset()
         self._datasetMapped  = None
         # invalidate display data, will be generated in getData() / _getDisplayDataset()
         self._datasetDisplay = None
         # new data is always forwarded to the curve and scatter plot items
         self._sentDisplayData = None
+        # data derived from the previous data is released
+        self._peakCache = None
+        self._appendBuffers = None
         # reset auto-downsample value
         self._adsLastValue   = 1
 
         profiler('set data')
 
-        self.updateItems( styleUpdate=self.property('styleWasChanged') )
+        self._requestDisplayUpdate(styleUpdate=self.property('styleWasChanged'))
         # items have been updated
         self.setProperty('styleWasChanged', False)
         profiler('update items')
@@ -1429,20 +1671,30 @@ class PlotDataItem(GraphicsObject):
         data or graphics style has been updated. It is not usually necessary to call this
         from user code. 
 
-        When `styleUpdate` is ``False`` and the displayed `x` and `y` arrays are the
-        same objects as those last forwarded, the curve and scatter plot are already up
-        to date and are left untouched.
+        Styles are forwarded only when they changed: the curve and the scatter plot
+        keep them across data updates. Per-point scatter styles (lists or arrays of
+        symbols, pens, brushes or sizes, and the point `data`) are forwarded with every
+        data update, since :meth:`ScatterPlotItem.setData
+        <pyqtgraph.ScatterPlotItem.setData>` discards them. When `styleUpdate` is
+        ``False`` and the displayed `x` and `y` arrays are the same objects as those
+        last forwarded, the curve and scatter plot are already up to date and are left
+        untouched.
 
         Parameters
         ----------
         styleUpdate : bool, default True
             Indicates if the style was updated in addition to the data.
         """
+        # the latest data is applied now: a deferred update is no longer needed
+        self._cancelDisplayFlush()
+        # a style change that could not be forwarded yet (no data) is still pending
+        styleUpdate = bool(styleUpdate or self._styleDirty)
         dataset = self._getDisplayDataset()
         if dataset is None:  # then we have nothing to show
+            self._styleDirty = styleUpdate
             self._sentDisplayData = None
-            self.curve.hide()
-            self.scatter.hide()
+            self._curve.hide()
+            self._scatter.hide()
             return
 
         if (
@@ -1455,14 +1707,7 @@ class PlotDataItem(GraphicsObject):
             # without dynamic range clipping): forwarding them again would only discard
             # the cached path of the curve and the styles of the scatter plot.
             return
-
-        # override styleUpdate request and always enforce update until we have a
-        # better solution for:
-        # - ScatterPlotItem losing per-point style information
-        # - PlotDataItem performing multiple unnecessary setData calls on initialization
-        # See: https://github.com/pyqtgraph/pyqtgraph/pull/1653
-        if not styleUpdate:
-            styleUpdate = True
+        self._styleDirty = False
 
         curveArgs = {}
         scatterArgs = {}
@@ -1475,9 +1720,7 @@ class PlotDataItem(GraphicsObject):
                 ('fillOutline', 'fillOutline'),
                 ('fillBrush', 'brush'),
                 ('antialias', 'antialias'),
-                ('connect', 'connect'),
                 ('stepMode', 'stepMode'),
-                ('skipFiniteCheck', 'skipFiniteCheck')
             ]:
                 if k in self.opts:
                     curveArgs[v] = self.opts[k]
@@ -1487,13 +1730,28 @@ class PlotDataItem(GraphicsObject):
                 ('symbolBrush', 'brush'),
                 ('symbol', 'symbol'),
                 ('symbolSize', 'size'),
-                ('data', 'data'),
                 ('pxMode', 'pxMode'),
                 ('antialias', 'antialias'),
                 ('useCache', 'useCache')
             ]:
                 if k in self.opts:
                     scatterArgs[v] = self.opts[k]
+        else:
+            # ScatterPlotItem.setData discards the per-point styles: repeat them
+            for k, v in [
+                ('symbolPen', 'pen'),
+                ('symbolBrush', 'brush'),
+                ('symbol', 'symbol'),
+                ('symbolSize', 'size'),
+            ]:
+                if isinstance(self.opts[k], (list, np.ndarray)):
+                    scatterArgs[v] = self.opts[k]
+        if self.opts['data'] is not None:
+            # point data is stored per point as well
+            scatterArgs['data'] = self.opts['data']
+        # the connection mode depends on the data (see 'auto' below)
+        curveArgs['connect'] = self.opts['connect']
+        curveArgs['skipFiniteCheck'] = self.opts['skipFiniteCheck']
 
         self._sentDisplayData = (dataset.x, dataset.y)
         x = dataset.x
@@ -1508,6 +1766,9 @@ class PlotDataItem(GraphicsObject):
                 self.opts['fillLevel'] is not None
             )
         ):  # draw if visible...
+            # A single min/max pass over the displayed data provides both the bounds
+            # handed over to the curve and the finiteness used to select `connect`.
+            bounds = dataset._finiteBounds()
             # auto-switch to indicate non-finite values as interruptions in the curve:
             if (
                 isinstance(curveArgs['connect'], str) and
@@ -1524,18 +1785,80 @@ class PlotDataItem(GraphicsObject):
                     #   use connect='finite' in case there are non-finites.
                     curveArgs['connect'] = 'finite'
                     curveArgs['skipFiniteCheck'] = False
-            self.curve.setData(x=x, y=y, **curveArgs)
-            self.curve.show()
+            self._curve.setData(x=x, y=y, _dataBounds=bounds, **curveArgs)
+            self._curve.show()
         else:  # ...hide if not.
-            self.curve.hide()
+            self._curve.hide()
 
         if self.opts['symbol'] is not None:  # draw if visible...
             if self.opts.get('stepMode') == "center":
                 x = 0.5 * (x[:-1] + x[1:])                
-            self.scatter.setData(x=x, y=y, **scatterArgs)
-            self.scatter.show()
+            self._scatter.setData(x=x, y=y, **scatterArgs)
+            self._scatter.show()
         else:  # ...hide if not.
-            self.scatter.hide()
+            self._scatter.hide()
+
+    def _requestDisplayUpdate(self, styleUpdate: bool) -> None:
+        """
+        Update the curve and scatter plot now, or before the next paint.
+
+        When the displayed data depends on the view range (`clipToView` or
+        `autoDownsample`), a data update is deferred: a view change in the same frame,
+        e.g. ``setXRange`` in a streaming loop, then does not compute the displayed
+        data twice. The deferred update is applied by a queued call, which the event
+        loop delivers before paint events (these have a low priority), so that the
+        regions changed by the update are painted in the same pass. It is also
+        applied when the scene is about to be rendered
+        (``GraphicsScene.sigPrepareForPaint``, e.g. for a synchronous ``grab`` or an
+        export), and on demand by :meth:`getData`, :meth:`dataBounds`,
+        :meth:`pixelPadding`, :meth:`updateItems`, a view change requiring new display
+        data, and the :attr:`curve` and :attr:`scatter` properties. Style updates are
+        never deferred.
+
+        Parameters
+        ----------
+        styleUpdate : bool
+            Indicates if the style was updated in addition to the data.
+        """
+        scene = self.scene()
+        if (
+            styleUpdate
+            or not (self.opts['clipToView'] or self.opts['autoDownsample'])
+            or scene is None
+            or not hasattr(scene, 'sigPrepareForPaint')
+        ):
+            self.updateItems(styleUpdate=styleUpdate)
+            return
+        if not self._displayDirty:
+            self._displayDirty = True
+            self._sigFlushDisplay.emit()
+            # safety net for a render requested before the queued call is delivered
+            scene.sigPrepareForPaint.connect(self._flushDisplay)
+            self._flushScene = weakref.ref(scene)
+
+    @QtCore.Slot()
+    def _flushDisplay(self) -> None:
+        """
+        Apply a deferred data update of the curve and scatter plot, if any.
+        """
+        if self._displayDirty:
+            self.updateItems(styleUpdate=False)
+
+    def _cancelDisplayFlush(self) -> None:
+        """
+        Forget a deferred data update, and stop waiting for the next paint.
+        """
+        if not self._displayDirty:
+            return
+        self._displayDirty = False
+        scene = None if self._flushScene is None else self._flushScene()
+        self._flushScene = None
+        if scene is not None:
+            try:
+                scene.sigPrepareForPaint.disconnect(self._flushDisplay)
+            except (TypeError, RuntimeError):
+                # TypeError and RuntimeError are from PyQt and PySide, respectively
+                pass
 
     def getOriginalDataset(self) -> tuple[None, None] | tuple[np.ndarray, np.ndarray]:
         """
@@ -1555,6 +1878,150 @@ class PlotDataItem(GraphicsObject):
         """
         dataset = self._dataset
         return (None, None) if dataset is None else (dataset.x, dataset.y)
+
+    def appendData(self, *args, **kwargs) -> None:
+        """
+        Append points to the data.
+
+        This is the efficient way to stream data: the points are copied into internal
+        buffers whose capacity grows geometrically, so that appending is O(1)
+        amortized in the number of points already held. The data bounds are updated
+        from the new points only, and the extremes of the blocks drawn by the 'peak'
+        downsampling method are kept, so that only the new blocks are computed.
+
+        With an active data mapping (FFT, derivative, phase map, mean subtraction or
+        log mode), ``stepMode='center'``, a `connect` array, or boolean data, the data
+        is concatenated and set with :meth:`setData` instead. Per-point style lists
+        (e.g. `symbolBrush`) are not extended.
+
+        Parameters
+        ----------
+        *args
+            ``appendData(y)`` or ``appendData(x, y)``: array-like or scalar values.
+            `x` may only be omitted if it was omitted in :meth:`setData` as well, in
+            which case the index of the points is continued.
+        **kwargs
+            `x` and `y` may also be given as keyword arguments.
+
+        Raises
+        ------
+        TypeError
+            Raised if too many arguments are given, if `y` is missing, or if `x` is
+            missing while the current `x` values were not generated.
+        ValueError
+            Raised if `x` and `y` do not have the same length.
+
+        Notes
+        -----
+        After this call, the arrays returned by :meth:`getOriginalDataset` (and the
+        :attr:`xData` and :attr:`yData` attributes) are views of the internal buffers.
+        They must not be modified in place.
+        """
+        if len(args) > 2:
+            raise TypeError(f'appendData takes at most 2 positional arguments ({len(args)} given)')
+        x = kwargs.get('x', args[0] if len(args) == 2 else None)
+        y = kwargs.get('y', args[-1] if args else None)
+        if y is None:
+            raise TypeError('appendData requires y values')
+        y = np.atleast_1d(np.asarray(y)).ravel()
+        if x is None:
+            if self._dataset is not None and not self._implicitX:
+                raise TypeError('appendData requires x values, as setData was given x')
+            start = 0 if self._dataset is None else len(self._dataset.y)
+            x = np.arange(start, start + len(y))
+        else:
+            x = np.atleast_1d(np.asarray(x)).ravel()
+        if len(x) != len(y):
+            raise ValueError(
+                f'x and y must have the same length (got {len(x)} and {len(y)})'
+            )
+        if len(y) == 0:
+            return
+        dataset = self._dataset
+        if dataset is None:
+            if 'x' in kwargs or len(args) == 2:
+                self.setData(x=x, y=y)
+            else:
+                self.setData(y=y)
+            return
+        if (
+            self.opts['fftMode']
+            or self.opts['derivativeMode']
+            or self.opts['phasemapMode']
+            or self.opts['subtractMeanMode']
+            or True in self.opts['logMode']
+            or self.opts['stepMode'] == 'center'
+            or isinstance(self.opts['connect'], np.ndarray)
+            or any(a.dtype == bool for a in (dataset.x, dataset.y, x, y))
+        ):
+            # the mapped data has to be computed from all points
+            implicit_x = self._implicitX
+            self.setData(
+                x=np.concatenate([dataset.x, x]), y=np.concatenate([dataset.y, y])
+            )
+            self._implicitX = implicit_x
+            return
+
+        profiler = debug.Profiler()
+        x_all = self._appendToBuffer(0, dataset.x, x)
+        y_all = self._appendToBuffer(1, dataset.y, y)
+        self._appendBuffers = (x_all.base, y_all.base)
+        self._dataset = dataset._appended(x_all, y_all)
+        # the extremes of the complete blocks of the previous data stay valid
+        if self._peakCache is not None and self._peakCache.y is dataset.y:
+            self._peakCache.extend(y_all)
+        self._datasetMapped  = None
+        self._datasetDisplay = None
+        self._sentDisplayData = None
+        profiler('append data')
+
+        self._requestDisplayUpdate(styleUpdate=False)
+        profiler('update items')
+        self.informViewBoundsChanged()
+        self.sigPlotChanged.emit(self)
+        profiler('emit')
+
+    def _appendToBuffer(
+        self,
+        axis: int,
+        current: np.ndarray,
+        new: np.ndarray
+    ) -> np.ndarray:
+        """
+        Append values to the growth buffer of an axis.
+
+        Parameters
+        ----------
+        axis : { 0, 1 }
+            0 for `x`, 1 for `y`.
+        current : np.ndarray
+            Current values of the axis.
+        new : np.ndarray
+            Values to append.
+
+        Returns
+        -------
+        np.ndarray
+            View of the buffer holding the current values followed by the new ones.
+        """
+        n = len(current)
+        size = n + len(new)
+        dtype = np.result_type(current.dtype, new.dtype)
+        buffer = None if self._appendBuffers is None else self._appendBuffers[axis]
+        if (
+            buffer is None
+            or current.base is not buffer
+            or buffer.dtype != dtype
+            or current.__array_interface__['data'][0] != buffer.__array_interface__['data'][0]
+        ):
+            # the current values are not the start of the buffer (e.g. after setData)
+            buffer = None
+        if buffer is None or size > len(buffer):
+            grown = np.empty(max(2 * size, 1024), dtype=dtype)
+            grown[:n] = current
+            buffer = grown
+        buffer[n:size] = new
+        return buffer[:size]
 
     def _getDisplayDataset(self) -> PlotDataset | None:
         """
@@ -1604,28 +2071,155 @@ class PlotDataItem(GraphicsObject):
                 x = self._dataset.y[:-1]
                 y = np.diff(self._dataset.y) / np.diff(self._dataset.x)
 
-            dataset = PlotDataset(
-                x,
-                y,
-                self._dataset.xAllFinite,
-                self._dataset.yAllFinite
-            )
-            
-            if True in self.opts['logMode']:
-                # Apply log scaling for x and/or y-axis
-                dataset.applyLogMapping( self.opts['logMode'] )
+            if (
+                x is self._dataset.x
+                and y is self._dataset.y
+                and True not in self.opts['logMode']
+            ):
+                # no mapping: share the original dataset, its bounds are cached once
+                dataset = self._dataset
+            else:
+                # finiteness is only known for unchanged arrays
+                dataset = PlotDataset(
+                    x,
+                    y,
+                    self._dataset.xAllFinite if x is self._dataset.x else None,
+                    self._dataset.yAllFinite if y is self._dataset.y else None
+                )
+                if True in self.opts['logMode']:
+                    # Apply log scaling for x and/or y-axis
+                    dataset.applyLogMapping( self.opts['logMode'] )
 
             self._datasetMapped = dataset
         
         # apply processing that affects the on-screen display of data:
-        x = self._datasetMapped.x
-        y = self._datasetMapped.y
-        xAllFinite = self._datasetMapped.xAllFinite
-        yAllFinite = self._datasetMapped.yAllFinite
+        mapped = self._datasetMapped
+        x = mapped.x
+        y = mapped.y
 
-        view = self.getViewBox()
         view_range = self._displayViewRange()
+        ds, visible = self._displayReduction(x, view_range)
+        if self.opts['autoDownsample']:
+            self._adsLastValue = ds
+        # downsampling is expensive; it is applied after clipping.
+        start, end = self._displaySelection(len(y), ds, visible)
+        self._displayKey = (ds, start, end)
 
+        connect = self.opts['connect'] if isinstance(self.opts['connect'], np.ndarray) else None
+        if ds > 1 and self.opts['downsampleMethod'] == 'peak':
+            # blocks are aligned to multiples of ds from the first point, so that they
+            # do not move with the view, and their extremes are cached.
+            x, y, connect = self._peakDownsample(x, y, connect, ds, start, end)
+        else:
+            if visible is not None:
+                x = x[start:end]
+                y = y[start:end]
+                if connect is not None:
+                    connect = connect[start:end]
+
+            if ds > 1:
+                if self.opts['downsampleMethod'] == 'subsample':
+                    x = x[::ds]
+                    y = y[::ds]
+                    if connect is not None:
+                        connect = connect[::ds]
+                elif self.opts['downsampleMethod'] == 'mean':
+                    n = len(x) // ds
+                    # start of x-values try to select a somewhat centered point
+                    stx = ds // 2
+                    x = x[stx:stx + n * ds:ds]
+                    y = y[:n * ds].reshape(n, ds).mean(axis=1)
+                    if connect is not None:
+                        connect = connect[:n*ds].reshape(n,ds).all(axis=1)
+
+        if x is mapped.x and y is mapped.y and connect is None:
+            # nothing changed: share the mapped dataset and its cached bounds
+            dataset = mapped
+        else:
+            # clipping and downsampling preserve finiteness, but values that are not
+            # finite may have been removed: only a positive result is inherited.
+            dataset = PlotDataset(
+                x,
+                y,
+                True if mapped.xAllFinite else None,
+                True if mapped.yAllFinite else None,
+                connect
+            )
+
+        clip_active = False
+        if self.opts['dynamicRangeLimit'] is not None and view_range is not None:
+            # Only the displayed points matter: the range is that of the displayed y,
+            # which is already clipped to the view and downsampled (the 'peak' method
+            # keeps the extremes). It is cached by the dataset and reused by the curve.
+            data_range = dataset.dataRect()
+            # never clip data if it fits into +/- (extended) limit * view height
+            if data_range is not None and self._drlClipRequired(data_range, view_range):
+                clip_active = True
+                view_height = view_range.height()
+                limit = self.opts['dynamicRangeLimit']
+                hyst  = self.opts['dynamicRangeHyst']
+                cache_is_good = False
+                # check if cached display data can be reused. This is only valid if
+                # the cached data was clipped itself.
+                if self._datasetDisplay is not None and self._drlClipActive:
+                    # top is minimum value, bottom is maximum value
+                    # how many multiples of the current view height does the clipped
+                    # plot extend to the top and bottom?
+                    top_exc = -(self._drlLastClip[0]-view_range.bottom()) / view_height
+                    bot_exc =  (self._drlLastClip[1]-view_range.top()   ) / view_height
+                    if (
+                        limit / hyst <= top_exc <= limit * hyst and
+                        limit / hyst <= bot_exc <= limit * hyst
+                    ):
+                        # restore cached values
+                        dataset = self._datasetDisplay
+                        cache_is_good = True
+                if not cache_is_good:
+                    min_val = view_range.bottom() - limit * view_height
+                    max_val = view_range.top()    + limit * view_height
+                    # clipping replaces infinite values, but keeps NaN
+                    dataset = PlotDataset(
+                        x,
+                        fn.clip_array(y, min_val, max_val),
+                        dataset.xAllFinite,
+                        True if dataset.yAllFinite else None,
+                        connect
+                    )
+                    self._drlLastClip = (min_val, max_val)
+        self._drlClipActive = clip_active
+        self._datasetDisplay = dataset
+        self.setProperty('xViewRangeWasChanged', False)
+        self.setProperty('yViewRangeWasChanged', False)
+
+        return self._datasetDisplay
+
+    def _displayReduction(
+        self,
+        x: np.ndarray,
+        view_range: QtCore.QRectF | None
+    ) -> tuple[int, tuple[int, int] | None]:
+        """
+        Determine the downsampling factor and the visible index range.
+
+        This method has no side effect: the auto-downsampling hysteresis is applied
+        with respect to the last factor, but the factor is not stored.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Mapped `x` data.
+        view_range : :class:`QRectF` or None
+            Visible range, see :meth:`_displayViewRange`.
+
+        Returns
+        -------
+        ds : int
+            Downsampling factor, at least 1.
+        visible : tuple of int or None
+            Index of the first visible point and of the first point right of the view,
+            or ``None`` if the data is not clipped to the view.
+        """
+        view = self.getViewBox()
         ds = self.opts['downsample']
         if not isinstance(ds, int):
             ds = 1
@@ -1656,89 +2250,140 @@ class PlotDataItem(GraphicsObject):
             # this guards against an infinite cycle where the plot never stabilizes.
             if math.isclose(ds, self._adsLastValue, rel_tol=0.01):
                 ds = self._adsLastValue
-            self._adsLastValue = ds
-            # downsampling is expensive; delay until after clipping.
+        return ds, visible
 
-        connect = self.opts['connect'] if isinstance(self.opts['connect'], np.ndarray) else None
-        if visible is not None:
-            # since we want the curve to go to the edge of the screen, we need to
-            # preserve one down-sampled point on the left and one of the right, so we
-            # extend the interval
-            x0 = fn.clip_scalar(visible[0] - ds, 0, len(x))
-            x1 = fn.clip_scalar(visible[1] + ds, x0, len(x))
-            x = x[x0:x1]
-            y = y[x0:x1]
-            if connect is not None:
-                connect = connect[x0:x1]
+    def _displaySelection(
+        self,
+        n: int,
+        ds: int,
+        visible: tuple[int, int] | None
+    ) -> tuple[int, int]:
+        """
+        Determine the part of the data that is displayed.
 
-        if ds > 1:
-            if self.opts['downsampleMethod'] == 'subsample':
-                x = x[::ds]
-                y = y[::ds]
-                if connect is not None:
-                    connect = connect[::ds]
-            elif self.opts['downsampleMethod'] == 'mean':
-                n = len(x) // ds
-                # start of x-values try to select a somewhat centered point
-                stx = ds // 2
-                x = x[stx:stx + n * ds:ds]
-                y = y[:n * ds].reshape(n, ds).mean(axis=1)
-                if connect is not None:
-                    connect = connect[:n*ds].reshape(n,ds).all(axis=1)
-            elif self.opts['downsampleMethod'] == 'peak':
-                n = len(x) // ds
-                x1 = np.empty((n, 2))
-                # start of x-values; try to select a somewhat centered point
-                stx = ds // 2
-                x1[:] = x[stx:stx + n * ds:ds, np.newaxis]
-                x = x1.reshape(n * 2)
-                y1 = np.empty((n, 2))
-                y2 = y[:n * ds].reshape((n, ds))
-                y1[:, 0] = y2.max(axis=1)
-                y1[:, 1] = y2.min(axis=1)
-                y = y1.reshape(n * 2)
-                if connect is not None:
-                    c = np.ones((n*2), dtype=bool)
-                    c[1::2] = connect[:n*ds].reshape(n,ds).all(axis=1)
-                    connect = c
+        Parameters
+        ----------
+        n : int
+            Number of data points.
+        ds : int
+            Downsampling factor.
+        visible : tuple of int or None
+            Visible index range, see :meth:`_displayReduction`.
 
-        clip_active = False
-        if self.opts['dynamicRangeLimit'] is not None and view_range is not None:
-            data_range = self._datasetMapped.dataRect()
-            # never clip data if it fits into +/- (extended) limit * view height
-            if data_range is not None and self._drlClipRequired(data_range, view_range):
-                clip_active = True
-                view_height = view_range.height()
-                limit = self.opts['dynamicRangeLimit']
-                hyst  = self.opts['dynamicRangeHyst']
-                cache_is_good = False
-                # check if cached display data can be reused. This is only valid if
-                # the cached data was clipped itself.
-                if self._datasetDisplay is not None and self._drlClipActive:
-                    # top is minimum value, bottom is maximum value
-                    # how many multiples of the current view height does the clipped
-                    # plot extend to the top and bottom?
-                    top_exc = -(self._drlLastClip[0]-view_range.bottom()) / view_height
-                    bot_exc =  (self._drlLastClip[1]-view_range.top()   ) / view_height
-                    if (
-                        limit / hyst <= top_exc <= limit * hyst and
-                        limit / hyst <= bot_exc <= limit * hyst
-                    ):
-                        # restore cached values
-                        x = self._datasetDisplay.x
-                        y = self._datasetDisplay.y
-                        cache_is_good = True
-                if not cache_is_good:
-                    min_val = view_range.bottom() - limit * view_height
-                    max_val = view_range.top()    + limit * view_height
-                    y = fn.clip_array(y, min_val, max_val)
-                    self._drlLastClip = (min_val, max_val)
-        self._drlClipActive = clip_active
-        self._datasetDisplay = PlotDataset(x, y, xAllFinite, yAllFinite, connect)
-        self.setProperty('xViewRangeWasChanged', False)
-        self.setProperty('yViewRangeWasChanged', False)
+        Returns
+        -------
+        tuple of int
+            For the 'peak' downsampling, the range of blocks to draw. Otherwise, the
+            range of points to draw.
+        """
+        if ds > 1 and self.opts['downsampleMethod'] == 'peak':
+            num_blocks = n // ds
+            if visible is None:
+                return 0, num_blocks
+            # keep one block beyond each edge, so that the curve reaches the edges
+            return (
+                max(visible[0] // ds - 1, 0),
+                min(-(-visible[1] // ds) + 1, num_blocks)
+            )
+        if visible is None:
+            return 0, n
+        # since we want the curve to go to the edge of the screen, we need to preserve
+        # one down-sampled point on the left and one of the right, so we extend the
+        # interval. Its start is aligned to a multiple of ds, so that the selected
+        # points do not change while panning.
+        x0 = (max(visible[0] - ds, 0) // ds) * ds
+        return x0, int(fn.clip_scalar(visible[1] + ds, x0, n))
 
-        return self._datasetDisplay
+    def _displayChangedByView(self) -> bool:
+        """
+        Test whether the current view range requires new display data.
+
+        The downsampling factor and the selected range are compared with those of the
+        current display data; the test is O(log N).
+
+        Returns
+        -------
+        bool
+            ``True`` if the display data has to be recomputed.
+        """
+        mapped = self._datasetMapped
+        if self._datasetDisplay is None or mapped is None or self._displayKey is None:
+            return True
+        ds, visible = self._displayReduction(mapped.x, self._displayViewRange())
+        return (ds, *self._displaySelection(len(mapped.y), ds, visible)) != self._displayKey
+
+    def _peakDownsample(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        connect: np.ndarray | None,
+        ds: int,
+        first_block: int,
+        end_block: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        """
+        Downsample by drawing the maximum and the minimum of blocks of points.
+
+        Block ``b`` holds the points ``b * ds`` to ``(b + 1) * ds - 1``. The extremes
+        of complete blocks are cached between calls, see :class:`_PeakBlockCache`.
+
+        When the drawn blocks reach the end of the data, the incomplete block at the
+        end, if any, is drawn with its own extremes, and the last drawn block is placed
+        at the `x` value of the last point. The newest points of a stream are thus
+        always visible, and the drawn `x` range ends at the newest point, as without
+        downsampling: an auto-range follows the data without jumping back and forth
+        as blocks complete.
+
+        Parameters
+        ----------
+        x, y : np.ndarray
+            Mapped data, before clipping.
+        connect : np.ndarray or None
+            Connection array matching `x` and `y`, if any.
+        ds : int
+            Number of points per block, larger than 1.
+        first_block, end_block : int
+            Range of complete blocks to draw.
+
+        Returns
+        -------
+        x, y : np.ndarray
+            Two points per block: the maximum, then the minimum, at the `x` value of
+            the block center (of the last point, for the last block of the data).
+        connect : np.ndarray or None
+            Matching connection array, if `connect` was given.
+        """
+        cache = self._peakCache
+        if cache is None or cache.ds != ds or cache.y is not y:
+            cache = self._peakCache = _PeakBlockCache(y, ds)
+        block_max, block_min = cache.blocks(first_block, end_block)
+        n = len(y)
+        num = end_block - first_block
+        start, end = first_block * ds, end_block * ds
+        at_end = end_block == n // ds
+        has_tail = at_end and end < n
+        total = num + 1 if has_tail else num
+
+        x_out = np.empty((total, 2))
+        y_out = np.empty((total, 2))
+        # x-values: select the point at the center of each block
+        x_out[:num] = x[start + ds // 2:end:ds, np.newaxis]
+        y_out[:num, 0] = block_max
+        y_out[:num, 1] = block_min
+        if has_tail:
+            # the incomplete block holding the newest points
+            y_out[num, 0] = y[end:].max()
+            y_out[num, 1] = y[end:].min()
+        if at_end and total > 0:
+            x_out[total - 1] = x[n - 1]
+
+        if connect is not None:
+            c = np.ones(total * 2, dtype=bool)
+            c[1:num * 2:2] = connect[start:end].reshape(num, ds).all(axis=1)
+            if has_tail:
+                c[num * 2 + 1] = connect[end:].all()
+            connect = c
+        return x_out.reshape(total * 2), y_out.reshape(total * 2), connect
 
     def _autoDownsampleFactor(
         self,
@@ -1861,7 +2506,7 @@ class PlotDataItem(GraphicsObject):
 
         The dynamic range limiter only modifies the displayed data while it clips it,
         or when the new view range requires clipping. The test is O(1), since the data
-        bounds are cached by the mapped :class:`PlotDataset`.
+        bounds are cached by the displayed :class:`PlotDataset`.
 
         Returns
         -------
@@ -1871,12 +2516,13 @@ class PlotDataItem(GraphicsObject):
         """
         if self.opts['dynamicRangeLimit'] is None or self._dataset is None:
             return False
-        if self._drlClipActive or self._datasetMapped is None:
+        if self._drlClipActive or self._datasetDisplay is None:
             return True
         view_range = self._displayViewRange()
         if view_range is None:
             return False
-        data_range = self._datasetMapped.dataRect()
+        # without clipping, the display dataset holds the unclipped displayed data
+        data_range = self._datasetDisplay.dataRect()
         if data_range is None:
             return False
         return self._drlClipRequired(data_range, view_range)
@@ -1897,6 +2543,7 @@ class PlotDataItem(GraphicsObject):
         :meth:`getOriginalDataset`
             This method returns the original data provided to PlotDataItem instead.
         """
+        self._flushDisplay()
         dataset = self._getDisplayDataset()
         return (None, None) if dataset is None else (dataset.x, dataset.y)
 
@@ -1949,11 +2596,12 @@ class PlotDataItem(GraphicsObject):
             The maximum end of the range that the data occupies along the specified
             axis. ``None`` if there is no data.
         """
+        self._flushDisplay()
         bounds: tuple[None, None] | tuple[float, float] = (None, None)
-        if self.curve.isVisible():
-            bounds = self.curve.dataBounds(ax, frac, orthoRange)
-        if self.scatter.isVisible():
-            bounds2 = self.scatter.dataBounds(ax, frac, orthoRange)
+        if self._curve.isVisible():
+            bounds = self._curve.dataBounds(ax, frac, orthoRange)
+        if self._scatter.isVisible():
+            bounds2 = self._scatter.dataBounds(ax, frac, orthoRange)
             bounds = (
                 min(
                     (i for i in [bounds2[0], bounds[0]] if i is not None), default=None
@@ -1978,25 +2626,27 @@ class PlotDataItem(GraphicsObject):
             returned by :meth:`dataBounds`. This method is called by :class:`ViewBox`
             when auto-scaling.
         """
+        self._flushDisplay()
         pad = 0
-        if self.curve.isVisible():
-            pad = max(pad, self.curve.pixelPadding())
-        elif self.scatter.isVisible():
-            pad = max(pad, self.scatter.pixelPadding())
+        if self._curve.isVisible():
+            pad = max(pad, self._curve.pixelPadding())
+        elif self._scatter.isVisible():
+            pad = max(pad, self._scatter.pixelPadding())
         return pad
 
     def clear(self) -> None:
         """
         Remove all data from this item and from its curve and scatter plot.
         """
+        self._cancelDisplayFlush()
         self._dataset = self._datasetMapped = self._datasetDisplay = None
         self._sentDisplayData = None
         self._drlClipActive = False
-        self.curve.clear()
-        self.scatter.clear()
-
-    def appendData(self, *args, **kwargs):
-        pass
+        self._peakCache = None
+        self._appendBuffers = None
+        self._implicitX = False
+        self._curve.clear()
+        self._scatter.clear()
 
     @QtCore.Slot(object, object)
     def curveClicked(self, _: PlotCurveItem, ev):
@@ -2023,13 +2673,27 @@ class PlotDataItem(GraphicsObject):
         )
         self.sigPointsHovered.emit(self, points, ev)
 
-    # def viewTransformChanged(self):
-    #   """ view transform (and thus range) has changed, replot if needed """
-    # viewTransformChanged is only called when the cached viewRect of GraphicsItem
-    # has already been invalidated. However, responding here will make PlotDataItem
-    # update curve and scatter later than intended.
-    #   super().viewTransformChanged() # this invalidates the viewRect() cache!
-        
+    @QtCore.Slot()
+    def viewTransformChanged(self) -> None:
+        """
+        Update the displayed data if the size of a pixel changed its downsampling.
+
+        View range changes are handled by :meth:`viewRangeChanged`, as soon as the
+        range changes. A view resized without a change of range, however, changes the
+        size of a pixel only, which the automatic downsampling factor depends on: the
+        displayed data is then recomputed if the factor changes. The view transform is
+        updated before the scene is painted, so this happens in the same paint.
+        """
+        super().viewTransformChanged()  # invalidates the viewRect() cache
+        if (
+            self.opts['autoDownsample']
+            and self._dataset is not None
+            and self._displayChangedByView()
+        ):
+            self.setProperty('xViewRangeWasChanged', True)
+            self._datasetDisplay = None
+            self.updateItems(styleUpdate=False)
+
     @QtCore.Slot(object, object)
     @QtCore.Slot(object, object, object)
     def viewRangeChanged(
@@ -2042,8 +2706,9 @@ class PlotDataItem(GraphicsObject):
         Update the displayed data after a change of the view range, if needed.
 
         A horizontal change requires new display data with `clipToView` or
-        `autoDownsample`. A vertical change requires it only while the dynamic range
-        limiter clips the data, or when the new range requires clipping.
+        `autoDownsample`, if the visible points or the downsampling factor change. A
+        vertical change requires it only while the dynamic range limiter clips the
+        data, or when the new range requires clipping.
 
         Parameters
         ----------
@@ -2057,16 +2722,15 @@ class PlotDataItem(GraphicsObject):
         """
         # view range has changed; re-plot if needed 
         update_needed = False
-        if changed is None or changed[0]: 
-            # if ranges is not None:
-            #     print('hor:', ranges[0])
+        if (
+            (changed is None or changed[0])
+            and (self.opts['clipToView'] or self.opts['autoDownsample'])
+            and self._displayChangedByView()
+        ):
+            # the visible points or the downsampling factor changed
             self.setProperty('xViewRangeWasChanged', True)
-            if (
-                self.opts['clipToView']
-                or self.opts['autoDownsample']
-            ):
-                self._datasetDisplay = None
-                update_needed = True
+            self._datasetDisplay = None
+            update_needed = True
         if (changed is None or changed[1]) and self._drlUpdateRequired():
             # The dynamic range limiter clips the data, or has to start doing so:
             # update, but do not discard cached display data.

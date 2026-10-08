@@ -120,7 +120,7 @@ Référence à `cc94092` : `pytest tests/graphicsItems tests/test_functions.py` 
 **Légende :**
 - **Effort :** S < ½ jour d'agent, M = 1-2 jours, L > 2 jours.
 - **Risque :** F faible, M moyen, É élevé.
-- **Statut :** ☐ à faire, ◐ en cours, ☑ fait.
+- **Statut :** ☐ à faire, ◐ en cours ou partiel (voir le message du commit), ☑ fait.
 
 | ID | Tâche | Phase | Effort | Risque | Gain attendu (scénario) | Dépend de | Statut |
 |----|-------|:-----:|:------:|:------:|-------------------------|-----------|:------:|
@@ -137,18 +137,18 @@ Référence à `cc94092` : `pytest tests/graphicsItems tests/test_functions.py` 
 | T1.9 | Légende et liste des paramètres sans coût quadratique | 1 | S | F | 500 courbes : 4,05 → ~0,6 s | — | ☑ |
 | T1.10 | `itemsNearEvent` : une seule requête, filtrer avant de trier | 1 | S | F | 4,65 → 2,3 ms/mouvement (500 courbes) | — | ☑ |
 | T1.11 | Bugs d'API qui désactivent des optimisations | 1 | S | F | `clipToView`/`autoDownsample` réellement actifs | — | ☑ |
-| T2.1 | Supprimer le double rendu par mise à jour | 2 | M | M | −25 à −45 % par image | T0.2 | ☐ |
-| T2.2 | Pipeline courbe : un seul passage O(N) par `setData` | 2 | M | F | 1e7 clip+ds : 100 → ~5 ms/image | T1.6 | ☐ |
-| T2.3 | Flux incrémental : `appendData`, blocs de pics alignés et mis en cache | 2 | L | M | 1e7 vue complète : ~2 ms/image | T2.2 | ☐ |
-| T2.4 | Données affichées calculées une seule fois par image | 2 | M | M | ÷2,5 sur le traitement des données | T2.1, T2.2 | ☐ |
-| T2.5 | Ne plus forcer `styleUpdate=True` dans `updateItems` | 2 | M | M | styles non renvoyés à chaque image | T1.2 | ☐ |
-| T2.6 | Chemin rapide `drawPolyline` pour les courbes simples | 2 | M | M | construction ×2,5, −33 % de mémoire | — | ☐ |
-| T2.7 | Atlas de symboles indexé par valeur, tailles quantifiées | 2 | M | F | ×30 à ×300 (couleurs/tailles par point) | T1.4 | ☐ |
-| T2.8 | Styles du nuage calculés par combinaison unique et chemin numérique | 2 | L | M | `setData` 1e5 : 330 → < 30 ms | T2.7 | ☐ |
-| T2.9 | `ScatterPlotItem.paint` : préparation vectorisée | 2 | M | M | 1e6 : 314 → ~190 ms/rendu | T2.8 | ☐ |
-| T2.10 | `AxisItem` : cache des libellés et de leur géométrie | 2 | M | F | −35 % par régénération d'axe | — | ☐ |
-| T2.11 | `TextItem` : plus de slot par élément sur le signal de rendu | 2 | M | M | ~×3 par élément | T2.1 | ☐ |
-| T2.12 | `ImageItem` : NaN gérés via un index réservé, sans masque RGBA | 2 | M | F | NaN : 15-29 → ~3 ms | — | ☐ |
+| T2.1 | Supprimer le double rendu par mise à jour | 2 | M | M | −25 à −45 % par image | T0.2 | ☑ |
+| T2.2 | Pipeline courbe : un seul passage O(N) par `setData` | 2 | M | F | 1e7 clip+ds : 100 → ~5 ms/image | T1.6 | ☑ |
+| T2.3 | Flux incrémental : `appendData`, blocs de pics alignés et mis en cache | 2 | L | M | 1e7 vue complète : ~2 ms/image | T2.2 | ☑ |
+| T2.4 | Données affichées calculées une seule fois par image | 2 | M | M | ÷2,5 sur le traitement des données | T2.1, T2.2 | ☑ |
+| T2.5 | Ne plus forcer `styleUpdate=True` dans `updateItems` | 2 | M | M | styles non renvoyés à chaque image | T1.2 | ☑ |
+| T2.6 | Chemin rapide `drawPolyline` pour les courbes simples | 2 | M | M | construction ×2,5, −33 % de mémoire | — | ◐ |
+| T2.7 | Atlas de symboles indexé par valeur, tailles quantifiées | 2 | M | F | ×30 à ×300 (couleurs/tailles par point) | T1.4 | ☑ |
+| T2.8 | Styles du nuage calculés par combinaison unique et chemin numérique | 2 | L | M | `setData` 1e5 : 330 → < 30 ms | T2.7 | ☑ |
+| T2.9 | `ScatterPlotItem.paint` : préparation vectorisée | 2 | M | M | 1e6 : 314 → ~190 ms/rendu | T2.8 | ☑ |
+| T2.10 | `AxisItem` : cache des libellés et de leur géométrie | 2 | M | F | −35 % par régénération d'axe | — | ☑ |
+| T2.11 | `TextItem` : plus de slot par élément sur le signal de rendu | 2 | M | M | ~×3 par élément | T2.1 | ☑ |
+| T2.12 | `ImageItem` : NaN gérés via un index réservé, sans masque RGBA | 2 | M | F | NaN : 15-29 → ~3 ms | — | ☑ |
 | T3.1 | `BarGraphItem` : découpage à la vue et LOD | 3 | M | F | 500k barres zoomées : 30 → ~2 ms | T0.1 | ☐ |
 | T3.2 | Nouvel élément `CandlestickItem` (OHLC) vectorisé | 3 | L | F | bougies natives, LOD par agrégation OHLC | T3.1 | ☐ |
 | T3.3 | `FillBetweenItem` reconstruit seulement au rendu, depuis numpy | 3 | M | F | 200k : 60 → < 5 ms/image | — | ☐ |

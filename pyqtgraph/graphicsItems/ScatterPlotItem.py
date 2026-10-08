@@ -1,12 +1,14 @@
+import enum
 import itertools
 import math
 import operator
 import weakref
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
+from numpy.lib.recfunctions import structured_to_unstructured
 
 from .. import Qt, debug
 from .. import functions as fn
@@ -123,8 +125,7 @@ def renderSymbol(symbol, size, pen, brush, device=None, dpr=1.0):
 def _mkPen(*args, **kwargs):
     """
     Wrapper for fn.mkPen which avoids creating a new QPen object if passed one as its
-    sole argument. This is used to avoid unnecessary cache misses in SymbolAtlas which
-    uses the QPen object id in its key.
+    sole argument, so that the pens given by the user are stored as they are.
     """
     if len(args) == 1 and isinstance(args[0], QtGui.QPen):
         return args[0]
@@ -135,8 +136,7 @@ def _mkPen(*args, **kwargs):
 def _mkBrush(*args, **kwargs):
     """
     Wrapper for fn.mkBrush which avoids creating a new QBrush object if passed one as its
-    sole argument. This is used to avoid unnecessary cache misses in SymbolAtlas which
-    uses the QBrush object id in its key.
+    sole argument, so that the brushes given by the user are stored as they are.
     """
     if len(args) == 1 and isinstance(args[0], QtGui.QBrush):
         return args[0]
@@ -167,6 +167,361 @@ def _isNoneMask(col: np.ndarray) -> np.ndarray:
                        dtype=bool, count=len(col))
 
 
+def _mkMany(values: Iterable, qtype: type, make: Callable[[object], object]
+            ) -> tuple[np.ndarray, list | None, np.ndarray | None]:
+    """
+    Convert each value with ``make``, building one object per unique hashable value.
+
+    Values that are already instances of ``qtype`` are kept as they are. The other
+    values are converted once per distinct ``(type, value)`` pair (the type keeps, for
+    example, ``1`` and ``1.0`` apart, which ``mkColor`` interprets differently); equal
+    values then share the same object, which keeps the symbol atlas small. Unhashable
+    values (dicts, lists, arrays) are converted one by one.
+
+    Parameters
+    ----------
+    values : iterable
+        Values accepted by ``make``, such as colors or ``QBrush`` objects.
+    qtype : type
+        Type of the objects produced, ``QtGui.QPen`` or ``QtGui.QBrush``.
+    make : callable
+        Conversion function, such as :func:`~pyqtgraph.mkBrush`.
+
+    Returns
+    -------
+    objects : numpy.ndarray
+        Object array holding one ``qtype`` object per value, in the same order.
+    reps : list or None
+        The distinct objects made, when every value was converted through the
+        memo; ``None`` otherwise.
+    codes : numpy.ndarray or None
+        Index in ``reps`` of each value, or ``None`` when ``reps`` is ``None``.
+    """
+    if isinstance(values, np.ndarray):
+        values = values.tolist()  # iterating over a list is faster
+    else:
+        values = list(values)
+    n = len(values)
+    if all(map(isinstance, values, itertools.repeat(qtype))):
+        return np.fromiter(values, dtype=object, count=n), None, None
+    cache = {}
+    reps = []
+    codes = []
+    out = []
+    append = out.append
+    for value in values:
+        if isinstance(value, qtype):
+            append(value)
+            codes = None
+            continue
+        key = (type(value), value)
+        try:
+            code = cache.get(key)
+        except TypeError:  # unhashable value
+            append(make(value))
+            codes = None
+            continue
+        if code is None:
+            code = cache[key] = len(reps)
+            reps.append(make(value))
+        append(reps[code])
+        if codes is not None:
+            codes.append(code)
+    objects = np.fromiter(out, dtype=object, count=n)
+    if codes is None:
+        return objects, None, None
+    return objects, reps, np.array(codes, dtype=np.intp)
+
+
+def _colorArrayToObjects(colors: object, make: Callable[[object], object]
+                         ) -> tuple[np.ndarray, list, np.ndarray] | None:
+    """
+    Convert an array of RGB(A) colors into pens or brushes, one per distinct color.
+
+    This is the numeric fast path of :meth:`ScatterPlotItem.setBrush` and
+    :meth:`ScatterPlotItem.setPen`. The colors give the same objects as converting
+    each row with ``make``: channels are 0-255 values, converted with ``int()``
+    (non-finite values become 0), and the alpha channel defaults to 255.
+
+    Parameters
+    ----------
+    colors : object
+        Candidate ``(N, 3)`` or ``(N, 4)`` numeric array.
+    make : callable
+        Conversion of an ``(r, g, b, a)`` tuple, :func:`~pyqtgraph.mkBrush` or
+        :func:`~pyqtgraph.mkPen`.
+
+    Returns
+    -------
+    tuple or None
+        ``(objects, reps, codes)``: the object array of ``N`` pens or brushes, equal
+        colors sharing the same object, the distinct objects, and the index in
+        ``reps`` of each color. ``None`` if ``colors`` is not such an array or has
+        channels outside 0-255, which are left to the generic path.
+    """
+    if not (isinstance(colors, np.ndarray) and colors.ndim == 2
+            and colors.shape[1] in (3, 4) and colors.dtype.kind in 'uif'):
+        return None
+    values = colors
+    if values.dtype != np.uint8:
+        if values.dtype.kind == 'f':
+            values = np.trunc(np.where(np.isfinite(values), values, 0))
+        if values.size and (values.min() < 0 or values.max() > 255):
+            return None
+    rgba = np.full((len(values), 4), 255, dtype=np.uint8)
+    rgba[:, :values.shape[1]] = values
+    packed = rgba.view(np.uint32).ravel()
+    unique, codes = np.unique(packed, return_inverse=True)
+    first = _representatives(codes, len(unique))
+    reps = [make(tuple(row)) for row in rgba[first].tolist()]
+    objects = np.empty(len(reps), dtype=object)
+    objects[:] = reps
+    return objects[codes], reps, codes
+
+
+def _representatives(codes: np.ndarray, n: int) -> np.ndarray:
+    """
+    Return the position of one element of each group.
+
+    Parameters
+    ----------
+    codes : numpy.ndarray
+        Group index of each element, with every group in ``range(n)`` present.
+    n : int
+        Number of groups.
+
+    Returns
+    -------
+    numpy.ndarray
+        For each group, the index of one of its elements (the last one).
+    """
+    first = np.empty(n, dtype=np.intp)
+    first[codes] = np.arange(len(codes))
+    return first
+
+
+def _groupObjects(objs: list) -> tuple[list, np.ndarray | None]:
+    """
+    Group objects by identity.
+
+    Parameters
+    ----------
+    objs : list
+        The objects.
+
+    Returns
+    -------
+    reps : list
+        One object per group.
+    codes : numpy.ndarray or None
+        Group index of each object, or ``None`` when all objects are the same one.
+    """
+    ids = np.fromiter(map(id, objs), dtype=np.intp, count=len(objs))
+    if len(ids) == 0 or (ids == ids[0]).all():
+        return objs[:1], None
+    unique, codes = np.unique(ids, return_inverse=True)
+    return [objs[i] for i in _representatives(codes, len(unique)).tolist()], codes
+
+
+def _mergeEqual(reps: list, codes: np.ndarray | None) -> tuple[list, np.ndarray | None]:
+    """
+    Merge the groups of equal hashable representatives.
+
+    Used for symbols, where equal strings are often distinct objects (for instance
+    when taken from a numpy string array).
+
+    Parameters
+    ----------
+    reps : list
+        One object per group.
+    codes : numpy.ndarray or None
+        Group index of each element, or ``None`` for a single group.
+
+    Returns
+    -------
+    reps : list
+        The representatives of the merged groups.
+    codes : numpy.ndarray or None
+        The merged group index of each element.
+    """
+    if codes is None:
+        return reps, codes
+    index = {}
+    remap = []
+    merged = []
+    for rep in reps:
+        key = (type(rep), rep)
+        try:
+            j = index.get(key)
+        except TypeError:  # unhashable, such as QPainterPath: keep the identity group
+            j = None
+            key = None
+        if j is None:
+            j = len(merged)
+            merged.append(rep)
+            if key is not None:
+                index[key] = j
+        remap.append(j)
+    if len(merged) == len(reps):
+        return reps, codes
+    return merged, np.array(remap, dtype=np.intp)[codes]
+
+
+def _groupValues(values: np.ndarray) -> tuple[list, np.ndarray | None]:
+    """
+    Group equal numeric values.
+
+    Parameters
+    ----------
+    values : numpy.ndarray
+        One-dimensional numeric array.
+
+    Returns
+    -------
+    reps : list
+        The distinct values, as Python scalars.
+    codes : numpy.ndarray or None
+        Index of each value in ``reps``, or ``None`` when all values are equal.
+    """
+    if len(values) == 0 or (values == values[0]).all():
+        return values[:1].tolist(), None
+    reps, codes = np.unique(values, return_inverse=True)
+    return reps.tolist(), codes
+
+
+def _quantizeSize(size: float, step: float) -> float:
+    """
+    Round a symbol size to a multiple of ``1 / step``.
+
+    Integral sizes are returned unchanged, so that they render exactly as requested
+    whatever the device pixel ratio. Non-finite sizes are returned unchanged.
+
+    Parameters
+    ----------
+    size : float
+        Symbol size in pixels.
+    step : float
+        Number of quantization steps per pixel.
+
+    Returns
+    -------
+    float
+        The quantized size.
+    """
+    size = float(size)
+    if size.is_integer() or not math.isfinite(size):
+        return size
+    return round(size * step) / step
+
+
+def _quantizeSizes(sizes: np.ndarray, step: float) -> np.ndarray:
+    """
+    Vectorized :func:`_quantizeSize`, giving the same values.
+
+    Parameters
+    ----------
+    sizes : numpy.ndarray
+        Symbol sizes in pixels.
+    step : float
+        Number of quantization steps per pixel.
+
+    Returns
+    -------
+    numpy.ndarray
+        The quantized sizes, as a new float64 array.
+    """
+    sizes = np.array(sizes, dtype=np.float64)
+    rounded = np.rint(sizes * step) / step
+    change = np.isfinite(sizes) & (sizes != np.trunc(sizes))
+    sizes[change] = rounded[change]
+    return sizes
+
+
+def _enumValue(value: enum.Enum | int) -> int:
+    """
+    Return the integer value of a Qt enum member, whatever the Qt binding.
+
+    Integers hash much faster than ``enum.Enum`` members, whose ``__hash__`` is
+    implemented in Python.
+
+    Parameters
+    ----------
+    value : enum.Enum or int
+        Enum member (PyQt6, PySide6) or integer-like enum value (PyQt5).
+
+    Returns
+    -------
+    int
+        The value.
+    """
+    return value.value if isinstance(value, enum.Enum) else int(value)
+
+
+# brush styles whose rendering is not fully described by the color and the style
+_SHAPED_BRUSH_STYLES = frozenset((
+    QtCore.Qt.BrushStyle.LinearGradientPattern,
+    QtCore.Qt.BrushStyle.RadialGradientPattern,
+    QtCore.Qt.BrushStyle.ConicalGradientPattern,
+    QtCore.Qt.BrushStyle.TexturePattern,
+))
+# brush styles whose rendering does not depend on the brush transform
+_PLAIN_BRUSH_STYLES = frozenset((
+    QtCore.Qt.BrushStyle.NoBrush,
+    QtCore.Qt.BrushStyle.SolidPattern,
+))
+
+
+def _brushValueKey(brush: QtGui.QBrush) -> tuple | None:
+    """
+    Return a hashable key describing how a brush renders, if it can be built.
+
+    Parameters
+    ----------
+    brush : QtGui.QBrush
+        The brush.
+
+    Returns
+    -------
+    tuple or None
+        ``(rgba, style)`` as integers, or ``None`` for gradient and texture brushes
+        and for transformed hatch patterns, which must be keyed by identity.
+    """
+    style = brush.style()
+    if style in _SHAPED_BRUSH_STYLES:
+        return None
+    if style not in _PLAIN_BRUSH_STYLES and not brush.transform().isIdentity():
+        return None
+    return (brush.color().rgba(), _enumValue(style))
+
+
+def _penValueKey(pen: QtGui.QPen) -> tuple | None:
+    """
+    Return a hashable key describing how a pen renders, if it can be built.
+
+    Besides the color, width, style and cosmetic flag, the key holds the cap and join
+    styles, the miter limit and the dash pattern, which all change the rendered
+    symbol.
+
+    Parameters
+    ----------
+    pen : QtGui.QPen
+        The pen.
+
+    Returns
+    -------
+    tuple or None
+        The key, or ``None`` when the pen brush cannot be keyed by value.
+    """
+    brushKey = _brushValueKey(pen.brush())
+    if brushKey is None:
+        return None
+    style = pen.style()
+    dash = tuple(pen.dashPattern()) if style == QtCore.Qt.PenStyle.CustomDashLine else ()
+    return (brushKey, pen.widthF(), _enumValue(style), pen.isCosmetic(),
+            _enumValue(pen.capStyle()), _enumValue(pen.joinStyle()), pen.miterLimit(),
+            dash, pen.dashOffset())
+
+
 class SymbolAtlas(object):
     """
     Used to efficiently construct a single QPixmap containing all rendered symbols
@@ -178,6 +533,11 @@ class SymbolAtlas(object):
         sc2 = atlas[[('t', 10, QPen(..), QBrush(..))]]
         pm = atlas.pixmap
 
+    Symbols are keyed by value: pens and brushes that render the same share one
+    entry, whatever the Python objects. Gradient and texture brushes, and custom
+    ``QPainterPath`` symbols, are keyed by identity. Non-integral sizes are rounded
+    to a quarter of a device pixel (``1 / (4 * devicePixelRatio)`` logical pixel),
+    and the symbol is rendered at the rounded size.
     """
     _idGenerator = itertools.count()
 
@@ -190,13 +550,14 @@ class SymbolAtlas(object):
         Given a list of tuples, (symbol, size, pen, brush), return a list of coordinates of
         corresponding symbols within the atlas. Note that these coordinates may change if the atlas is rebuilt.
         """
-        keys = self._keys(styles)
-        new = {key: style for key, style in zip(keys, styles) if key not in self._coords}
+        keys, inverse, renderStyles = self._uniqueKeys(styles)
+        new = {key: style for key, style in zip(keys, renderStyles) if key not in self._coords}
 
         if new:
             self._extend(new)
 
-        return list(map(self._coords.__getitem__, keys))
+        coords = [self._coords[key] for key in keys]
+        return [coords[i] for i in inverse]
 
     def __len__(self):
         return len(self._coords)
@@ -223,7 +584,7 @@ class SymbolAtlas(object):
         if styles is None:
             data = []
         else:
-            keys = set(self._keys(styles))
+            keys = self._uniqueKeys(styles)[0]
             data = list(self._itemData(keys))
 
         self.clear()
@@ -251,18 +612,89 @@ class SymbolAtlas(object):
                     area_used=1.0 if n == 0 else a / (w * h),
                     squareness=1.0 if n == 0 else 2 * w * h / (w**2 + h**2))
 
-    def _keys(self, styles):
-        def getId(obj):
-            try:
-                return obj._id
-            except AttributeError:
-                obj._id = next(SymbolAtlas._idGenerator)
-                return obj._id
+    @staticmethod
+    def _identityKey(obj: object) -> tuple[str, int]:
+        """
+        Return a key identifying an object for the lifetime of the program.
 
-        return [
-            (symbol if isinstance(symbol, (str, int)) else getId(symbol), size, getId(pen), getId(brush))
-            for symbol, size, pen, brush in styles
-        ]
+        A counter value is stored on the object: unlike ``id()``, it is never reused by
+        another object.
+
+        Parameters
+        ----------
+        obj : object
+            Object accepting new attributes, such as a Qt object.
+
+        Returns
+        -------
+        tuple
+            ``('id', n)``, which never equals a value key.
+        """
+        try:
+            return ('id', obj._id)
+        except AttributeError:
+            obj._id = next(SymbolAtlas._idGenerator)
+            return ('id', obj._id)
+
+    def _uniqueKeys(self, styles: Sequence[tuple]) -> tuple[list[tuple], list[int], list[tuple]]:
+        """
+        Compute the distinct atlas keys of a sequence of styles.
+
+        The key of a style is ``(symbolKey, quantizedSize, penKey, brushKey)``: pens and
+        brushes are described by value (see :func:`_penValueKey` and
+        :func:`_brushValueKey`) when possible, by identity otherwise, and the size is
+        quantized (see :func:`_quantizeSize`).
+
+        Parameters
+        ----------
+        styles : sequence of tuple
+            ``(symbol, size, pen, brush)`` tuples.
+
+        Returns
+        -------
+        keys : list of tuple
+            The distinct keys, in order of first appearance.
+        inverse : list of int
+            For each style, the index of its key in ``keys``.
+        renderStyles : list of tuple
+            For each key, the ``(symbol, size, pen, brush)`` style to render, with the
+            quantized size.
+        """
+        step = 4 * self._dpr
+        identityKey = self._identityKey
+        keys = []
+        inverse = []
+        renderStyles = []
+        append = inverse.append
+        # Styles are first grouped by object identity, which is cheap; the value keys
+        # are then computed once per group. The identities are only valid during this
+        # call, while ``styles`` holds the objects: a pen or brush modified between two
+        # calls is keyed by its new value.
+        byIdentity = {}
+        byValue = {}
+        penKeys = {}
+        brushKeys = {}
+        for symbol, size, pen, brush in styles:
+            groupKey = (id(symbol), size, id(pen), id(brush))
+            index = byIdentity.get(groupKey)
+            if index is None:
+                penKey = penKeys.get(id(pen))
+                if penKey is None:
+                    penKey = penKeys[id(pen)] = _penValueKey(pen) or identityKey(pen)
+                brushKey = brushKeys.get(id(brush))
+                if brushKey is None:
+                    brushKey = brushKeys[id(brush)] = (_brushValueKey(brush)
+                                                       or identityKey(brush))
+                symbolKey = symbol if isinstance(symbol, (str, int)) else identityKey(symbol)
+                key = (symbolKey, _quantizeSize(size, step), penKey, brushKey)
+                index = byValue.get(key)
+                if index is None:
+                    index = byValue[key] = len(keys)
+                    keys.append(key)
+                    renderStyles.append((symbol, key[1], pen, brush))
+                byIdentity[groupKey] = index
+            append(index)
+        return keys, inverse, renderStyles
 
     def _itemData(self, keys):
         for key in keys:
@@ -360,6 +792,96 @@ class SymbolAtlas(object):
         return pm
 
 
+class _SpotArrays:
+    """
+    Contiguous copies of the spot fields used to paint and to hit-test.
+
+    The fields of the structured spot array are strided (one record per spot), which
+    makes every vectorized pass over them slow. These copies are built on demand from
+    :attr:`ScatterPlotItem.data` and dropped by :meth:`ScatterPlotItem.invalidate`
+    whenever the spots change.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Structured spot array.
+    """
+
+    __slots__ = ('serial', 'x', 'y', 'sourceRect', 'uniformRect', 'halfWidth', 'halfHeight',
+                 'visible', 'allVisible', 'bounds')
+
+    _serials = itertools.count()
+
+    def __init__(self, data: np.ndarray) -> None:
+        n = len(data)
+        self.serial = next(_SpotArrays._serials)  # identifies these arrays
+        self.x = np.array(data['x'], dtype=np.float64)
+        self.y = np.array(data['y'], dtype=np.float64)
+        # one pass over the records for the four fields (sx, sy, sw, sh)
+        self.sourceRect = structured_to_unstructured(data['sourceRect'], dtype=np.float64)
+        # the source rect shared by all the spots (uniform style), if any
+        self.uniformRect = None
+        if n and (self.sourceRect == self.sourceRect[0]).all():
+            self.uniformRect = tuple(self.sourceRect[0].tolist())
+        # half symbol sizes in device pixels: a scalar when uniform, else one per spot
+        self.halfWidth = self._halfSizes(self.sourceRect[:, 2])
+        self.halfHeight = self._halfSizes(self.sourceRect[:, 3])
+        self.visible = np.array(data['visible'], dtype=bool)
+        self.allVisible = bool(self.visible.all())
+        # NaN coordinates give NaN bounds, which then never compare as inside a view
+        self.bounds = (None if n == 0 else
+                       (self.x.min(), self.x.max(), self.y.min(), self.y.max()))
+
+    @staticmethod
+    def _halfSizes(sizes: np.ndarray) -> float | np.ndarray:
+        """
+        Halve symbol sizes, returning a scalar when they are all equal.
+
+        Parameters
+        ----------
+        sizes : numpy.ndarray
+            Symbol widths or heights.
+
+        Returns
+        -------
+        float or numpy.ndarray
+            ``sizes / 2``, or its single value; both give the same results in
+            arithmetic with the spot coordinates.
+        """
+        if len(sizes) and (sizes == sizes[0]).all():
+            return float(sizes[0]) / 2
+        return sizes / 2
+
+
+def _mapPoints(transform: QtGui.QTransform, x: np.ndarray, y: np.ndarray,
+               out: np.ndarray) -> None:
+    """
+    Map points to device coordinates, as :func:`~pyqtgraph.functions.transformCoordinates`.
+
+    The operations are done in the same order as ``transformCoordinates`` followed by
+    a clip to +-2**30 (larger coordinates crash Qt), so that the results are
+    bit-identical; perspective is ignored likewise.
+
+    Parameters
+    ----------
+    transform : QtGui.QTransform
+        Item to device transform.
+    x, y : numpy.ndarray
+        Coordinates of the points.
+    out : numpy.ndarray
+        ``(N, 2)`` float64 array, or view, receiving the mapped coordinates.
+    """
+    for col, (mx, my, d) in enumerate(((transform.m11(), transform.m21(), transform.dx()),
+                                       (transform.m12(), transform.m22(), transform.dy()))):
+        # computed in a contiguous array: passes over a strided column are slow
+        with np.errstate(invalid='ignore', over='ignore'):
+            mapped = x * mx
+            mapped += y * my
+            mapped += d
+        np.clip(mapped, -2 ** 30, 2 ** 30, out=mapped)
+        out[:, col] = mapped
+
+
 class ScatterPlotItem(GraphicsObject):
     """
     Displays a set of x/y points. Instances of this class are created
@@ -396,6 +918,24 @@ class ScatterPlotItem(GraphicsObject):
         self.fragmentAtlas = SymbolAtlas()
         if screen := QtGui.QGuiApplication.primaryScreen():
             self.fragmentAtlas.setDevicePixelRatio(screen.devicePixelRatio())
+        # The atlas is rebuilt with the styles in use when it holds more entries than
+        # this, unless at least half of its entries are in use.
+        self._atlasMaxEntries = 4096
+        # During addPoints: grouping of the per-spot pens and brushes, when known from
+        # their conversion, keyed by column name (see _setStyleColumn)
+        self._styleCodes = None
+        # True once views of self.data were handed out (SpotItems, getData), which
+        # forbids reusing the array in place for the next setData
+        self._dataShared = False
+        # During setData: previous spot array that addPoints may reuse in place
+        self._reusableData = None
+        # Contiguous copies of the spot fields for painting and hit tests, built on
+        # demand and dropped by invalidate() (see _spotArrays)
+        self._paintCache = None
+        # Columns already written in the pixmap fragment buffer, as (key, rows) where
+        # the key holds the buffer address (see _prepareFragments)
+        self._fragmentRects = None
+        self._fragmentConstants = None
 
         dtype = [
             ('x', float),
@@ -417,6 +957,7 @@ class ScatterPlotItem(GraphicsObject):
         ]
 
         self.data = np.empty(0, dtype=dtype)
+        self._initialSpot = self._makeInitialSpot(self.data.dtype)
         self.bounds = [None, None]  ## caches data bounds
         self._maxSpotWidth = 0      ## maximum size of the scale-variant portion of all spots
         self._maxSpotPxWidth = 0    ## maximum size of the scale-invariant portion of all spots
@@ -468,9 +1009,11 @@ class ScatterPlotItem(GraphicsObject):
                                width and height of 1.0. Note that it is also possible to 'install' custom shapes by setting 
                                ScatterPlotItem.Symbols[key] = shape.
         *pen*                  The pen (or list of pens) to use for drawing spot outlines.
-        *brush*                The brush (or list of brushes) to use for filling spots.
+        *brush*                The brush (or list of brushes) to use for filling spots. For one color per spot, an
+                               (N, 4) ``uint8`` array of RGBA values is the fastest (see :func:`~ScatterPlotItem.setBrush`).
         *size*                 The size (or list of sizes) of spots. If *pxMode* is True, this value is in pixels. Otherwise,
-                               it is in the item's local coordinate system.
+                               it is in the item's local coordinate system. In pixel mode, non-integral sizes are rounded
+                               to a quarter of a device pixel.
         *data*                 a list of python objects used to uniquely identify each spot.
         *hoverable*            If True, sigHovered is emitted with a list of hovered points, a tool tip is shown containing
                                information about them, and an optional separate style for them is used. Default is False.
@@ -491,10 +1034,23 @@ class ScatterPlotItem(GraphicsObject):
         *name*                 The name of this item. Names are used for automatically
                                generating LegendItem entries and by some exporters.
         ====================== ===============================================================================================
+
+        When the number of spots does not change (sliding window), the structured array
+        ``self.data`` is reset and reused in place, unless SpotItems (:meth:`points`,
+        :meth:`pointsAt`, hover and click signals) or :meth:`getData` views of it were
+        handed out, or an argument shares its memory: those keep referring to the
+        previous spots. References to ``self.data`` taken by other means see the new
+        spots.
         """
         oldData = self.data  ## this causes cached pixmaps to be preserved while new data is registered.
+        # The spot array is reused in place when the number of spots does not change,
+        # unless views of it were handed out (see addPoints).
+        self._reusableData = None if self._dataShared else oldData
         self.clear()  ## clear out all old data
-        self.addPoints(*args, **kwargs)
+        try:
+            self.addPoints(*args, **kwargs)
+        finally:
+            self._reusableData = None
 
     def addPoints(self, *args, **kwargs):
         """
@@ -543,18 +1099,35 @@ class ScatterPlotItem(GraphicsObject):
         ## Clear current SpotItems since the data references they contain will no longer be current
         self.data['item'][...] = None
 
-        ## Extend record array
-        oldData = self.data
-        self.data = np.empty(len(oldData)+numPts, dtype=self.data.dtype)
-        ## note that np.empty initializes object fields to None and string fields to ''
+        reusable = self._reusableData
+        self._reusableData = None
+        if (reusable is not None and len(self.data) == 0 and len(reusable) == numPts
+                and 'spots' not in kwargs
+                and not any(isinstance(value, np.ndarray) and np.may_share_memory(value, reusable)
+                            for value in kwargs.values())):
+            # setData with as many spots as before (sliding window): reset the previous
+            # array in place. Nothing outside the item refers to it (no SpotItem, no
+            # getData view, no input sharing its memory).
+            self.data = reusable
+            self._resetSpotArray(self.data)
+        else:
+            ## Extend record array
+            oldData = self.data
+            self.data = self._newSpotArray(len(oldData) + numPts)
+            self._dataShared = False
 
-        self.data[:len(oldData)] = oldData
-        #for i in range(len(oldData)):
-            #oldData[i]['item']._data = self.data[i]  ## Make sure items have proper reference to new array
+            self.data[:len(oldData)] = oldData
+            #for i in range(len(oldData)):
+                #oldData[i]['item']._data = self.data[i]  ## Make sure items have proper reference to new array
 
-        newData = self.data[len(oldData):]
-        newData['size'] = -1  ## indicates to use default size
-        newData['visible'] = True
+        newData = self.data[len(self.data) - numPts:]
+
+        # style columns of the new spots that keep their initial unset value
+        if 'spots' in kwargs:
+            unset = frozenset()
+        else:
+            unset = frozenset(k for k in ('symbol', 'size', 'pen', 'brush')
+                              if not isinstance(kwargs.get(k), (list, np.ndarray)))
 
         if 'spots' in kwargs:
             spots = kwargs['spots']
@@ -597,18 +1170,23 @@ class ScatterPlotItem(GraphicsObject):
             self.opts['useCache'] = kwargs['useCache']
 
         ## Set any extra parameters provided in keyword arguments
-        for k in ['pen', 'brush', 'symbol', 'size']:
-            if k in kwargs:
-                setMethod = getattr(self, 'set' + k[0].upper() + k[1:])
-                setMethod(kwargs[k], update=False, dataSet=newData, mask=kwargs.get('mask', None))
-            kh = 'hover' + k.title()
-            if kh in kwargs:
-                vh = kwargs[kh]
-                if k == 'pen':
-                    vh = _mkPen(vh)
-                elif k == 'brush':
-                    vh = _mkBrush(vh)
-                self.opts[kh] = vh
+        self._styleCodes = {}
+        try:
+            for k in ['pen', 'brush', 'symbol', 'size']:
+                if k in kwargs:
+                    setMethod = getattr(self, 'set' + k[0].upper() + k[1:])
+                    setMethod(kwargs[k], update=False, dataSet=newData, mask=kwargs.get('mask', None))
+                kh = 'hover' + k.title()
+                if kh in kwargs:
+                    vh = kwargs[kh]
+                    if k == 'pen':
+                        vh = _mkPen(vh)
+                    elif k == 'brush':
+                        vh = _mkBrush(vh)
+                    self.opts[kh] = vh
+        finally:
+            known = self._styleCodes
+            self._styleCodes = None
         if 'data' in kwargs:
             self.setPointData(kwargs['data'], dataSet=newData)
 
@@ -616,15 +1194,96 @@ class ScatterPlotItem(GraphicsObject):
         self.informViewBoundsChanged()
         self.bounds = [None, None]
         self.invalidate()
-        self.updateSpots(newData)
+        self._updateSpots(newData, unset=unset, known=known, new=True)
         self.sigPlotChanged.emit(self)
 
-    def invalidate(self):
-        ## clear any cached drawing state
+    def _newSpotArray(self, n: int) -> np.ndarray:
+        """
+        Allocate the structured array of ``n`` spots in their initial state.
+
+        Object fields are ``None``, ``size`` is -1 (default size), ``visible`` is True,
+        and the other fields are zero. ``np.zeros`` followed by a copy of the initial
+        record is several times faster than ``np.empty``, which initializes object
+        fields record by record.
+
+        Parameters
+        ----------
+        n : int
+            Number of spots.
+
+        Returns
+        -------
+        numpy.ndarray
+            New structured array with the dtype of ``self.data``.
+        """
+        data = np.zeros(n, dtype=self.data.dtype)
+        data[...] = self._initialSpot
+        return data
+
+    def _resetSpotArray(self, data: np.ndarray) -> None:
+        """
+        Put a spot array back in the initial state of :meth:`_newSpotArray`.
+
+        All the fields, positions included, are written in a single pass over the
+        records, which is about 2.5 times faster than one pass per field at 1e6 spots.
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Structured spot array, modified in place.
+        """
+        data[...] = self._initialSpot
+
+    @staticmethod
+    def _makeInitialSpot(dtype: np.dtype) -> np.ndarray:
+        """
+        Build the record of a spot in its initial state.
+
+        Parameters
+        ----------
+        dtype : numpy.dtype
+            Structured dtype of the spot array.
+
+        Returns
+        -------
+        numpy.ndarray
+            One-element array: object fields ``None``, ``size`` -1 (default size),
+            ``visible`` True, other fields zero.
+        """
+        spot = np.zeros(1, dtype=dtype)
+        for name, (fieldType, *_) in dtype.fields.items():
+            if fieldType.hasobject:
+                spot[name] = None
+        spot['size'] = -1
+        spot['visible'] = True
+        return spot
+
+    def invalidate(self) -> None:
+        """
+        Clear any cached drawing state and schedule a repaint.
+
+        Must be called (directly, or through :meth:`updateSpots`) after modifying the
+        spot array ``self.data`` in place.
+        """
         self.picture = None
+        self._paintCache = None
         self.update()
 
+    def _spotArrays(self) -> _SpotArrays:
+        """
+        Return the contiguous copies of the spot fields, building them if needed.
+
+        Returns
+        -------
+        _SpotArrays
+            Arrays valid until the next :meth:`invalidate`.
+        """
+        if self._paintCache is None:
+            self._paintCache = _SpotArrays(self.data)
+        return self._paintCache
+
     def getData(self):
+        self._dataShared = True  # views of self.data are handed out
         return self.data['x'], self.data['y']
 
     def implements(self, interface=None):
@@ -636,11 +1295,76 @@ class ScatterPlotItem(GraphicsObject):
     def name(self):
         return self.opts.get('name', None)
 
-    def setPen(self, *args, **kwargs):
-        """Set the pen(s) used to draw the outline around each spot.
-        If a list or array is provided, then the pen for each spot will be set separately.
-        Otherwise, the arguments are passed to pg.mkPen and used as the default pen for
-        all spots which do not have a pen explicitly set."""
+    def _resetSymbols(self, dataSet: np.ndarray) -> None:
+        """
+        Mark spots for a new symbol atlas lookup after a style change.
+
+        Nothing is written while :meth:`addPoints` applies the style arguments: its
+        spots are new and not looked up yet, and a pass over the records costs about
+        20 ms at 1e6 spots.
+
+        Parameters
+        ----------
+        dataSet : numpy.ndarray
+            Structured array (or view) of the spots whose style changed.
+        """
+        if self._styleCodes is None:
+            dataSet['sourceRect'] = 0
+            self._paintCache = None
+
+    def _setStyleColumn(self, name: str, dataSet: np.ndarray, objects: np.ndarray,
+                        reps: list | None, codes: np.ndarray | None) -> None:
+        """
+        Store per-spot pens or brushes, and record their grouping when it is known.
+
+        During :meth:`addPoints`, a grouping known from the conversion of the input
+        (one object per distinct color) is handed over to :meth:`_updateSpots`, which
+        then does not need to group the column again.
+
+        Parameters
+        ----------
+        name : str
+            Column name, ``'pen'`` or ``'brush'``.
+        dataSet : numpy.ndarray
+            Structured array (or view) of the spots.
+        objects : numpy.ndarray
+            Object array of one pen or brush per spot.
+        reps : list or None
+            The distinct objects of ``objects``, if known.
+        codes : numpy.ndarray or None
+            Index in ``reps`` of each spot, if known.
+        """
+        dataSet[name] = objects
+        if self._styleCodes is not None:
+            if codes is None:
+                self._styleCodes.pop(name, None)
+            else:
+                self._styleCodes[name] = (reps, codes)
+
+    def setPen(self, *args, **kwargs) -> None:
+        """
+        Set the pen(s) used to draw the outline around each spot.
+
+        If a list or array is provided, then the pen for each spot will be set
+        separately; equal hashable specifications (such as color tuples) share one
+        ``QPen``. Otherwise, the arguments are passed to :func:`~pyqtgraph.mkPen` and
+        used as the default pen for all spots which do not have a pen explicitly set.
+
+        The fastest way to give one color per spot is an ``(N, 4)`` (or ``(N, 3)``)
+        numeric array of RGBA (RGB) values in the range 0-255, preferably of
+        ``uint8`` dtype: one cosmetic pen of width 1 is made per distinct color.
+
+        Parameters
+        ----------
+        *args
+            A list or array holding one pen specification per spot, an ``(N, 4)`` or
+            ``(N, 3)`` array of colors, or the arguments of :func:`~pyqtgraph.mkPen`.
+        **kwargs
+            Keyword arguments of :func:`~pyqtgraph.mkPen`, and the internal options
+            ``update`` (bool, default True: update the spots now), ``dataSet``
+            (structured array of the spots to change, default all spots) and ``mask``
+            (selection applied to a per-spot list or array).
+        """
         update = kwargs.pop('update', True)
         dataSet = kwargs.pop('dataSet', self.data)
 
@@ -650,19 +1374,45 @@ class ScatterPlotItem(GraphicsObject):
                 pens = pens[kwargs['mask']]
             if len(pens) != len(dataSet):
                 raise Exception("Number of pens does not match number of points (%d != %d)" % (len(pens), len(dataSet)))
-            dataSet['pen'] = list(map(_mkPen, pens))
+            converted = (_colorArrayToObjects(pens, fn.mkPen)
+                         or _mkMany(pens, QtGui.QPen, fn.mkPen))
+            self._setStyleColumn('pen', dataSet, *converted)
         else:
             self.opts['pen'] = _mkPen(*args, **kwargs)
 
-        dataSet['sourceRect'] = 0
+        self._resetSymbols(dataSet)
         if update:
             self.updateSpots(dataSet)
 
-    def setBrush(self, *args, **kwargs):
-        """Set the brush(es) used to fill the interior of each spot.
-        If a list or array is provided, then the brush for each spot will be set separately.
-        Otherwise, the arguments are passed to pg.mkBrush and used as the default brush for
-        all spots which do not have a brush explicitly set."""
+    def setBrush(self, *args, **kwargs) -> None:
+        """
+        Set the brush(es) used to fill the interior of each spot.
+
+        If a list or array is provided, then the brush for each spot will be set
+        separately; equal hashable specifications (such as color tuples) share one
+        ``QBrush``. Otherwise, the arguments are passed to :func:`~pyqtgraph.mkBrush`
+        and used as the default brush for all spots which do not have a brush
+        explicitly set.
+
+        The fastest way to give one color per spot, for instance buy and sell
+        colors of trades, is an ``(N, 4)`` (or ``(N, 3)``) numeric array of RGBA
+        (RGB) values in the range 0-255, preferably of ``uint8`` dtype: one brush is
+        made per distinct color. An object array built from a palette, such as
+        ``np.array(palette, dtype=object)[indices]`` with ``palette`` a list of
+        ``QBrush``, is nearly as fast, since spots are grouped by brush object.
+
+        Parameters
+        ----------
+        *args
+            A list or array holding one brush specification per spot, an ``(N, 4)``
+            or ``(N, 3)`` array of colors, or the arguments of
+            :func:`~pyqtgraph.mkBrush`.
+        **kwargs
+            Keyword arguments of :func:`~pyqtgraph.mkBrush`, and the internal options
+            ``update`` (bool, default True: update the spots now), ``dataSet``
+            (structured array of the spots to change, default all spots) and ``mask``
+            (selection applied to a per-spot list or array).
+        """
         update = kwargs.pop('update', True)
         dataSet = kwargs.pop('dataSet', self.data)
 
@@ -672,19 +1422,33 @@ class ScatterPlotItem(GraphicsObject):
                 brushes = brushes[kwargs['mask']]
             if len(brushes) != len(dataSet):
                 raise Exception("Number of brushes does not match number of points (%d != %d)" % (len(brushes), len(dataSet)))
-            dataSet['brush'] = list(map(_mkBrush, brushes))
+            converted = (_colorArrayToObjects(brushes, fn.mkBrush)
+                         or _mkMany(brushes, QtGui.QBrush, fn.mkBrush))
+            self._setStyleColumn('brush', dataSet, *converted)
         else:
             self.opts['brush'] = _mkBrush(*args, **kwargs)
 
-        dataSet['sourceRect'] = 0
+        self._resetSymbols(dataSet)
         if update:
             self.updateSpots(dataSet)
 
-    def setSymbol(self, symbol, update=True, dataSet=None, mask=None):
+    def setSymbol(self, symbol: object, update: bool = True, dataSet: np.ndarray | None = None,
+                  mask: np.ndarray | None = None) -> None:
         """Set the symbol(s) used to draw each spot.
         If a list or array is provided, then the symbol for each spot will be set separately.
         Otherwise, the argument will be used as the default symbol for
         all spots which do not have a symbol explicitly set.
+
+        Parameters
+        ----------
+        symbol : str, int, QtGui.QPainterPath, list or numpy.ndarray
+            A symbol, or one symbol per spot.
+        update : bool, default True
+            Update the spots now.
+        dataSet : numpy.ndarray, optional
+            Structured array of the spots to change; defaults to all spots.
+        mask : numpy.ndarray, optional
+            Selection applied to a per-spot list or array.
 
         **Supported symbols:**
 
@@ -724,15 +1488,32 @@ class ScatterPlotItem(GraphicsObject):
             self.opts['symbol'] = symbol
             self._spotPixmap = None
 
-        dataSet['sourceRect'] = 0
+        self._resetSymbols(dataSet)
         if update:
             self.updateSpots(dataSet)
 
-    def setSize(self, size, update=True, dataSet=None, mask=None):
-        """Set the size(s) used to draw each spot.
-        If a list or array is provided, then the size for each spot will be set separately.
-        Otherwise, the argument will be used as the default size for
-        all spots which do not have a size explicitly set."""
+    def setSize(self, size: float | list | np.ndarray, update: bool = True,
+                dataSet: np.ndarray | None = None, mask: np.ndarray | None = None) -> None:
+        """
+        Set the size(s) used to draw each spot.
+
+        If a list or array is provided, then the size for each spot will be set
+        separately. Otherwise, the argument will be used as the default size for all
+        spots which do not have a size explicitly set. A float array is the fastest
+        way to give one size per spot (for instance proportional to trade volumes);
+        in pixel mode, non-integral sizes are rounded to a quarter of a device pixel.
+
+        Parameters
+        ----------
+        size : float, list or numpy.ndarray
+            A size, or one size per spot (-1 for the default size).
+        update : bool, default True
+            Update the spots now.
+        dataSet : numpy.ndarray, optional
+            Structured array of the spots to change; defaults to all spots.
+        mask : numpy.ndarray, optional
+            Selection applied to a per-spot list or array.
+        """
         if dataSet is None:
             dataSet = self.data
 
@@ -747,15 +1528,32 @@ class ScatterPlotItem(GraphicsObject):
             self.opts['size'] = size
             self._spotPixmap = None
 
-        dataSet['sourceRect'] = 0
+        self._resetSymbols(dataSet)
         if update:
             self.updateSpots(dataSet)
 
 
-    def setPointsVisible(self, visible, update=True, dataSet=None, mask=None):
-        """Set whether or not each spot is visible.
-        If a list or array is provided, then the visibility for each spot will be set separately.
-        Otherwise, the argument will be used for all spots."""
+    def setPointsVisible(self, visible: bool | list | np.ndarray, update: bool = True,
+                         dataSet: np.ndarray | None = None,
+                         mask: np.ndarray | None = None) -> None:
+        """
+        Set whether or not each spot is visible.
+
+        If a list or array is provided, then the visibility for each spot will be set
+        separately. Otherwise, the argument will be used for all spots.
+
+        Parameters
+        ----------
+        visible : bool, list or numpy.ndarray
+            Visibility of all spots, or of each spot.
+        update : bool, default True
+            Update the spots now.
+        dataSet : numpy.ndarray, optional
+            Structured array of the spots to change; defaults to all spots.
+        mask : numpy.ndarray, optional
+            Selection applied to a per-spot list or array.
+        """
+        self._paintCache = None
         if dataSet is None:
             dataSet = self.data
 
@@ -798,20 +1596,65 @@ class ScatterPlotItem(GraphicsObject):
         self.opts['pxMode'] = mode
         self.invalidate()
 
-    def updateSpots(self, dataSet=None):
+    def updateSpots(self, dataSet: np.ndarray | None = None) -> None:
+        """
+        Look up the symbols of spots whose style changed, and schedule a repaint.
+
+        Parameters
+        ----------
+        dataSet : numpy.ndarray, optional
+            Structured array (or view) of the spots to update; defaults to all spots.
+        """
+        self._updateSpots(dataSet)
+
+    def _updateSpots(self, dataSet: np.ndarray | None = None,
+                     unset: frozenset[str] = frozenset(),
+                     known: dict[str, tuple[list, np.ndarray]] | None = None,
+                     new: bool = False) -> None:
+        """
+        Implementation of :meth:`updateSpots`.
+
+        The spots are grouped by style (see :meth:`_uniqueStyles`): the symbol atlas
+        is queried once per distinct style, and the atlas positions are then
+        broadcast to the spots with a single vectorized assignment.
+
+        Parameters
+        ----------
+        dataSet : numpy.ndarray, optional
+            Structured array (or view) of the spots to update; defaults to all spots.
+        unset : frozenset of str, default frozenset()
+            Style columns known to hold only their initial unset value in
+            ``dataSet``, which are then not scanned.
+        known : dict, optional
+            Known grouping ``(reps, codes)`` of style columns of ``dataSet``, keyed by
+            column name (see :meth:`_setStyleColumn`).
+        new : bool, default False
+            True when all the spots of ``dataSet`` are new (see :meth:`addPoints`): they
+            are all looked up, without scanning their atlas positions first.
+        """
         profiler = debug.Profiler()  # noqa: profiler prints on GC
         if dataSet is None:
             dataSet = self.data
 
         invalidate = False
         if self.opts['pxMode'] and self.opts['useCache']:
-            mask = dataSet['sourceRect']['w'] == 0
-            if np.any(mask):
+            if new:
+                lookup, idx = len(dataSet) > 0, None
+            else:
+                mask = dataSet['sourceRect']['w'] == 0
+                lookup = bool(np.any(mask))
+                idx = None if lookup and mask.all() else mask
+            if lookup:
                 invalidate = True
-                coords = self.fragmentAtlas[
-                    list(zip(*self._style(['symbol', 'size', 'pen', 'brush'], data=dataSet, idx=mask)))
-                ]
-                dataSet['sourceRect'][mask] = coords
+                styles, inverse = self._uniqueStyles(dataSet, idx, unset,
+                                                     known if idx is None else None)
+                sourceRect = dataSet['sourceRect']
+                coords = np.array(self.fragmentAtlas[styles], dtype=sourceRect.dtype)
+                coords = coords[0] if inverse is None else coords[inverse]
+                if idx is None:
+                    sourceRect[...] = coords
+                else:
+                    sourceRect[idx] = coords
 
             self._maybeRebuildAtlas()
         else:
@@ -822,12 +1665,151 @@ class ScatterPlotItem(GraphicsObject):
         if invalidate:
             self.invalidate()
 
-    def _maybeRebuildAtlas(self, threshold=4, minlen=1000):
+    def _uniqueStyles(self, data: np.ndarray, idx: np.ndarray | None = None,
+                      unset: frozenset[str] = frozenset(),
+                      known: dict[str, tuple[list, np.ndarray]] | None = None
+                      ) -> tuple[list[tuple], np.ndarray | None]:
+        """
+        Group spots by effective style.
+
+        The effective style is the one :meth:`_style` gives (item defaults for unset
+        entries, hover style for hovered spots), with sizes quantized as in the
+        symbol atlas (see :func:`_quantizeSize`). Each style column is coded with
+        numpy, by object identity for symbols, pens and brushes and by value for
+        sizes; the codes are then combined. Only the distinct combinations are turned
+        into Python tuples.
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Structured spot array.
+        idx : numpy.ndarray, optional
+            Boolean mask selecting the spots; defaults to all spots.
+        unset : frozenset of str, default frozenset()
+            Style columns known to hold only their initial unset value.
+        known : dict, optional
+            Known grouping ``(reps, codes)`` of style columns of all the spots of
+            ``data``, keyed by column name; only used when ``idx`` is ``None``.
+
+        Returns
+        -------
+        styles : list of tuple
+            The distinct ``(symbol, size, pen, brush)`` styles. Objects that are
+            distinct but equal give distinct styles, which the atlas merges.
+        inverse : numpy.ndarray or None
+            Index in ``styles`` of each selected spot, or ``None`` when all the
+            spots have the style ``styles[0]``.
+        """
+        n = len(data) if idx is None else int(np.count_nonzero(idx))
+        if n == 0:
+            return [], np.zeros(0, dtype=np.intp)
+        hovered = None
+        if self.opts['hoverable']:
+            hovered = data['hovered'] if idx is None else data['hovered'][idx]
+            if not hovered.any():
+                hovered = None
+        step = 4 * self.fragmentAtlas.devicePixelRatio()
+        if known is None or idx is not None:
+            known = {}
+
+        reps = []   # per style column: the distinct values
+        codes = []  # per style column: index in reps of each spot, or None if uniform
+        for opt in ('symbol', 'size', 'pen', 'brush'):
+            default = self.opts[opt]
+            if opt in unset:
+                colReps, colCodes = [default], None
+            elif opt in known:
+                colReps, colCodes = known[opt]
+                if len(colReps) == 1:
+                    colCodes = None
+            elif opt == 'size':
+                col = data['size'] if idx is None else data['size'][idx]
+                col = np.where(col == _DEFAULT_STYLE['size'], default, col)
+                colReps, colCodes = _groupValues(_quantizeSizes(col, step))
+            else:
+                col = data[opt] if idx is None else data[opt][idx]
+                colReps, colCodes = _groupObjects(col.tolist())
+                colReps = [default if rep is None else rep for rep in colReps]
+                if opt == 'symbol':
+                    colReps, colCodes = _mergeEqual(colReps, colCodes)
+
+            hoverValue = self.opts['hover' + opt.title()]
+            if hovered is not None and hoverValue != _DEFAULT_STYLE[opt]:
+                if opt == 'size':
+                    hoverValue = _quantizeSize(hoverValue, step)
+                if colCodes is None:
+                    colCodes = np.zeros(n, dtype=np.intp)
+                else:
+                    colCodes = colCodes.copy()  # known codes may be shared
+                colCodes[hovered] = len(colReps)
+                colReps = colReps + [hoverValue]
+            reps.append(colReps)
+            codes.append(colCodes)
+
+        active = [i for i, colCodes in enumerate(codes) if colCodes is not None]
+        if not active:
+            return [tuple(colReps[0] for colReps in reps)], None
+        if len(active) == 1:
+            # a single varying column: its codes index the styles directly
+            col = active[0]
+            styles = [tuple(rep if i == col else reps[i][0] for i in range(4))
+                      for rep in reps[col]]
+            return styles, codes[col]
+
+        combined = codes[active[0]].astype(np.int64)
+        radix = len(reps[active[0]])
+        for col in active[1:]:
+            size = len(reps[col])
+            if radix * size >= 2 ** 62:
+                # renumber the combinations seen so far to avoid an overflow
+                _, combined = np.unique(combined, return_inverse=True)
+                radix = int(combined.max()) + 1
+            combined = combined * size + codes[col]
+            radix *= size
+        unique, inverse = np.unique(combined, return_inverse=True)
+        styles = []
+        for i in _representatives(inverse, len(unique)).tolist():
+            styles.append(tuple(colReps[0] if colCodes is None else colReps[colCodes[i]]
+                                for colReps, colCodes in zip(reps, codes)))
+        return styles, inverse
+
+    def _atlasEntriesInUse(self) -> int:
+        """
+        Count the symbol atlas entries used by the spots.
+
+        Returns
+        -------
+        int
+            Number of distinct atlas positions referenced by the spots.
+        """
+        sr = self.data['sourceRect']
+        sr = sr[sr['w'] != 0]
+        return len(np.unique((sr['x'].astype(np.int64) << 32) | sr['y'].astype(np.int64)))
+
+    def _maybeRebuildAtlas(self, threshold: int = 4, minlen: int = 1000) -> None:
+        """
+        Rebuild the symbol atlas with the styles in use when it holds too many entries.
+
+        The atlas is rebuilt when it holds more than ``minlen`` entries and more than
+        ``threshold`` entries per spot, or when it holds more than
+        ``self._atlasMaxEntries`` entries of which less than half are in use. The
+        second rule bounds the atlas when the styles keep changing, for instance with
+        colors that follow a live value; requiring half of the entries to be unused
+        avoids rebuilding at every update when the styles in use alone exceed the cap.
+
+        Parameters
+        ----------
+        threshold : int, default 4
+            Maximum number of atlas entries per spot.
+        minlen : int, default 1000
+            Number of atlas entries below which the per-spot rule does not apply.
+        """
         n = len(self.fragmentAtlas)
-        if (n > minlen) and (n > threshold * len(self.data)):
-            self.fragmentAtlas.rebuild(
-                list(zip(*self._style(['symbol', 'size', 'pen', 'brush'])))
-            )
+        rebuild = n > minlen and n > threshold * len(self.data)
+        if not rebuild and n > self._atlasMaxEntries:
+            rebuild = n > 2 * self._atlasEntriesInUse()
+        if rebuild:
+            self.fragmentAtlas.rebuild(self._uniqueStyles(self.data)[0])
             self.data['sourceRect'] = 0
             self.updateSpots()
 
@@ -1033,15 +2015,6 @@ class ScatterPlotItem(GraphicsObject):
             scale = 1.0
 
         if self.opts['pxMode'] is True:
-            # Cull points that are outside view
-            viewMask = self._maskAt(self.viewRect())
-
-            # Map points using painter's world transform so they are drawn with pixel-valued sizes
-            pts = np.vstack([self.data['x'], self.data['y']])
-            pts = fn.transformCoordinates(p.transform(), pts)
-            pts = fn.clip_array(pts, -2 ** 30, 2 ** 30)  # prevent Qt segmentation fault.
-            p.resetTransform()
-
             if self.opts['useCache'] and self._exportOpts is False:
                 # Draw symbols from pre-rendered atlas
 
@@ -1054,26 +2027,30 @@ class ScatterPlotItem(GraphicsObject):
                     self.data['sourceRect'] = 0
                     self.updateSpots()
 
-                # x, y is the center of the target rect
-                xy = pts[:, viewMask].T
-                sr = self.data['sourceRect'][viewMask]
-
-                self._pixmapFragments.resize(sr.size)
-                frags = self._pixmapFragments.ndarray()
-                frags[:, 0:2] = xy
-                frags[:, 2:6] = np.frombuffer(sr, dtype=int).reshape((-1, 4)) # sx, sy, sw, sh
-                frags[:, 6:10] = [1/dpr, 1/dpr, 0.0, 1.0]   # scaleX, scaleY, rotation, opacity
+                # Cull points that are outside view, and map the others using the
+                # painter's world transform so they are drawn with pixel-valued sizes
+                self._prepareFragments(p.transform(), self.viewRect(), dpr)
+                p.resetTransform()
 
                 profiler('prep')
                 drawargs = self._pixmapFragments.drawargs()
                 p.drawPixmapFragments(*drawargs, self.fragmentAtlas.pixmap)
                 profiler('draw')
             else:
+                # Cull points that are outside view
+                viewMask = self._maskAt(self.viewRect())
+
+                # Map points using painter's world transform so they are drawn with pixel-valued sizes
+                arrays = self._spotArrays()
+                pts = np.empty((np.count_nonzero(viewMask), 2))
+                _mapPoints(p.transform(), arrays.x[viewMask], arrays.y[viewMask], pts)
+                p.resetTransform()
+
                 # render each symbol individually
                 p.setRenderHint(p.RenderHint.Antialiasing, aa)
 
                 for pt, style in zip(
-                        pts[:, viewMask].T,
+                        pts,
                         zip(*(self._style(['symbol', 'size', 'pen', 'brush'], idx=viewMask, scale=scale)))
                 ):
                     p.resetTransform()
@@ -1098,6 +2075,7 @@ class ScatterPlotItem(GraphicsObject):
             self.picture.play(p)
 
     def points(self):
+        self._dataShared = True  # SpotItems and the 'item' column view are handed out
         m = np.equal(self.data['item'], None)
         for i in np.argwhere(m)[:, 0]:
             rec = self.data[i]
@@ -1124,6 +2102,8 @@ class ScatterPlotItem(GraphicsObject):
             Object array of :class:`SpotItem`, in the order of ``idx``.
         """
         items = self.data['item']
+        if len(idx):
+            self._dataShared = True  # the SpotItems are views of self.data
         for i in idx.tolist():
             if items[i] is None:
                 items[i] = SpotItem(self.data[i], self, i)
@@ -1148,50 +2128,222 @@ class ScatterPlotItem(GraphicsObject):
         """
         return self._pointsForIndices(np.flatnonzero(self._maskAt(pos))[::-1])
 
-    def _maskAt(self, obj):
+    def _prepareFragments(self, transform: QtGui.QTransform, viewRect: QtCore.QRectF,
+                          dpr: float) -> None:
         """
-        Return a boolean mask indicating all points that overlap obj, a QPointF or QRectF.
+        Fill the pixmap fragment array with the spots visible in a view rectangle.
+
+        Spots are culled with the test of :meth:`_maskAt`, on contiguous arrays and
+        with a scalar margin when all the symbols have the same size; culling is
+        skipped altogether when all the spots lie inside the view. (A scalar margin
+        for varied sizes would keep more spots, which are not always invisible: the
+        test under-estimates the extent of symbols in rotated items.) Only the kept
+        spots are mapped to device coordinates.
+
+        Each pass over the fragment array (80 bytes per row) touches all of its
+        memory, so the columns are computed in a contiguous block and copied in one
+        pass, and the columns already in place are not written again: the source
+        rects when they are uniform or belong to the same spots as in the previous
+        paint, and the constant scale, rotation and opacity columns.
+
+        Parameters
+        ----------
+        transform : QtGui.QTransform
+            Item to device transform of the painter.
+        viewRect : QtCore.QRectF
+            Visible area, in item coordinates.
+        dpr : float
+            Device pixel ratio of the symbol atlas.
+        """
+        left, right, top, bottom = self._rectEdges(viewRect)
+        arrays = self._spotArrays()
+        x, y = arrays.x, arrays.y
+        bounds = arrays.bounds
+        if (arrays.allVisible and bounds is not None and bounds[0] > left
+                and bounds[1] < right and bounds[2] > top and bounds[3] < bottom):
+            mask = None  # all the spots are inside the view
+        else:
+            # the operations of _maskAt, which give the same values
+            px, py = self._pixelLengths()
+            mx = arrays.halfWidth * px
+            my = arrays.halfHeight * py
+            mask = x + mx > left
+            mask &= x - mx < right
+            mask &= y + my > top
+            mask &= y - my < bottom
+            if not arrays.allVisible:
+                mask &= arrays.visible
+            x, y = x[mask], y[mask]
+
+        n = len(x)
+        self._pixmapFragments.resize(n)
+        if n == 0:
+            self._fragmentRects = self._fragmentConstants = None
+            return
+        frags = self._pixmapFragments.ndarray()
+        # The address identifies the buffer: a reallocated buffer is created while the
+        # previous one, whose state is recorded, still exists, so it gets another
+        # address (and the states are dropped when the buffer is emptied above).
+        address = frags.__array_interface__['data'][0]
+
+        if arrays.uniformRect is not None:
+            rectKey = (address, 'uniform', arrays.uniformRect)
+        elif mask is None:
+            rectKey = (address, 'all', arrays.serial)
+        else:
+            rectKey = None  # rects of a subset of the spots: not reusable
+        if self._fragmentRows(self._fragmentRects, rectKey, n):
+            positions = np.empty((n, 2))
+            _mapPoints(transform, x, y, positions)
+            frags[:, 0:2] = positions  # target center x, y
+        else:
+            block = np.empty((n, 6))
+            _mapPoints(transform, x, y, block[:, 0:2])
+            if arrays.uniformRect is not None:
+                block[:, 2:6] = arrays.uniformRect  # sx, sy, sw, sh
+            elif mask is None:
+                block[:, 2:6] = arrays.sourceRect
+            else:
+                block[:, 2:6] = arrays.sourceRect[mask]
+            frags[:, 0:6] = block
+            self._fragmentRects = self._writtenRows(self._fragmentRects, rectKey, n)
+
+        constKey = (address, dpr)
+        if not self._fragmentRows(self._fragmentConstants, constKey, n):
+            frags[:, 6:10] = [1/dpr, 1/dpr, 0.0, 1.0]   # scaleX, scaleY, rotation, opacity
+            self._fragmentConstants = self._writtenRows(self._fragmentConstants, constKey, n)
+
+    @staticmethod
+    def _fragmentRows(state: tuple | None, key: tuple | None, n: int) -> bool:
+        """
+        Tell whether fragment columns are already in place for ``n`` rows.
+
+        Parameters
+        ----------
+        state : tuple or None
+            ``(key, rows)`` recorded when the columns were last written, or ``None``.
+        key : tuple or None
+            Key of the columns needed now (fragment buffer address and contents);
+            ``None`` when they cannot be reused.
+        n : int
+            Number of fragments.
+
+        Returns
+        -------
+        bool
+            True if the first ``n`` rows already hold the columns.
+        """
+        return key is not None and state is not None and state[0] == key and state[1] >= n
+
+    @staticmethod
+    def _writtenRows(state: tuple | None, key: tuple | None, n: int) -> tuple | None:
+        """
+        Return the state to record after writing fragment columns for ``n`` rows.
+
+        Parameters
+        ----------
+        state : tuple or None
+            Previous ``(key, rows)`` state.
+        key : tuple or None
+            Key of the columns written; ``None`` when they cannot be reused.
+        n : int
+            Number of rows written.
+
+        Returns
+        -------
+        tuple or None
+            The new ``(key, rows)`` state; rows written earlier with the same key stay
+            valid.
+        """
+        if key is None:
+            return None
+        if state is not None and state[0] == key:
+            return key, max(n, state[1])
+        return key, n
+
+    @staticmethod
+    def _rectEdges(obj: QtCore.QPointF | QtCore.QRectF) -> tuple[float, float, float, float]:
+        """
+        Return the edges of a point or a rectangle.
+
+        Parameters
+        ----------
+        obj : QtCore.QPointF or QtCore.QRectF
+            Point or rectangle.
+
+        Returns
+        -------
+        tuple of float
+            ``(left, right, top, bottom)``.
+
+        Raises
+        ------
+        TypeError
+            If ``obj`` is neither a ``QPointF`` nor a ``QRectF``.
         """
         if isinstance(obj, QtCore.QPointF):
-            l = r = obj.x()
-            t = b = obj.y()
+            return obj.x(), obj.x(), obj.y(), obj.y()
         elif isinstance(obj, QtCore.QRectF):
-            l = obj.left()
-            r = obj.right()
-            t = obj.top()
-            b = obj.bottom()
-        else:
-            raise TypeError
+            return obj.left(), obj.right(), obj.top(), obj.bottom()
+        raise TypeError
+
+    def _pixelLengths(self) -> tuple[float, float]:
+        """
+        Return the length of a device pixel in the local x and y directions.
+
+        Returns
+        -------
+        tuple of float
+            ``(px, py)``, 0 where unknown.
+        """
+        px, py = self.pixelVectors()
+        try:
+            px = 0 if px is None else px.length()
+        except OverflowError:
+            px = 0
+        try:
+            py = 0 if py is None else py.length()
+        except OverflowError:
+            py = 0
+        return px, py
+
+    def _maskAt(self, obj: QtCore.QPointF | QtCore.QRectF) -> np.ndarray:
+        """
+        Return a boolean mask indicating all points that overlap obj, a QPointF or QRectF.
+
+        Parameters
+        ----------
+        obj : QtCore.QPointF or QtCore.QRectF
+            Point or rectangle, in item coordinates.
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean mask over the spots, ``True`` for the visible spots overlapping
+            ``obj``.
+        """
+        l, r, t, b = self._rectEdges(obj)
+        arrays = self._spotArrays()
 
         if self.opts['pxMode'] and self.opts['useCache']:
-            w = self.data['sourceRect']['w']
-            h = self.data['sourceRect']['h']
+            w = arrays.halfWidth
+            h = arrays.halfHeight
         else:
             s, = self._style(['size'])
-            w = h = s
-
-        w = w / 2
-        h = h / 2
+            w = s / 2
+            h = s / 2
 
         if self.opts['pxMode']:
             # determine length of pixel in local x, y directions
-            px, py = self.pixelVectors()
-            try:
-                px = 0 if px is None else px.length()
-            except OverflowError:
-                px = 0
-            try:
-                py = 0 if py is None else py.length()
-            except OverflowError:
-                py = 0
-            w *= px
-            h *= py
+            px, py = self._pixelLengths()
+            w = w * px  # not in place: w may be a cached array
+            h = h * py
 
-        return (self.data['visible']
-                & (self.data['x'] + w > l)
-                & (self.data['x'] - w < r)
-                & (self.data['y'] + h > t)
-                & (self.data['y'] - h < b))
+        return (arrays.visible
+                & (arrays.x + w > l)
+                & (arrays.x - w < r)
+                & (arrays.y + h > t)
+                & (arrays.y - h < b))
 
     def mouseClickEvent(self, ev):
         if ev.button() == QtCore.Qt.MouseButton.LeftButton:

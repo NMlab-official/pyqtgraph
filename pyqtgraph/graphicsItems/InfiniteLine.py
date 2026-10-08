@@ -645,6 +645,9 @@ class InfiniteLine(GraphicsObject):
         """
         Keep the cached bounds up to date when the line moves within its view.
 
+        The labels of the line (:class:`InfLineLabel`) are also updated when the
+        transform or the parent of the line changes.
+
         Parameters
         ----------
         change : QtWidgets.QGraphicsItem.GraphicsItemChange
@@ -667,6 +670,18 @@ class InfiniteLine(GraphicsObject):
             if tracking:
                 GraphicsItem.viewTransformChanged(self)  # the local view rect moved
                 self._updateBoundingRect()
+                if change != QtWidgets.QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+                    # the labels keep their scale and orientation relative to the
+                    # line without checking the transform before each paint
+                    for child in self.childItems():
+                        if isinstance(child, InfLineLabel):
+                            child.updateTransform()
+        elif change == QtWidgets.QGraphicsItem.GraphicsItemChange.ItemParentHasChanged:
+            # whether the labels must check their transform before each paint
+            # depends on the parent of the line (see InfLineLabel._needsPaintSync)
+            for child in self.childItems():
+                if isinstance(child, InfLineLabel):
+                    child._updatePaintSync()
         return ret
 
     def setName(self, name):
@@ -845,6 +860,25 @@ class InfLineLabel(TextItem):
         GraphicsItem.viewTransformChanged(self)
         self.updatePosition()
         TextItem.viewTransformChanged(self)
+
+    def _needsPaintSync(self) -> bool:
+        """
+        Return whether the transform must be checked before every paint.
+
+        The line updates the transform of its labels when its own transform changes
+        (see :meth:`InfiniteLine.itemChange`), so a label only needs to check its
+        transform before every paint when the line is not a direct child of a
+        :class:`ViewBox`.
+
+        Returns
+        -------
+        bool
+            True if the label has to connect to ``sigPrepareForPaint``.
+        """
+        line = self.parentItem()
+        if line is not self.line:
+            return TextItem._needsPaintSync(self)
+        return not self._isViewChild(line.parentItem())
 
     def _posToRel(self, pos):
         # convert local position to relative position along line between view bounds

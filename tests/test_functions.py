@@ -438,6 +438,21 @@ def test_arrayToQPath(xs, ys, connect, expected):
         assert eq(expected[i], (element.type, element.x, element.y))
 
 
+@pytest.mark.parametrize('n', [9999, 10000, 10001, 20000, 20001, 30001, 30002])
+@pytest.mark.parametrize('finiteCheck', [True, False])
+def test_arrayToQPath_all_keeps_every_point(n, finiteCheck):
+    # long paths are built by chunks of 10000 points: a last chunk of a single point
+    # used to be ignored by QPainterPath.connectPath, losing the last segment
+    x = np.arange(n, dtype=np.float64)
+    y = np.sin(x / 100.0)
+    path = arrayToQPath(x, y, connect='all', finiteCheck=finiteCheck)
+    assert path.elementCount() == n
+    last = path.elementAt(n - 1)
+    assert (last.x, last.y) == (x[-1], y[-1])
+    assert path.elementAt(0).isMoveTo()
+    assert not any(path.elementAt(i).isMoveTo() for i in range(1, n))
+
+
 def test_ndarray_from_qpolygonf():
     # test that we get an empty ndarray from an empty QPolygonF
     poly = pg.functions.create_qpolygonf(0)

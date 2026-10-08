@@ -10,6 +10,14 @@ from .mouseEvents import HoverEvent, MouseClickEvent, MouseDragEvent
 
 getMillis = lambda: perf_counter_ns() // 10 ** 6
 
+# QCoreApplication.sendPostedEvents takes the event type as an int
+_LAYOUT_REQUEST = int(getattr(QtCore.QEvent.Type.LayoutRequest, 'value',
+                              QtCore.QEvent.Type.LayoutRequest))
+
+# Maximum number of prepareForPaint passes before Qt computes the regions to repaint,
+# see GraphicsScene.event.
+_MAX_PREPARE_PASSES = 6
+
 
 __all__ = ['GraphicsScene']
 
@@ -81,6 +89,11 @@ class GraphicsScene(QtWidgets.QGraphicsScene):
     sigItemRemoved = QtCore.Signal(object)  ## emits the item object just removed
 
     _addressCache = weakref.WeakValueDictionary()
+
+    # Set by requestPrepare: prepareForPaint must run before the next processing of
+    # the dirty items, see event(). A class attribute, as events reach event() while
+    # QGraphicsScene.__init__ runs.
+    _prepareRequested = False
     
     ExportDirectory = None
 
@@ -115,7 +128,70 @@ class GraphicsScene(QtWidgets.QGraphicsScene):
         be rendered by emitting sigPrepareForPaint.
         
         This allows items to delay expensive processing until they know a paint will be required."""
+        self._prepareRequested = False
         self.sigPrepareForPaint.emit()
+
+    def requestPrepare(self) -> None:
+        """
+        Request :meth:`prepareForPaint` before Qt computes the regions to repaint.
+
+        Items whose deferred work changes the geometry or the transformation of other
+        items, such as the auto-range and the view transformation of a
+        :class:`ViewBox <pyqtgraph.ViewBox>` or the tick labels of an
+        :class:`AxisItem <pyqtgraph.AxisItem>`, which set its size, call this method
+        when that work becomes pending. The work then happens before Qt processes the items marked dirty,
+        and the changes it makes are repainted in the same pass instead of a second
+        one. :meth:`GraphicsView.paintEvent <pyqtgraph.GraphicsView.paintEvent>`
+        still calls :meth:`prepareForPaint` in any case.
+        """
+        self._prepareRequested = True
+
+    def event(self, ev: QtCore.QEvent) -> bool:
+        """
+        Handle scene events, running a requested :meth:`prepareForPaint` first.
+
+        Parameters
+        ----------
+        ev : QtCore.QEvent
+            The event.
+
+        Returns
+        -------
+        bool
+            Whether the event was recognized and processed.
+        """
+        # Qt processes the items marked dirty in QGraphicsScene's private slot
+        # _q_processDirtyItems, which markDirty() invokes with a queued connection:
+        # it reaches the scene as a QEvent.Type.MetaCall event (the same in Qt 5 and
+        # Qt 6). Preparing on the first MetaCall after a request, and only then,
+        # updates the auto-range and the view transformations before the regions to
+        # repaint are computed. Otherwise prepareForPaint ran in
+        # GraphicsView.paintEvent, during the paint, and the new transformation
+        # dirtied the items again, which cost a second full paint per update.
+        # Hidden views are not prepared: as before, their deferred work waits for
+        # the next paint.
+        if (
+            self._prepareRequested
+            and ev.type() == QtCore.QEvent.Type.MetaCall
+            and any(view.isVisible() for view in self.views())
+        ):
+            # Layouts invalidated while preparing, e.g. by an axis whose tick labels
+            # need a new size, would otherwise be applied after the paint and
+            # repainted again: their posted LayoutRequest events are delivered after
+            # each pass. Another pass follows if more work was requested meanwhile:
+            # by a view resized by the layout, by a linked view whose range changed
+            # after it was prepared, by an axis whose range changed. In a PlotItem,
+            # an auto-range changing the width of an axis takes four passes: the
+            # auto-range; the axis measuring its labels, then the layout; the
+            # auto-range and the axis pictures for the new size; a last pass finding
+            # nothing left. Grids of plots take one more. The bound stops work that
+            # would not converge, which GraphicsView.paintEvent then prepares.
+            for _ in range(_MAX_PREPARE_PASSES):
+                self.prepareForPaint()
+                QtCore.QCoreApplication.sendPostedEvents(None, _LAYOUT_REQUEST)
+                if not self._prepareRequested:
+                    break
+        return super().event(ev)
     
 
     def setClickRadius(self, r: int):
