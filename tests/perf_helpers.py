@@ -10,7 +10,7 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Callable, Iterator
 
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 __all__ = ['CallCounter', 'count_calls', 'process_events', 'paints_per_update']
 
@@ -101,22 +101,61 @@ def process_events(passes: int = 3) -> None:
         app.processEvents()
 
 
-def paints_per_update(widget: QtWidgets.QWidget, item_class: type,
+class _PaintEventCounter(QtCore.QObject):
+    """
+    Event filter counting the paint events received by the objects it is installed on.
+
+    An event filter sees the events of any binding, unlike a Python method patched onto
+    a class after its instances were created: PySide6 does not dispatch such virtual
+    method calls to the patch.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.count = 0
+
+    def eventFilter(self, obj: QtCore.QObject, ev: QtCore.QEvent) -> bool:
+        """
+        Count ``ev`` if it is a paint event; never filter it out.
+
+        Parameters
+        ----------
+        obj : QtCore.QObject
+            The object receiving the event.
+        ev : QtCore.QEvent
+            The event.
+
+        Returns
+        -------
+        bool
+            Always False: the event is delivered normally.
+        """
+        if ev.type() == QtCore.QEvent.Type.Paint:
+            self.count += 1
+        return False
+
+
+def paints_per_update(widget: QtWidgets.QWidget, item_class: type | None,
                       update_fn: Callable[[int], object], n: int = 20,
                       warmup: int = 3) -> float:
     """
-    Average number of ``paint`` calls of ``item_class`` per update.
+    Average number of times the widget is painted per update.
 
     The widget is shown, ``update_fn`` is called ``warmup`` times without counting, then
-    ``n`` times while counting the paints of ``item_class``. Events are processed after
-    each update, as in an application event loop.
+    ``n`` times while counting the paint events of the widget's viewport (the widget
+    itself if it is not a scroll area). Events are processed after each update, as in
+    an application event loop. Each viewport paint event paints all the items of the
+    region to repaint, so this is the number of paints of the updated items, with any
+    Qt binding.
 
     Parameters
     ----------
     widget : QtWidgets.QWidget
-        Widget displaying the item, e.g. a ``PlotWidget``.
-    item_class : type
-        Class whose ``paint`` calls are counted, e.g. ``PlotCurveItem``.
+        Widget displaying the items, e.g. a ``PlotWidget``.
+    item_class : type or None
+        Unused, kept for compatibility. The ``paint`` calls of this class used to be
+        counted, by patching the method, which PySide6 does not call for existing
+        items; the paint events of the viewport are counted instead.
     update_fn : callable
         Function performing one update; receives the update index.
     n : int, default 20
@@ -129,13 +168,21 @@ def paints_per_update(widget: QtWidgets.QWidget, item_class: type,
     float
         Mean number of paints per update; 1.0 means each update is painted once.
     """
+    if isinstance(widget, QtWidgets.QAbstractScrollArea):
+        target = widget.viewport()
+    else:
+        target = widget
     widget.show()
     process_events(5)
     for i in range(warmup):
         update_fn(i)
         process_events()
-    with count_calls(item_class, 'paint') as paints:
+    counter = _PaintEventCounter()
+    target.installEventFilter(counter)
+    try:
         for i in range(warmup, warmup + n):
             update_fn(i)
             process_events()
-    return paints.count / n
+    finally:
+        target.removeEventFilter(counter)
+    return counter.count / n
