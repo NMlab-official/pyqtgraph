@@ -590,3 +590,99 @@ def test_update_is_immediate_without_view_dependency():
     with count_calls(pg.PlotCurveItem, 'setData') as calls:
         item.setData(np.arange(10.0))
     assert calls.count == 1 and not item._displayDirty
+
+
+# --------------------------------------------------------------------------------------
+# T2.5: styles are only forwarded when they changed (regression tests for #1653)
+# --------------------------------------------------------------------------------------
+
+def _scatter_colors(item: pg.PlotDataItem) -> list[str]:
+    return [p.brush().color().name() for p in item.scatter.points()]
+
+
+def _scatter_symbols(item: pg.PlotDataItem) -> list[str]:
+    return [p.symbol() for p in item.scatter.points()]
+
+
+def test_per_point_scatter_styles_kept_with_same_length():
+    brushes = [pg.mkBrush(c) for c in ('r', 'g', 'b')]
+    item = pg.PlotDataItem([0, 1, 2], [3, 4, 5], symbol=['o', 's', 't'],
+                           symbolBrush=brushes, symbolSize=[5, 6, 7], data=['a', 'b', 'c'])
+    expected = ['#ff0000', '#00ff00', '#0000ff']
+    assert _scatter_colors(item) == expected
+    item.setData([0, 1, 2], [5, 4, 3])
+    assert _scatter_colors(item) == expected
+    assert _scatter_symbols(item) == ['o', 's', 't']
+    assert [p.size() for p in item.scatter.points()] == [5, 6, 7]
+    assert [p.data() for p in item.scatter.points()] == ['a', 'b', 'c']
+    np.testing.assert_array_equal(item.scatter.getData()[1], [5, 4, 3])
+
+
+def test_per_point_scatter_styles_with_different_length():
+    brushes = [pg.mkBrush(c) for c in ('r', 'g', 'b')]
+    item = pg.PlotDataItem([0, 1, 2], [3, 4, 5], symbolBrush=brushes)
+    # new per-point styles given with data of another length are applied
+    item.setData([0, 1, 2, 3], [5, 4, 3, 2], symbolBrush=brushes + [pg.mkBrush('y')])
+    assert _scatter_colors(item) == ['#ff0000', '#00ff00', '#0000ff', '#ffff00']
+    # and kept by a following update of the same length
+    item.setData([0, 1, 2, 3], [1, 2, 3, 4])
+    assert _scatter_colors(item) == ['#ff0000', '#00ff00', '#0000ff', '#ffff00']
+    # per-point styles that do not match the new length are rejected, as before
+    with pytest.raises(Exception):
+        item.setData([0, 1], [1, 2])
+
+
+def test_uniform_scatter_style_kept_with_new_data():
+    item = pg.PlotDataItem([0, 1, 2], [3, 4, 5], symbol='s', symbolBrush='r', symbolSize=4)
+    item.setData([0, 1, 2, 3, 4], [5, 4, 3, 2, 1])
+    assert _scatter_colors(item) == ['#ff0000'] * 5
+    assert _scatter_symbols(item) == ['s'] * 5
+    item.setSymbolBrush('g')
+    item.setData([0, 1], [5, 4])
+    assert _scatter_colors(item) == ['#00ff00'] * 2
+
+
+def test_streaming_does_not_forward_unchanged_styles():
+    item = pg.PlotDataItem(np.arange(10.0), pen='r', fillLevel=0.0, brush='b', symbol='o')
+    with count_calls(pg.PlotCurveItem, 'setPen') as pens, \
+            count_calls(pg.PlotCurveItem, 'setBrush') as brushes, \
+            count_calls(pg.PlotCurveItem, 'setFillLevel') as levels, \
+            count_calls(pg.PlotCurveItem, 'setShadowPen') as shadows, \
+            count_calls(pg.ScatterPlotItem, 'setBrush') as symbol_brushes:
+        for k in range(10):
+            item.setData(np.arange(10.0) * k)
+        item.appendData(10.0)
+    assert (pens.count, brushes.count, levels.count, shadows.count) == (0, 0, 0, 0)
+    assert symbol_brushes.count == 0
+    # the curve keeps its style
+    assert item.curve.opts['pen'].color().name() == '#ff0000'
+    assert item.curve.opts['fillLevel'] == 0.0
+    # a style change is forwarded
+    with count_calls(pg.PlotCurveItem, 'setPen') as pens:
+        item.setPen('g')
+    assert pens.count == 1
+    assert item.curve.opts['pen'].color().name() == '#00ff00'
+
+
+def test_style_set_before_data_is_applied_with_data():
+    item = pg.PlotDataItem()
+    item.setPen('r')
+    item.setSymbol('t')
+    item.setData([1.0, 2.0, 3.0])
+    assert item.curve.opts['pen'].color().name() == '#ff0000'
+    assert _scatter_symbols(item) == ['t'] * 3
+
+
+def test_connect_follows_the_data_without_style_update():
+    item = pg.PlotDataItem(np.arange(10.0))
+    assert item.curve.opts['connect'] == 'all'
+    y = np.arange(10.0)
+    y[3] = np.nan
+    item.setData(y)
+    assert item.curve.opts['connect'] == 'finite'
+    assert item.curve.opts['skipFiniteCheck'] is False
+    item.setData(np.arange(10.0))
+    assert item.curve.opts['connect'] == 'all'
+    item.setData(np.arange(10.0), connect='pairs')
+    item.setData(np.arange(10.0) + 1)
+    assert item.curve.opts['connect'] == 'pairs'
