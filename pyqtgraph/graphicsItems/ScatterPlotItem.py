@@ -1,7 +1,9 @@
 import itertools
 import math
+import operator
 import weakref
 from collections import OrderedDict
+from collections.abc import Iterator
 
 import numpy as np
 
@@ -136,6 +138,29 @@ def _mkBrush(*args, **kwargs):
         return args[0]
     else:
         return fn.mkBrush(*args, **kwargs)
+
+
+def _isNoneMask(col: np.ndarray) -> np.ndarray:
+    """
+    Return a mask of the entries of an object array that are ``None``.
+
+    The entries are tested by identity. ``np.equal(col, None)`` would instead call the
+    ``__eq__`` method of every entry, which is slow for Qt objects such as ``QPen`` and
+    ``QBrush``.
+
+    Parameters
+    ----------
+    col : numpy.ndarray
+        One-dimensional array, usually of ``object`` dtype.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array of the same length as ``col``, ``True`` where the entry is ``None``.
+    """
+    # iterating over a list is faster than iterating over an object array
+    return np.fromiter(map(operator.is_, col.tolist(), itertools.repeat(None)),
+                       dtype=bool, count=len(col))
 
 
 class SymbolAtlas(object):
@@ -802,7 +827,33 @@ class ScatterPlotItem(GraphicsObject):
             self.data['sourceRect'] = 0
             self.updateSpots()
 
-    def _style(self, opts, data=None, idx=None, scale=None):
+    def _style(self, opts: list[str], data: np.ndarray | None = None,
+               idx: np.ndarray | slice | None = None,
+               scale: float | None = None) -> Iterator[np.ndarray]:
+        """
+        Generate the effective style columns of a set of spots.
+
+        Unset entries (``None`` for ``symbol``, ``pen`` and ``brush``, ``-1`` for
+        ``size``) are replaced by the item default, and hovered spots take the hover
+        style when one is set.
+
+        Parameters
+        ----------
+        opts : list of str
+            Names of the style columns to generate, among ``'symbol'``, ``'size'``,
+            ``'pen'`` and ``'brush'``.
+        data : numpy.ndarray, optional
+            Structured spot array; defaults to ``self.data``.
+        idx : numpy.ndarray or slice, optional
+            Boolean mask or index selecting the spots; defaults to all spots.
+        scale : float, optional
+            Factor applied to the ``size`` column.
+
+        Yields
+        ------
+        numpy.ndarray
+            One new array per name of ``opts``, in the same order.
+        """
         if data is None:
             data = self.data
 
@@ -819,7 +870,12 @@ class ScatterPlotItem(GraphicsObject):
                 if val != _DEFAULT_STYLE[opt]:
                     col[data['hovered'][idx]] = val
 
-            col[np.equal(col, _DEFAULT_STYLE[opt])] = self.opts[opt]
+            default = _DEFAULT_STYLE[opt]
+            if default is None:
+                # identity test: np.equal would call QPen/QBrush.__eq__ per element
+                col[_isNoneMask(col)] = self.opts[opt]
+            else:
+                col[np.equal(col, default)] = self.opts[opt]
 
             if opt == 'size' and scale is not None:
                 col *= scale
