@@ -20,7 +20,7 @@ from pyqtgraph.graphicsItems.AxisItem import _TICK_TEXT_FLAGS, AxisItem, _LRUCac
 from pyqtgraph.graphicsItems.DateAxisItem import HOUR_SPACING
 from pyqtgraph.Point import Point
 from pyqtgraph.Qt import QtCore, QtGui
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -105,8 +105,7 @@ def _make_plot(kind: str) -> pg.PlotWidget:
     widget.resize(700, 400)
     if kind == 'log':
         widget.plotItem.setLogMode(True, True)
-    widget.show()
-    app.processEvents()
+    show_and_wait(widget)
     return widget
 
 
@@ -281,8 +280,7 @@ def test_overridden_tick_strings_are_not_cached():
     axis = PrefixAxis('bottom')
     widget = pg.PlotWidget(axisItems={'bottom': axis})
     widget.resize(700, 400)
-    widget.show()
-    app.processEvents()
+    show_and_wait(widget)
     axis.unlinkFromView()
     axis.setRange(0, 10)
     assert all(text.startswith('a') for _, _, text in _generate(axis)[2])
@@ -305,8 +303,7 @@ def _date_axis() -> tuple[pg.PlotWidget, pg.DateAxisItem]:
     axis = pg.DateAxisItem()
     widget = pg.PlotWidget(axisItems={'bottom': axis})
     widget.resize(700, 400)
-    widget.show()
-    app.processEvents()
+    show_and_wait(widget)
     axis.unlinkFromView()
     axis.setRange(T0, T0 + 86400)
     return widget, axis
@@ -393,8 +390,7 @@ def test_overridden_date_tick_strings_are_not_cached():
     axis = UpperDateAxis()
     widget = pg.PlotWidget(axisItems={'bottom': axis})
     widget.resize(700, 400)
-    widget.show()
-    app.processEvents()
+    show_and_wait(widget)
     axis.unlinkFromView()
     axis.setRange(T0, T0 + 86400)
     assert all(text.endswith('!') for text in _texts(axis))

@@ -324,8 +324,7 @@ def test_no_rebuild_while_hidden():
     lower = pw.plot(X, Y - 1.0)
     fill = pg.FillBetweenItem(upper, lower, brush=(50, 50, 200, 80))
     pw.addItem(fill)
-    pw.show()
-    process_events()
+    show_and_wait(pw)
     fill.hide()
     process_events()
     with count_calls(pg.FillBetweenItem, 'updatePath') as rebuilds:

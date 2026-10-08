@@ -9,7 +9,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -18,8 +18,7 @@ app = pg.mkQApp()
 def plot_widget():
     pw = pg.PlotWidget()
     pw.resize(400, 300)
-    pw.show()
-    process_events()
+    show_and_wait(pw)
     yield pw
     pw.close()
 
@@ -569,8 +568,7 @@ def test_deferred_update_renders_identically(process):
         pw.resize(300, 200)
         item = pw.plot(data_x, data_y, autoDownsample=True, clipToView=True, pen='y')
         pw.setRange(xRange=(5000, 15000), yRange=(y.min(), y.max()), padding=0)
-        pw.show()
-        process_events()
+        show_and_wait(pw)
         return pw, item
 
     pw, item = make(x[:10_000], y[:10_000])
@@ -723,8 +721,7 @@ def test_streaming_peaks_show_the_newest_points(append):
     # the width of the left axis follows its labels: keep it fixed to count paints
     pw.getPlotItem().getAxis('left').setWidth(45)
     item = pw.plot(x[:n], y[:n], autoDownsample=True, downsampleMethod='peak')
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     vb = pw.getViewBox()
     log = _PaintLog()
     pw.viewport().installEventFilter(log)
