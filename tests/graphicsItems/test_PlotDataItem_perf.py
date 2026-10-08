@@ -225,3 +225,118 @@ def test_data_bounds_upper_limit_with_step_mode_and_symbols():
     # the curve spans the step boundaries, the symbols sit at the step centers
     assert item.dataBounds(0) == (0.0, 10.0)
     assert item.dataBounds(1) == (0.0, 9.0)
+
+
+# --------------------------------------------------------------------------------------
+# T2.2: a single O(N) pass per setData
+# --------------------------------------------------------------------------------------
+
+@pytest.fixture
+def full_scans(monkeypatch):
+    """Count numpy reductions and finiteness tests applied to arrays of a given size."""
+    calls: dict[str, int] = {}
+    size = {'n': None}
+
+    def wrap(name):
+        original = getattr(np, name)
+
+        def recording(arr, *args, **kwargs):
+            if size['n'] is not None and np.size(arr) == size['n']:
+                calls[name] = calls.get(name, 0) + 1
+            return original(arr, *args, **kwargs)
+
+        monkeypatch.setattr(np, name, recording)
+
+    for name in ('isfinite', 'min', 'max', 'nanmin', 'nanmax'):
+        wrap(name)
+
+    def start(n):
+        calls.clear()
+        size['n'] = n
+        return calls
+
+    return start
+
+
+def test_set_data_scans_finite_data_once(plot_widget, full_scans):
+    n = 200_003  # a size no other array of the test has
+    rng = np.random.default_rng(0)
+    item = plot_widget.plot()
+    process_events()
+    calls = full_scans(n)
+    item.setData(np.arange(n, dtype=float), rng.normal(size=n))
+    process_events()  # auto-range, bounding rect and paint
+    # one min and one max per axis, no finiteness test of the full arrays
+    assert calls == {'min': 2, 'max': 2}
+    assert item.curve.opts['connect'] == 'all'
+    assert item.curve.opts['skipFiniteCheck'] is True
+
+
+def test_finite_data_connects_all_from_first_set_data():
+    item = pg.PlotDataItem(np.arange(10.0), np.arange(10.0))
+    assert item.curve.opts['connect'] == 'all'
+    assert item.curve.opts['skipFiniteCheck'] is True
+
+
+def test_non_finite_data_still_interrupts_curve():
+    y = np.arange(10.0)
+    y[5] = np.nan
+    item = pg.PlotDataItem(np.arange(10.0), y)
+    assert item.curve.opts['connect'] == 'finite'
+    assert item.curve.opts['skipFiniteCheck'] is False
+    y = np.arange(10.0)
+    y[5] = np.inf
+    item.setData(np.arange(10.0), y)
+    assert item.curve.opts['connect'] == 'finite'
+    # bounds ignore the non-finite value
+    assert item.dataBounds(1) == (0.0, 9.0)
+    path = item.curve.getPath()
+    # the curve is interrupted: two move-to elements
+    moves = [i for i in range(path.elementCount()) if path.elementAt(i).isMoveTo()]
+    assert len(moves) == 2
+
+
+def test_curve_bounds_reuse_precomputed_values():
+    x = np.linspace(-3.0, 7.0, 1000)
+    y = np.sin(x) * 5
+    item = pg.PlotDataItem(x, y)
+    with count_calls(pg.PlotCurveItem, '_computeDataBounds') as scans:
+        assert item.curve.dataBounds(0) == (-3.0, 7.0)
+        assert item.curve.dataBounds(1) == (float(y.min()), float(y.max()))
+    assert scans.count == 0
+    # a partial range is still computed from the data
+    with count_calls(pg.PlotCurveItem, '_computeDataBounds') as scans:
+        item.curve.dataBounds(1, frac=0.5)
+        item.curve.dataBounds(1, orthoRange=(0.0, 1.0))
+    assert scans.count == 2
+    # the same values as computed from the data
+    reference = pg.PlotCurveItem(x, y)
+    for ax in (0, 1):
+        assert item.curve.dataBounds(ax) == reference.dataBounds(ax)
+
+
+def test_curve_bounds_hint_includes_fill_level_and_pen():
+    x = np.arange(10.0)
+    pen = pg.mkPen(width=2, cosmetic=False)
+    item = pg.PlotDataItem(x, x, fillLevel=-5.0, brush='r', pen=pen)
+    reference = pg.PlotCurveItem(x, x, fillLevel=-5.0, brush='r', pen=pen)
+    for ax in (0, 1):
+        assert item.curve.dataBounds(ax) == reference.dataBounds(ax)
+
+
+def test_dynamic_range_limit_uses_displayed_data(plot_widget):
+    # the extreme value lies outside of the clipped x range: no clipping is needed
+    x = np.arange(1000.0)
+    y = np.zeros(1000)
+    y[10] = 1e12
+    item = plot_widget.plot(x, y, clipToView=True)
+    plot_widget.setRange(xRange=(500, 600), yRange=(0, 1), padding=0)
+    process_events()
+    assert not item._drlClipActive
+    x_disp, y_disp = item.getData()
+    assert x_disp[0] >= 499 and y_disp.max() == 0
+    # back to the extreme value: clipping is applied
+    plot_widget.setXRange(0, 100, padding=0)
+    process_events()
+    assert item._drlClipActive
+    assert item.getData()[1].max() < 1e7

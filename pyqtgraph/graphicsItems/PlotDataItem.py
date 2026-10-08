@@ -103,7 +103,7 @@ class PlotDataset:
         xAllFinite: bool | None = None,
         yAllFinite: bool | None = None,
         connect: np.ndarray | None = None
-    ):
+    ) -> None:
         super().__init__()
         self.x = x
         self.y = y
@@ -111,6 +111,9 @@ class PlotDataset:
         self.yAllFinite = yAllFinite
         self.connect = connect
         self._dataRect = None
+        # ((xmin, xmax), (ymin, ymax)) of the finite values, as float. None if not
+        # computed yet, or if an axis holds no finite value.
+        self._finiteBoundsCache: tuple[tuple[float, float], tuple[float, float]] | None = None
 
         if isinstance(x, np.ndarray) and x.dtype.kind in 'iu':
             self.xAllFinite = True
@@ -124,9 +127,14 @@ class PlotDataset:
             return None
         return not (self.xAllFinite and self.yAllFinite)
 
-    def _updateDataRect(self):
+    def _updateDataRect(self) -> None:
         """ 
         Identify plottable bounds and presence of non-finite data.
+
+        Each array is scanned by a single minimum and maximum search. ``NaN``
+        propagates through them and infinite values show up as extremes, so a second
+        pass to locate non-finite values is only needed when the extremes are not
+        finite.
         """
         if self.y is None or self.x is None:
             return None
@@ -136,30 +144,68 @@ class PlotDataset:
             QtCore.QPointF(xmin, ymin),
             QtCore.QPointF(xmax, ymax)
         )
+        bounds = (float(xmin), float(xmax), float(ymin), float(ymax))
+        if all(math.isfinite(b) for b in bounds):
+            self._finiteBoundsCache = (bounds[:2], bounds[2:])
 
     def _getArrayBounds(
         self,
         arr: np.ndarray,
         all_finite: bool | None
     ) -> tuple[float, float, bool]:
-        # here all_finite could be [None, False, True]
-        if not all_finite:  # This may contain NaN or inf values.
-            # We are looking for the bounds of the plottable data set. Infinite and Nan
-            # are ignored.
-            selection = np.isfinite(arr)
-            # True if all values are finite, False if there are any non-finites
-            all_finite = bool(selection.all())
-            if not all_finite:
-                arr = arr[selection]
-        
-        # here all_finite could be [False, True]
-        try:
-            amin = np.min( arr )  # find minimum of all finite values
-            amax = np.max( arr )  # find maximum of all finite values
-        except ValueError:  # is raised when there are no finite values
-            amin = np.nan
-            amax = np.nan
-        return amin, amax, all_finite
+        """
+        Find the bounds of the finite values of an array, and whether all are finite.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            Data array.
+        all_finite : bool or None
+            Previously known finiteness. It is verified, at no extra cost.
+
+        Returns
+        -------
+        amin : float
+            Minimum of the finite values, ``NaN`` if there are none.
+        amax : float
+            Maximum of the finite values, ``NaN`` if there are none.
+        all_finite : bool
+            ``True`` if all values are finite.
+        """
+        if arr.size == 0:
+            return np.nan, np.nan, True if all_finite is None else all_finite
+        with warnings.catch_warnings():
+            # comparisons involving NaN may warn for some dtypes
+            warnings.simplefilter("ignore", RuntimeWarning)
+            amin = np.min(arr)
+            amax = np.max(arr)
+        if np.isfinite(amin) and np.isfinite(amax):
+            # NaN would have propagated, +-inf would be an extreme: all values are finite
+            return amin, amax, True
+        # We are looking for the bounds of the plottable data set. Infinite and NaN
+        # values are ignored.
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:  # there are no finite values
+            return np.nan, np.nan, False
+        return np.min(arr), np.max(arr), False
+
+    def _finiteBounds(self) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        """
+        Get the bounds of the finite values along both axes.
+
+        The bounds are computed together with :meth:`dataRect` and cached. They are
+        the values that :meth:`PlotCurveItem.dataBounds
+        <pyqtgraph.PlotCurveItem.dataBounds>` computes for the full data range.
+
+        Returns
+        -------
+        tuple of tuple of float or None
+            ``((xmin, xmax), (ymin, ymax))`` of the finite values, or ``None`` if an
+            axis holds no finite value.
+        """
+        if self._dataRect is None:
+            self._updateDataRect()
+        return self._finiteBoundsCache
 
     def dataRect(self) -> QtCore.QRectF | None:
         """
@@ -1508,6 +1554,9 @@ class PlotDataItem(GraphicsObject):
                 self.opts['fillLevel'] is not None
             )
         ):  # draw if visible...
+            # A single min/max pass over the displayed data provides both the bounds
+            # handed over to the curve and the finiteness used to select `connect`.
+            bounds = dataset._finiteBounds()
             # auto-switch to indicate non-finite values as interruptions in the curve:
             if (
                 isinstance(curveArgs['connect'], str) and
@@ -1524,7 +1573,7 @@ class PlotDataItem(GraphicsObject):
                     #   use connect='finite' in case there are non-finites.
                     curveArgs['connect'] = 'finite'
                     curveArgs['skipFiniteCheck'] = False
-            self.curve.setData(x=x, y=y, **curveArgs)
+            self.curve.setData(x=x, y=y, _dataBounds=bounds, **curveArgs)
             self.curve.show()
         else:  # ...hide if not.
             self.curve.hide()
@@ -1604,24 +1653,31 @@ class PlotDataItem(GraphicsObject):
                 x = self._dataset.y[:-1]
                 y = np.diff(self._dataset.y) / np.diff(self._dataset.x)
 
-            dataset = PlotDataset(
-                x,
-                y,
-                self._dataset.xAllFinite,
-                self._dataset.yAllFinite
-            )
-            
-            if True in self.opts['logMode']:
-                # Apply log scaling for x and/or y-axis
-                dataset.applyLogMapping( self.opts['logMode'] )
+            if (
+                x is self._dataset.x
+                and y is self._dataset.y
+                and True not in self.opts['logMode']
+            ):
+                # no mapping: share the original dataset, its bounds are cached once
+                dataset = self._dataset
+            else:
+                # finiteness is only known for unchanged arrays
+                dataset = PlotDataset(
+                    x,
+                    y,
+                    self._dataset.xAllFinite if x is self._dataset.x else None,
+                    self._dataset.yAllFinite if y is self._dataset.y else None
+                )
+                if True in self.opts['logMode']:
+                    # Apply log scaling for x and/or y-axis
+                    dataset.applyLogMapping( self.opts['logMode'] )
 
             self._datasetMapped = dataset
         
         # apply processing that affects the on-screen display of data:
-        x = self._datasetMapped.x
-        y = self._datasetMapped.y
-        xAllFinite = self._datasetMapped.xAllFinite
-        yAllFinite = self._datasetMapped.yAllFinite
+        mapped = self._datasetMapped
+        x = mapped.x
+        y = mapped.y
 
         view = self.getViewBox()
         view_range = self._displayViewRange()
@@ -1702,9 +1758,26 @@ class PlotDataItem(GraphicsObject):
                     c[1::2] = connect[:n*ds].reshape(n,ds).all(axis=1)
                     connect = c
 
+        if x is mapped.x and y is mapped.y and connect is None:
+            # nothing changed: share the mapped dataset and its cached bounds
+            dataset = mapped
+        else:
+            # clipping and downsampling preserve finiteness, but values that are not
+            # finite may have been removed: only a positive result is inherited.
+            dataset = PlotDataset(
+                x,
+                y,
+                True if mapped.xAllFinite else None,
+                True if mapped.yAllFinite else None,
+                connect
+            )
+
         clip_active = False
         if self.opts['dynamicRangeLimit'] is not None and view_range is not None:
-            data_range = self._datasetMapped.dataRect()
+            # Only the displayed points matter: the range is that of the displayed y,
+            # which is already clipped to the view and downsampled (the 'peak' method
+            # keeps the extremes). It is cached by the dataset and reused by the curve.
+            data_range = dataset.dataRect()
             # never clip data if it fits into +/- (extended) limit * view height
             if data_range is not None and self._drlClipRequired(data_range, view_range):
                 clip_active = True
@@ -1725,16 +1798,22 @@ class PlotDataItem(GraphicsObject):
                         limit / hyst <= bot_exc <= limit * hyst
                     ):
                         # restore cached values
-                        x = self._datasetDisplay.x
-                        y = self._datasetDisplay.y
+                        dataset = self._datasetDisplay
                         cache_is_good = True
                 if not cache_is_good:
                     min_val = view_range.bottom() - limit * view_height
                     max_val = view_range.top()    + limit * view_height
-                    y = fn.clip_array(y, min_val, max_val)
+                    # clipping replaces infinite values, but keeps NaN
+                    dataset = PlotDataset(
+                        x,
+                        fn.clip_array(y, min_val, max_val),
+                        dataset.xAllFinite,
+                        True if dataset.yAllFinite else None,
+                        connect
+                    )
                     self._drlLastClip = (min_val, max_val)
         self._drlClipActive = clip_active
-        self._datasetDisplay = PlotDataset(x, y, xAllFinite, yAllFinite, connect)
+        self._datasetDisplay = dataset
         self.setProperty('xViewRangeWasChanged', False)
         self.setProperty('yViewRangeWasChanged', False)
 
@@ -1861,7 +1940,7 @@ class PlotDataItem(GraphicsObject):
 
         The dynamic range limiter only modifies the displayed data while it clips it,
         or when the new view range requires clipping. The test is O(1), since the data
-        bounds are cached by the mapped :class:`PlotDataset`.
+        bounds are cached by the displayed :class:`PlotDataset`.
 
         Returns
         -------
@@ -1871,12 +1950,13 @@ class PlotDataItem(GraphicsObject):
         """
         if self.opts['dynamicRangeLimit'] is None or self._dataset is None:
             return False
-        if self._drlClipActive or self._datasetMapped is None:
+        if self._drlClipActive or self._datasetDisplay is None:
             return True
         view_range = self._displayViewRange()
         if view_range is None:
             return False
-        data_range = self._datasetMapped.dataRect()
+        # without clipping, the display dataset holds the unclipped displayed data
+        data_range = self._datasetDisplay.dataRect()
         if data_range is None:
             return False
         return self._drlClipRequired(data_range, view_range)
