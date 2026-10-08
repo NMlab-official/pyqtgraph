@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
+from numpy.lib.recfunctions import structured_to_unstructured
 
 from .. import Qt, debug
 from .. import functions as fn
@@ -791,6 +792,96 @@ class SymbolAtlas(object):
         return pm
 
 
+class _SpotArrays:
+    """
+    Contiguous copies of the spot fields used to paint and to hit-test.
+
+    The fields of the structured spot array are strided (one record per spot), which
+    makes every vectorized pass over them slow. These copies are built on demand from
+    :attr:`ScatterPlotItem.data` and dropped by :meth:`ScatterPlotItem.invalidate`
+    whenever the spots change.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Structured spot array.
+    """
+
+    __slots__ = ('serial', 'x', 'y', 'sourceRect', 'uniformRect', 'halfWidth', 'halfHeight',
+                 'visible', 'allVisible', 'bounds')
+
+    _serials = itertools.count()
+
+    def __init__(self, data: np.ndarray) -> None:
+        n = len(data)
+        self.serial = next(_SpotArrays._serials)  # identifies these arrays
+        self.x = np.array(data['x'], dtype=np.float64)
+        self.y = np.array(data['y'], dtype=np.float64)
+        # one pass over the records for the four fields (sx, sy, sw, sh)
+        self.sourceRect = structured_to_unstructured(data['sourceRect'], dtype=np.float64)
+        # the source rect shared by all the spots (uniform style), if any
+        self.uniformRect = None
+        if n and (self.sourceRect == self.sourceRect[0]).all():
+            self.uniformRect = tuple(self.sourceRect[0].tolist())
+        # half symbol sizes in device pixels: a scalar when uniform, else one per spot
+        self.halfWidth = self._halfSizes(self.sourceRect[:, 2])
+        self.halfHeight = self._halfSizes(self.sourceRect[:, 3])
+        self.visible = np.array(data['visible'], dtype=bool)
+        self.allVisible = bool(self.visible.all())
+        # NaN coordinates give NaN bounds, which then never compare as inside a view
+        self.bounds = (None if n == 0 else
+                       (self.x.min(), self.x.max(), self.y.min(), self.y.max()))
+
+    @staticmethod
+    def _halfSizes(sizes: np.ndarray) -> float | np.ndarray:
+        """
+        Halve symbol sizes, returning a scalar when they are all equal.
+
+        Parameters
+        ----------
+        sizes : numpy.ndarray
+            Symbol widths or heights.
+
+        Returns
+        -------
+        float or numpy.ndarray
+            ``sizes / 2``, or its single value; both give the same results in
+            arithmetic with the spot coordinates.
+        """
+        if len(sizes) and (sizes == sizes[0]).all():
+            return float(sizes[0]) / 2
+        return sizes / 2
+
+
+def _mapPoints(transform: QtGui.QTransform, x: np.ndarray, y: np.ndarray,
+               out: np.ndarray) -> None:
+    """
+    Map points to device coordinates, as :func:`~pyqtgraph.functions.transformCoordinates`.
+
+    The operations are done in the same order as ``transformCoordinates`` followed by
+    a clip to +-2**30 (larger coordinates crash Qt), so that the results are
+    bit-identical; perspective is ignored likewise.
+
+    Parameters
+    ----------
+    transform : QtGui.QTransform
+        Item to device transform.
+    x, y : numpy.ndarray
+        Coordinates of the points.
+    out : numpy.ndarray
+        ``(N, 2)`` float64 array, or view, receiving the mapped coordinates.
+    """
+    for col, (mx, my, d) in enumerate(((transform.m11(), transform.m21(), transform.dx()),
+                                       (transform.m12(), transform.m22(), transform.dy()))):
+        # computed in a contiguous array: passes over a strided column are slow
+        with np.errstate(invalid='ignore', over='ignore'):
+            mapped = x * mx
+            mapped += y * my
+            mapped += d
+        np.clip(mapped, -2 ** 30, 2 ** 30, out=mapped)
+        out[:, col] = mapped
+
+
 class ScatterPlotItem(GraphicsObject):
     """
     Displays a set of x/y points. Instances of this class are created
@@ -838,6 +929,13 @@ class ScatterPlotItem(GraphicsObject):
         self._dataShared = False
         # During setData: previous spot array that addPoints may reuse in place
         self._reusableData = None
+        # Contiguous copies of the spot fields for painting and hit tests, built on
+        # demand and dropped by invalidate() (see _spotArrays)
+        self._paintCache = None
+        # Columns already written in the pixmap fragment buffer, as (key, rows) where
+        # the key holds the buffer address (see _prepareFragments)
+        self._fragmentRects = None
+        self._fragmentConstants = None
 
         dtype = [
             ('x', float),
@@ -1160,10 +1258,29 @@ class ScatterPlotItem(GraphicsObject):
         spot['visible'] = True
         return spot
 
-    def invalidate(self):
-        ## clear any cached drawing state
+    def invalidate(self) -> None:
+        """
+        Clear any cached drawing state and schedule a repaint.
+
+        Must be called (directly, or through :meth:`updateSpots`) after modifying the
+        spot array ``self.data`` in place.
+        """
         self.picture = None
+        self._paintCache = None
         self.update()
+
+    def _spotArrays(self) -> _SpotArrays:
+        """
+        Return the contiguous copies of the spot fields, building them if needed.
+
+        Returns
+        -------
+        _SpotArrays
+            Arrays valid until the next :meth:`invalidate`.
+        """
+        if self._paintCache is None:
+            self._paintCache = _SpotArrays(self.data)
+        return self._paintCache
 
     def getData(self):
         self._dataShared = True  # views of self.data are handed out
@@ -1193,6 +1310,7 @@ class ScatterPlotItem(GraphicsObject):
         """
         if self._styleCodes is None:
             dataSet['sourceRect'] = 0
+            self._paintCache = None
 
     def _setStyleColumn(self, name: str, dataSet: np.ndarray, objects: np.ndarray,
                         reps: list | None, codes: np.ndarray | None) -> None:
@@ -1415,10 +1533,27 @@ class ScatterPlotItem(GraphicsObject):
             self.updateSpots(dataSet)
 
 
-    def setPointsVisible(self, visible, update=True, dataSet=None, mask=None):
-        """Set whether or not each spot is visible.
-        If a list or array is provided, then the visibility for each spot will be set separately.
-        Otherwise, the argument will be used for all spots."""
+    def setPointsVisible(self, visible: bool | list | np.ndarray, update: bool = True,
+                         dataSet: np.ndarray | None = None,
+                         mask: np.ndarray | None = None) -> None:
+        """
+        Set whether or not each spot is visible.
+
+        If a list or array is provided, then the visibility for each spot will be set
+        separately. Otherwise, the argument will be used for all spots.
+
+        Parameters
+        ----------
+        visible : bool, list or numpy.ndarray
+            Visibility of all spots, or of each spot.
+        update : bool, default True
+            Update the spots now.
+        dataSet : numpy.ndarray, optional
+            Structured array of the spots to change; defaults to all spots.
+        mask : numpy.ndarray, optional
+            Selection applied to a per-spot list or array.
+        """
+        self._paintCache = None
         if dataSet is None:
             dataSet = self.data
 
@@ -1880,15 +2015,6 @@ class ScatterPlotItem(GraphicsObject):
             scale = 1.0
 
         if self.opts['pxMode'] is True:
-            # Cull points that are outside view
-            viewMask = self._maskAt(self.viewRect())
-
-            # Map points using painter's world transform so they are drawn with pixel-valued sizes
-            pts = np.vstack([self.data['x'], self.data['y']])
-            pts = fn.transformCoordinates(p.transform(), pts)
-            pts = fn.clip_array(pts, -2 ** 30, 2 ** 30)  # prevent Qt segmentation fault.
-            p.resetTransform()
-
             if self.opts['useCache'] and self._exportOpts is False:
                 # Draw symbols from pre-rendered atlas
 
@@ -1901,26 +2027,30 @@ class ScatterPlotItem(GraphicsObject):
                     self.data['sourceRect'] = 0
                     self.updateSpots()
 
-                # x, y is the center of the target rect
-                xy = pts[:, viewMask].T
-                sr = self.data['sourceRect'][viewMask]
-
-                self._pixmapFragments.resize(sr.size)
-                frags = self._pixmapFragments.ndarray()
-                frags[:, 0:2] = xy
-                frags[:, 2:6] = np.frombuffer(sr, dtype=int).reshape((-1, 4)) # sx, sy, sw, sh
-                frags[:, 6:10] = [1/dpr, 1/dpr, 0.0, 1.0]   # scaleX, scaleY, rotation, opacity
+                # Cull points that are outside view, and map the others using the
+                # painter's world transform so they are drawn with pixel-valued sizes
+                self._prepareFragments(p.transform(), self.viewRect(), dpr)
+                p.resetTransform()
 
                 profiler('prep')
                 drawargs = self._pixmapFragments.drawargs()
                 p.drawPixmapFragments(*drawargs, self.fragmentAtlas.pixmap)
                 profiler('draw')
             else:
+                # Cull points that are outside view
+                viewMask = self._maskAt(self.viewRect())
+
+                # Map points using painter's world transform so they are drawn with pixel-valued sizes
+                arrays = self._spotArrays()
+                pts = np.empty((np.count_nonzero(viewMask), 2))
+                _mapPoints(p.transform(), arrays.x[viewMask], arrays.y[viewMask], pts)
+                p.resetTransform()
+
                 # render each symbol individually
                 p.setRenderHint(p.RenderHint.Antialiasing, aa)
 
                 for pt, style in zip(
-                        pts[:, viewMask].T,
+                        pts,
                         zip(*(self._style(['symbol', 'size', 'pen', 'brush'], idx=viewMask, scale=scale)))
                 ):
                     p.resetTransform()
@@ -1998,50 +2128,222 @@ class ScatterPlotItem(GraphicsObject):
         """
         return self._pointsForIndices(np.flatnonzero(self._maskAt(pos))[::-1])
 
-    def _maskAt(self, obj):
+    def _prepareFragments(self, transform: QtGui.QTransform, viewRect: QtCore.QRectF,
+                          dpr: float) -> None:
         """
-        Return a boolean mask indicating all points that overlap obj, a QPointF or QRectF.
+        Fill the pixmap fragment array with the spots visible in a view rectangle.
+
+        Spots are culled with the test of :meth:`_maskAt`, on contiguous arrays and
+        with a scalar margin when all the symbols have the same size; culling is
+        skipped altogether when all the spots lie inside the view. (A scalar margin
+        for varied sizes would keep more spots, which are not always invisible: the
+        test under-estimates the extent of symbols in rotated items.) Only the kept
+        spots are mapped to device coordinates.
+
+        Each pass over the fragment array (80 bytes per row) touches all of its
+        memory, so the columns are computed in a contiguous block and copied in one
+        pass, and the columns already in place are not written again: the source
+        rects when they are uniform or belong to the same spots as in the previous
+        paint, and the constant scale, rotation and opacity columns.
+
+        Parameters
+        ----------
+        transform : QtGui.QTransform
+            Item to device transform of the painter.
+        viewRect : QtCore.QRectF
+            Visible area, in item coordinates.
+        dpr : float
+            Device pixel ratio of the symbol atlas.
+        """
+        left, right, top, bottom = self._rectEdges(viewRect)
+        arrays = self._spotArrays()
+        x, y = arrays.x, arrays.y
+        bounds = arrays.bounds
+        if (arrays.allVisible and bounds is not None and bounds[0] > left
+                and bounds[1] < right and bounds[2] > top and bounds[3] < bottom):
+            mask = None  # all the spots are inside the view
+        else:
+            # the operations of _maskAt, which give the same values
+            px, py = self._pixelLengths()
+            mx = arrays.halfWidth * px
+            my = arrays.halfHeight * py
+            mask = x + mx > left
+            mask &= x - mx < right
+            mask &= y + my > top
+            mask &= y - my < bottom
+            if not arrays.allVisible:
+                mask &= arrays.visible
+            x, y = x[mask], y[mask]
+
+        n = len(x)
+        self._pixmapFragments.resize(n)
+        if n == 0:
+            self._fragmentRects = self._fragmentConstants = None
+            return
+        frags = self._pixmapFragments.ndarray()
+        # The address identifies the buffer: a reallocated buffer is created while the
+        # previous one, whose state is recorded, still exists, so it gets another
+        # address (and the states are dropped when the buffer is emptied above).
+        address = frags.__array_interface__['data'][0]
+
+        if arrays.uniformRect is not None:
+            rectKey = (address, 'uniform', arrays.uniformRect)
+        elif mask is None:
+            rectKey = (address, 'all', arrays.serial)
+        else:
+            rectKey = None  # rects of a subset of the spots: not reusable
+        if self._fragmentRows(self._fragmentRects, rectKey, n):
+            positions = np.empty((n, 2))
+            _mapPoints(transform, x, y, positions)
+            frags[:, 0:2] = positions  # target center x, y
+        else:
+            block = np.empty((n, 6))
+            _mapPoints(transform, x, y, block[:, 0:2])
+            if arrays.uniformRect is not None:
+                block[:, 2:6] = arrays.uniformRect  # sx, sy, sw, sh
+            elif mask is None:
+                block[:, 2:6] = arrays.sourceRect
+            else:
+                block[:, 2:6] = arrays.sourceRect[mask]
+            frags[:, 0:6] = block
+            self._fragmentRects = self._writtenRows(self._fragmentRects, rectKey, n)
+
+        constKey = (address, dpr)
+        if not self._fragmentRows(self._fragmentConstants, constKey, n):
+            frags[:, 6:10] = [1/dpr, 1/dpr, 0.0, 1.0]   # scaleX, scaleY, rotation, opacity
+            self._fragmentConstants = self._writtenRows(self._fragmentConstants, constKey, n)
+
+    @staticmethod
+    def _fragmentRows(state: tuple | None, key: tuple | None, n: int) -> bool:
+        """
+        Tell whether fragment columns are already in place for ``n`` rows.
+
+        Parameters
+        ----------
+        state : tuple or None
+            ``(key, rows)`` recorded when the columns were last written, or ``None``.
+        key : tuple or None
+            Key of the columns needed now (fragment buffer address and contents);
+            ``None`` when they cannot be reused.
+        n : int
+            Number of fragments.
+
+        Returns
+        -------
+        bool
+            True if the first ``n`` rows already hold the columns.
+        """
+        return key is not None and state is not None and state[0] == key and state[1] >= n
+
+    @staticmethod
+    def _writtenRows(state: tuple | None, key: tuple | None, n: int) -> tuple | None:
+        """
+        Return the state to record after writing fragment columns for ``n`` rows.
+
+        Parameters
+        ----------
+        state : tuple or None
+            Previous ``(key, rows)`` state.
+        key : tuple or None
+            Key of the columns written; ``None`` when they cannot be reused.
+        n : int
+            Number of rows written.
+
+        Returns
+        -------
+        tuple or None
+            The new ``(key, rows)`` state; rows written earlier with the same key stay
+            valid.
+        """
+        if key is None:
+            return None
+        if state is not None and state[0] == key:
+            return key, max(n, state[1])
+        return key, n
+
+    @staticmethod
+    def _rectEdges(obj: QtCore.QPointF | QtCore.QRectF) -> tuple[float, float, float, float]:
+        """
+        Return the edges of a point or a rectangle.
+
+        Parameters
+        ----------
+        obj : QtCore.QPointF or QtCore.QRectF
+            Point or rectangle.
+
+        Returns
+        -------
+        tuple of float
+            ``(left, right, top, bottom)``.
+
+        Raises
+        ------
+        TypeError
+            If ``obj`` is neither a ``QPointF`` nor a ``QRectF``.
         """
         if isinstance(obj, QtCore.QPointF):
-            l = r = obj.x()
-            t = b = obj.y()
+            return obj.x(), obj.x(), obj.y(), obj.y()
         elif isinstance(obj, QtCore.QRectF):
-            l = obj.left()
-            r = obj.right()
-            t = obj.top()
-            b = obj.bottom()
-        else:
-            raise TypeError
+            return obj.left(), obj.right(), obj.top(), obj.bottom()
+        raise TypeError
+
+    def _pixelLengths(self) -> tuple[float, float]:
+        """
+        Return the length of a device pixel in the local x and y directions.
+
+        Returns
+        -------
+        tuple of float
+            ``(px, py)``, 0 where unknown.
+        """
+        px, py = self.pixelVectors()
+        try:
+            px = 0 if px is None else px.length()
+        except OverflowError:
+            px = 0
+        try:
+            py = 0 if py is None else py.length()
+        except OverflowError:
+            py = 0
+        return px, py
+
+    def _maskAt(self, obj: QtCore.QPointF | QtCore.QRectF) -> np.ndarray:
+        """
+        Return a boolean mask indicating all points that overlap obj, a QPointF or QRectF.
+
+        Parameters
+        ----------
+        obj : QtCore.QPointF or QtCore.QRectF
+            Point or rectangle, in item coordinates.
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean mask over the spots, ``True`` for the visible spots overlapping
+            ``obj``.
+        """
+        l, r, t, b = self._rectEdges(obj)
+        arrays = self._spotArrays()
 
         if self.opts['pxMode'] and self.opts['useCache']:
-            w = self.data['sourceRect']['w']
-            h = self.data['sourceRect']['h']
+            w = arrays.halfWidth
+            h = arrays.halfHeight
         else:
             s, = self._style(['size'])
-            w = h = s
-
-        w = w / 2
-        h = h / 2
+            w = s / 2
+            h = s / 2
 
         if self.opts['pxMode']:
             # determine length of pixel in local x, y directions
-            px, py = self.pixelVectors()
-            try:
-                px = 0 if px is None else px.length()
-            except OverflowError:
-                px = 0
-            try:
-                py = 0 if py is None else py.length()
-            except OverflowError:
-                py = 0
-            w *= px
-            h *= py
+            px, py = self._pixelLengths()
+            w = w * px  # not in place: w may be a cached array
+            h = h * py
 
-        return (self.data['visible']
-                & (self.data['x'] + w > l)
-                & (self.data['x'] - w < r)
-                & (self.data['y'] + h > t)
-                & (self.data['y'] - h < b))
+        return (arrays.visible
+                & (arrays.x + w > l)
+                & (arrays.x - w < r)
+                & (arrays.y + h > t)
+                & (arrays.y - h < b))
 
     def mouseClickEvent(self, ev):
         if ev.button() == QtCore.Qt.MouseButton.LeftButton:

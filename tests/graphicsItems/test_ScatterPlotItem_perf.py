@@ -7,6 +7,7 @@ entries) instead of durations, see ``tests/perf_helpers.py``.
 import numpy as np
 
 import pyqtgraph as pg
+from pyqtgraph import functions as fn
 from pyqtgraph.graphicsItems.ScatterPlotItem import (
     SymbolAtlas,
     _brushValueKey,
@@ -14,10 +15,12 @@ from pyqtgraph.graphicsItems.ScatterPlotItem import (
     _penValueKey,
     _quantizeSize,
     _quantizeSizes,
+    _SpotArrays,
+    drawSymbol,
     renderSymbol,
 )
-from pyqtgraph.Qt import QtCore, QtGui
-from tests.perf_helpers import process_events
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from tests.perf_helpers import count_calls, process_events
 
 app = pg.mkQApp()
 
@@ -511,3 +514,185 @@ def test_spot_array_not_reused_when_shared():
     spot, = scatter.pointsAt(QtCore.QPointF(7, 0))
     scatter.setData(x=np.arange(n) + 100., y=np.zeros(n), size=0.5, pxMode=False)
     assert spot.pos() == pg.Point(7, 0)
+
+
+# --------------------------------------------------------------------------------------
+# T2.9: vectorized paint preparation
+# --------------------------------------------------------------------------------------
+
+def _referenceMask(scatter, rect):
+    """Spots kept by the per-spot culling of the previous implementation."""
+    data = scatter.data
+    l, r, t, b = rect.left(), rect.right(), rect.top(), rect.bottom()
+    if scatter.opts['pxMode'] and scatter.opts['useCache']:
+        w = data['sourceRect']['w'] / 2
+        h = data['sourceRect']['h'] / 2
+    else:
+        s, = scatter._style(['size'])
+        w = s / 2
+        h = s / 2
+    if scatter.opts['pxMode']:
+        px, py = scatter._pixelLengths()
+        w = w * px
+        h = h * py
+    return (data['visible'] & (data['x'] + w > l) & (data['x'] - w < r)
+            & (data['y'] + h > t) & (data['y'] - h < b))
+
+
+def _referencePoints(transform, scatter, mask):
+    """Device positions of the spots as computed by the previous implementation."""
+    pts = np.vstack([scatter.data['x'], scatter.data['y']])
+    pts = fn.transformCoordinates(transform, pts)
+    return np.clip(pts, -2 ** 30, 2 ** 30)[:, mask].T
+
+
+def _referenceFragments(scatter, transform, rect, dpr):
+    mask = _referenceMask(scatter, rect)
+    sr = scatter.data['sourceRect'][mask]
+    frags = np.empty((len(sr), 10))
+    frags[:, 0:2] = _referencePoints(transform, scatter, mask)
+    frags[:, 2:6] = np.frombuffer(sr.copy(), dtype=int).reshape((-1, 4))
+    frags[:, 6:10] = [1 / dpr, 1 / dpr, 0.0, 1.0]
+    return frags
+
+
+class _ReferenceScatter(pg.ScatterPlotItem):
+    """ScatterPlotItem painting spots in pixel mode as the previous implementation."""
+
+    def paint(self, p, option, widget):
+        if not self.opts['pxMode']:
+            return super().paint(p, option, widget)
+        mask = _referenceMask(self, self.viewRect())
+        pts = _referencePoints(p.transform(), self, mask)
+        p.resetTransform()
+        if self.opts['useCache']:
+            dpr = self.fragmentAtlas.devicePixelRatio()
+            frags = _referenceFragments(self, QtGui.QTransform(), self.viewRect(), dpr)
+            frags[:, 0:2] = pts
+            array = pg.Qt.internals.PrimitiveArray(QtGui.QPainter.PixmapFragment, 10)
+            array.resize(len(frags))
+            array.ndarray()[:] = frags
+            p.drawPixmapFragments(*array.drawargs(), self.fragmentAtlas.pixmap)
+        else:
+            p.setRenderHint(p.RenderHint.Antialiasing, self.opts['antialias'])
+            styles = zip(*self._style(['symbol', 'size', 'pen', 'brush'], idx=mask))
+            for pt, style in zip(pts, styles):
+                p.resetTransform()
+                p.translate(*pt)
+                drawSymbol(p, *style)
+
+
+def _paintTestKwargs(rng, n=600):
+    x = rng.normal(size=n) * 3
+    y = rng.normal(size=n) * 3
+    x[::50] = np.nan
+    y[7::61] = np.inf
+    palette = [pg.mkBrush(c) for c in ('r', 'g', 'b', 'y')]
+    return {
+        'uniform': dict(x=x, y=y, size=9),
+        'varied': dict(x=x, y=y, size=rng.integers(2, 40, n).astype(float),
+                       brush=[palette[i] for i in rng.integers(0, 4, n)],
+                       symbol=list(np.array(['o', 's', 't', 'star'], dtype=object)[
+                           rng.integers(0, 4, n)])),
+        'colors': dict(x=x, y=y, size=12, brush=_RGBA[rng.integers(0, 4, n)]),
+    }
+
+
+def test_fragments_identical_to_reference():
+    rng = np.random.default_rng(5)
+    view = pg.GraphicsView()
+    vb = pg.ViewBox(enableMouse=False)
+    view.setCentralItem(vb)
+    view.resize(300, 200)
+    view.show()
+    transforms = [QtGui.QTransform.fromScale(40, -30).translate(4, -5),
+                  QtGui.QTransform().rotate(30).scale(25, 25),
+                  QtGui.QTransform(30, 4, 0, -3, -35, 0, 120, 90, 1)]
+    rects = [QtCore.QRectF(-8, -8, 16, 16), QtCore.QRectF(-20, -20, 40, 40),
+             QtCore.QRectF(-1, -0.5, 2.5, 1.5), QtCore.QRectF(0.3, 2, 1, 4)]
+    for name, kwargs in _paintTestKwargs(rng).items():
+        scatter = pg.ScatterPlotItem(**kwargs)
+        vb.addItem(scatter)
+        vb.setRange(xRange=(-5, 5), yRange=(-5, 5), padding=0)
+        process_events()
+        hidden = np.zeros(len(scatter.data), bool)
+        for step in range(2):
+            if step == 1:  # hide some spots
+                hidden[::9] = True
+                scatter.setPointsVisible(~hidden)
+            # repeated preparations reuse the columns already in the fragment buffer
+            for transform in transforms:
+                for rect in rects:
+                    scatter._prepareFragments(transform, rect, 1.0)
+                    expected = _referenceFragments(scatter, transform, rect, 1.0)
+                    got = scatter._pixmapFragments.ndarray()
+                    assert got.shape == expected.shape, (name, step)
+                    assert np.array_equal(got, expected), (name, step)
+                    np.testing.assert_array_equal(scatter._maskAt(rect),
+                                                  _referenceMask(scatter, rect))
+        vb.removeItem(scatter)
+    view.close()
+
+
+def test_paint_identical_to_reference():
+    rng = np.random.default_rng(6)
+    for name, kwargs in _paintTestKwargs(rng).items():
+        for options in ({}, {'useCache': False}, {'pxMode': False}):
+            for xRange, yRange in (((-4, 4), (-4, 4)), ((-12, 12), (-12, 12)),
+                                   ((0.5, 2), (-1, 0.2))):
+                kw = dict(kwargs, **options)
+                if not kw.get('pxMode', True):
+                    kw['size'] = 0.2
+                images = []
+                for cls in (pg.ScatterPlotItem, _ReferenceScatter):
+                    scatter = cls(**kw)
+                    hidden = np.zeros(len(scatter.data), bool)
+                    hidden[3::11] = True
+                    scatter.setPointsVisible(~hidden)
+                    images.append(_renderInView([scatter], xRange, yRange, size=(200, 160)))
+                assert images[0] == images[1], (name, options, xRange)
+                assert images[0] != _renderInView([], xRange, yRange, size=(200, 160))
+
+
+def test_paint_arrays_cached_until_spots_change():
+    rng = np.random.default_rng(0)
+    n = 1000
+    view = pg.GraphicsView()
+    vb = pg.ViewBox(enableMouse=False)
+    view.setCentralItem(vb)
+    view.resize(200, 150)
+    scatter = pg.ScatterPlotItem(x=rng.random(n), y=rng.random(n), size=5)
+    vb.addItem(scatter)
+    view.show()
+    process_events()
+    with count_calls(_SpotArrays, '__init__') as builds:
+        for i in range(5):  # pans: the arrays are reused
+            vb.setRange(xRange=(i * 0.1, 1 + i * 0.1), yRange=(0, 1), padding=0)
+            process_events()
+            scatter.pointsAt(QtCore.QPointF(0.5, 0.5))
+        assert builds.count == 0
+        # every change of the spots drops them
+        scatter.setData(x=rng.random(n), y=rng.random(n), size=5)
+        process_events()
+        assert builds.count == 1
+        scatter.setPointsVisible(np.arange(n) % 2 == 0, update=False)
+        assert not scatter._maskAt(QtCore.QRectF(-1, -1, 3, 3))[1::2].any()
+        assert builds.count == 2
+        scatter.points()[0].setSize(30)
+        assert scatter._spotArrays().halfWidth[0] > scatter._spotArrays().halfWidth[2]
+        assert builds.count == 3
+    view.close()
+
+
+def test_paint_all_inside_skips_culling():
+    # all spots inside the view: fragments are prepared without the culling pass
+    scatter = pg.ScatterPlotItem(x=[1., 2., 3.], y=[1., 2., 3.], size=5)
+    arrays = scatter._spotArrays()
+    assert arrays.bounds == (1., 3., 1., 3.)
+    with count_calls(scatter, '_pixelLengths') as lengths:
+        scatter._prepareFragments(QtGui.QTransform(), QtCore.QRectF(0, 0, 4, 4), 1.0)
+        assert lengths.count == 0
+        scatter._prepareFragments(QtGui.QTransform(), QtCore.QRectF(1.5, 0, 4, 4), 1.0)
+        assert lengths.count == 1
+    assert len(scatter._pixmapFragments) == 2
+
