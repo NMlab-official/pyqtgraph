@@ -2673,13 +2673,27 @@ class PlotDataItem(GraphicsObject):
         )
         self.sigPointsHovered.emit(self, points, ev)
 
-    # def viewTransformChanged(self):
-    #   """ view transform (and thus range) has changed, replot if needed """
-    # viewTransformChanged is only called when the cached viewRect of GraphicsItem
-    # has already been invalidated. However, responding here will make PlotDataItem
-    # update curve and scatter later than intended.
-    #   super().viewTransformChanged() # this invalidates the viewRect() cache!
-        
+    @QtCore.Slot()
+    def viewTransformChanged(self) -> None:
+        """
+        Update the displayed data if the size of a pixel changed its downsampling.
+
+        View range changes are handled by :meth:`viewRangeChanged`, as soon as the
+        range changes. A view resized without a change of range, however, changes the
+        size of a pixel only, which the automatic downsampling factor depends on: the
+        displayed data is then recomputed if the factor changes. The view transform is
+        updated before the scene is painted, so this happens in the same paint.
+        """
+        super().viewTransformChanged()  # invalidates the viewRect() cache
+        if (
+            self.opts['autoDownsample']
+            and self._dataset is not None
+            and self._displayChangedByView()
+        ):
+            self.setProperty('xViewRangeWasChanged', True)
+            self._datasetDisplay = None
+            self.updateItems(styleUpdate=False)
+
     @QtCore.Slot(object, object)
     @QtCore.Slot(object, object, object)
     def viewRangeChanged(
