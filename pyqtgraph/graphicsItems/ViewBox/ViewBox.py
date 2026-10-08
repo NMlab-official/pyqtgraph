@@ -1,6 +1,7 @@
 import math
 import sys
 import weakref
+from collections.abc import Iterable
 from copy import deepcopy
 
 import numpy as np
@@ -10,6 +11,7 @@ from ... import functions as fn
 from ... import getConfigOption
 from ...Point import Point
 from ...Qt import QT_LIB, QtCore, QtGui, QtWidgets, isQObjectAlive
+from ..GraphicsItem import GraphicsItem
 from ..GraphicsWidget import GraphicsWidget
 from ..ItemGroup import ItemGroup
 
@@ -50,8 +52,9 @@ class ChildGroup(ItemGroup):
         #         mechanism, but this causes a different PySide crash.
         self.itemsChangedListeners = WeakList()
 
-        # exempt from telling view when transform changes
-        self._GraphicsObject__inform_view_on_change = False
+        # exempt from telling view when transform changes (the name mangling of
+        # GraphicsObject.__inform_view_on_changes; a typo once made this a no-op)
+        self._GraphicsObject__inform_view_on_changes = False
 
     def itemChange(self, change, value):
         ret = ItemGroup.itemChange(self, change, value)
@@ -135,6 +138,10 @@ class ViewBox(GraphicsWidget):
         self.name = None
         self.linksBlocked = False
         self.addedItems = []
+        # The items of addedItems, i.e. the items taking part in auto-ranging. The set
+        # gives itemBoundsChanged, which runs on every move of every child item, an
+        # O(1) membership test.
+        self._boundedItems = set()
         self._matrixNeedsUpdate = True  ## indicates that range has changed, but matrix update was deferred
         self._autoRangeNeedsUpdate = True ## indicates auto-range needs to be recomputed.
 
@@ -178,7 +185,11 @@ class ViewBox(GraphicsWidget):
 
         }
         self._updatingRange = False  ## Used to break recursive loops. See updateAutoRange.
-        self._itemBoundsCache = weakref.WeakKeyDictionary()
+        # Per-item bounds used by childrenBounds, invalidated by itemBoundsChanged.
+        # See childrenBounds for the content of the entries. Only items of
+        # _boundedItems, which holds them anyway, are cached, and removeItem drops
+        # their entry: a plain dict is enough and faster than a WeakKeyDictionary.
+        self._itemBoundsCache = {}
 
         self.locateGroup = None  ## items displayed when using ViewBox.locate(item)
 
@@ -421,10 +432,23 @@ class ViewBox(GraphicsWidget):
             self.menu.setParent(None)
             self.menu = None
 
-    def addItem(self, item, ignoreBounds=False):
+    def addItem(self, item: QtWidgets.QGraphicsItem, ignoreBounds: bool = False) -> None:
         """
-        Add a QGraphicsItem to this view. The view will include this item when determining how to set its range
-        automatically unless *ignoreBounds* is True.
+        Add a QGraphicsItem to this view.
+
+        The view includes this item when determining how to set its range
+        automatically, unless `ignoreBounds` is True.
+
+        Parameters
+        ----------
+        item : QGraphicsItem
+            The item to add.
+        ignoreBounds : bool, default False
+            If True, the item is not considered when auto-ranging. Moving or
+            reshaping it then neither triggers an auto-range nor repaints the whole
+            view. Add decorations that follow the view or the mouse this way, such as
+            crosshairs, price levels or order lines (:class:`InfiniteLine`,
+            :class:`TextItem`), especially when there are many of them.
         """
         if item.zValue() < self.zValue():
             item.setZValue(self.zValue()+1)
@@ -436,14 +460,25 @@ class ViewBox(GraphicsWidget):
 
         if not ignoreBounds:
             self.addedItems.append(item)
+            self._boundedItems.add(item)
         self.queueUpdateAutoRange()
 
-    def removeItem(self, item):
-        """Remove an item from this view."""
+    def removeItem(self, item: QtWidgets.QGraphicsItem) -> None:
+        """
+        Remove an item from this view.
+
+        Parameters
+        ----------
+        item : QGraphicsItem
+            The item to remove.
+        """
         try:
             self.addedItems.remove(item)
         except:
             pass
+        if item not in self.addedItems:  # the item may have been added twice
+            self._boundedItems.discard(item)
+        self._itemBoundsCache.pop(item, None)
 
         scene = self.scene()
         if scene is not None:
@@ -927,9 +962,29 @@ class ViewBox(GraphicsWidget):
         if x is not None or y is not None:
             self.queueUpdateAutoRange()
 
-    def queueUpdateAutoRange(self):
+    def queueUpdateAutoRange(self) -> None:
+        """
+        Request an auto-range before the next paint.
+
+        The view is scheduled for repainting only when auto-ranging is enabled on at
+        least one axis. Otherwise the auto-range is a no-op, and repainting the whole
+        view, all its children included, would be wasted.
+        """
         self._autoRangeNeedsUpdate = True
-        self.update()
+        if self._autoRangeEnabledOnAnyAxis():
+            self.update()
+
+    def _autoRangeEnabledOnAnyAxis(self) -> bool:
+        """
+        Tell whether auto-ranging is enabled on at least one axis.
+
+        Returns
+        -------
+        bool
+            True if auto-ranging is enabled on the x or on the y axis.
+        """
+        autoRange = self.state['autoRange']
+        return autoRange[0] is not False or autoRange[1] is not False
 
     def updateAutoRange(self):
         ## Break recursive loops when auto-ranging.
@@ -1148,10 +1203,56 @@ class ViewBox(GraphicsWidget):
         ## called when items are added/removed from self.childGroup
         self.queueUpdateAutoRange()
 
-    def itemBoundsChanged(self, item):
-        self._itemBoundsCache.pop(item, None)
-        if (self.state['autoRange'][0] is not False) or (self.state['autoRange'][1] is not False):
+    def itemBoundsChanged(self, item: QtWidgets.QGraphicsItem) -> None:
+        """
+        Called when the bounds of a descendant of this view may have changed.
+
+        The cached bounds of the item and of its ancestors taking part in
+        auto-ranging are invalidated, and an auto-range is queued if it is enabled.
+        Changes of items that do not take part in auto-ranging, i.e. added with
+        ``ignoreBounds=True`` and not descending from an item that takes part, are
+        ignored: they can change neither the auto-range nor the cached bounds.
+
+        Parameters
+        ----------
+        item : QGraphicsItem
+            The item whose bounds may have changed.
+        """
+        if self._forgetItemBounds(item) and self._autoRangeEnabledOnAnyAxis():
             self.queueUpdateAutoRange()
+
+    def _forgetItemBounds(self, item: QtWidgets.QGraphicsItem | None) -> bool:
+        """
+        Invalidate the cached bounds of `item` and of its ancestors in this view.
+
+        Besides :meth:`itemBoundsChanged`, :class:`GraphicsObject` calls this method
+        when an item is shown or hidden: the bounds of an item may depend on the
+        visibility of its children, as for :meth:`PlotDataItem.dataBounds
+        <pyqtgraph.PlotDataItem.dataBounds>`. No auto-range is queued in that case,
+        as before the bounds were cached.
+
+        Parameters
+        ----------
+        item : QGraphicsItem or None
+            A descendant of this view.
+
+        Returns
+        -------
+        bool
+            True if `item` or one of its ancestors takes part in auto-ranging, that
+            is, if its bounds may change the auto-range of this view.
+        """
+        bounded = self._boundedItems
+        cache = self._itemBoundsCache
+        childGroup = self.childGroup
+        found = False
+        # Walk up to the child group, e.g. from a PlotCurveItem to its PlotDataItem.
+        while item is not None and item is not childGroup and item is not self:
+            if item in bounded:
+                cache.pop(item, None)
+                found = True
+            item = item.parentItem()
+        return found
 
     def _invertAxis(self, ax, inv):
         key = 'xy'[ax] + 'Inverted'
@@ -1449,108 +1550,201 @@ class ViewBox(GraphicsWidget):
             children.extend(self.allChildren(ch))
         return children
 
-    def childrenBounds(self, frac=None, orthoRange=(None,None), items=None):
-        """Return the bounding range of all children.
-        [[xmin, xmax], [ymin, ymax]]
-        Values may be None if there are no specific bounds for an axis.
+    def childrenBounds(
+        self,
+        frac: tuple[float, float] | None = None,
+        orthoRange: tuple[tuple[float, float] | None, tuple[float, float] | None] = (None, None),
+        items: Iterable[QtWidgets.QGraphicsItem] | None = None,
+    ) -> list[list[float] | None]:
+        """
+        Return the bounding range of all children.
+
+        The bounds of items implementing ``dataBounds`` are cached per item, together
+        with `frac`, `orthoRange` and the transformation of the item into the view.
+        Such items report bounds changes through
+        :meth:`GraphicsItem.informViewBoundsChanged
+        <pyqtgraph.GraphicsItem.informViewBoundsChanged>`, which invalidates their
+        entry; the pixel padding and the visibility are always read again.
+
+        Parameters
+        ----------
+        frac : tuple of float, optional
+            Fraction of the data of each axis to include, passed to the
+            ``dataBounds`` method of the items. By default, all data.
+        orthoRange : tuple, default (None, None)
+            For each axis, an optional ``(min, max)`` range along the other axis
+            within which the data are considered, passed to ``dataBounds``.
+        items : iterable of QGraphicsItem, optional
+            Items to consider. By default, the items added without ``ignoreBounds``.
+
+        Returns
+        -------
+        list
+            ``[[xmin, xmax], [ymin, ymax]]``. The range of an axis is None if no
+            item has bounds along that axis.
         """
         profiler = debug.Profiler()
         if items is None:
             items = self.addedItems
+        if frac is None:
+            frac = (1.0, 1.0)
+        cacheKey = (
+            tuple(frac),
+            None if orthoRange[0] is None else tuple(orthoRange[0]),
+            None if orthoRange[1] is None else tuple(orthoRange[1]),
+        )
+        # Keep the side effect of the uncached computation, which mapped the first
+        # bounds through updateMatrix.
+        self.updateMatrix()
+        scene = self.scene()
+        childGroup = self.childGroup
+        boundedItems = self._boundedItems
+        cache = self._itemBoundsCache
 
-        ## First collect all boundary information
+        ## First collect all boundary information:
+        ## (left, top, right, bottom, useX, useY, pxPad) in view coordinates
         itemBounds = []
         for item in items:
-            if not item.isVisible() or not item.scene() is self.scene():
+            if not item.isVisible() or item.scene() is not scene:
                 continue
 
-            useX = True
-            useY = True
-
             if hasattr(item, 'dataBounds') and item.dataBounds is not None:
-                if frac is None:
-                    frac = (1.0, 1.0)
-                xr = item.dataBounds(0, frac=frac[0], orthoRange=orthoRange[0])
-                yr = item.dataBounds(1, frac=frac[1], orthoRange=orthoRange[1])
-                pxPad = 0 if not hasattr(item, 'pixelPadding') else item.pixelPadding()
+                # Only pyqtgraph items added to this view, and still direct children of
+                # the child group, are cached: their bounds changes reach
+                # itemBoundsChanged. The key includes the item transformation, so
+                # that moves which are not notified (rotation, scale) are seen too.
                 if (
-                    xr is None or
-                    (xr[0] is None and xr[1] is None) or
-                    not math.isfinite(xr[0]) or
-                    not math.isfinite(xr[1])
+                    item in boundedItems
+                    and isinstance(item, GraphicsItem)
+                    and item.parentItem() is childGroup
                 ):
-                    useX = False
-                    xr = (0,0)
-                if (
-                    yr is None or
-                    (yr[0] is None and yr[1] is None) or
-                    not math.isfinite(yr[0]) or
-                    not math.isfinite(yr[1])
-                ):
-                    useY = False
-                    yr = (0,0)
-
-                bounds = QtCore.QRectF(xr[0], yr[0], xr[1]-xr[0], yr[1]-yr[0])
-                bounds = self.mapFromItemToView(item, bounds).boundingRect()
-
-                if not any([useX, useY]):
+                    transform = item.itemTransform(childGroup)[0]
+                    entry = cache.get(item)
+                    if entry is None or entry[0] != cacheKey or entry[1] != transform:
+                        entry = (
+                            cacheKey,
+                            transform,
+                            self._itemDataBounds(item, frac, orthoRange),
+                            hasattr(item, 'pixelPadding'),
+                        )
+                        cache[item] = entry
+                    bounds, hasPixelPadding = entry[2], entry[3]
+                else:
+                    bounds = self._itemDataBounds(item, frac, orthoRange)
+                    hasPixelPadding = hasattr(item, 'pixelPadding')
+                if bounds is None:
                     continue
-
-                ## If we are ignoring only one axis, we need to check for rotations
-                if useX != useY:  ##   !=  means  xor
-                    ang = round(item.transformAngle())
-                    if ang == 0 or ang == 180:
-                        pass
-                    elif ang == 90 or ang == 270:
-                        useX, useY = useY, useX
-                    else:
-                        ## Item is rotated at non-orthogonal angle, ignore bounds entirely.
-                        ## Not really sure what is the expected behavior in this case.
-                        continue  ## need to check for item rotations and decide how best to apply this boundary.
-
-
-                itemBounds.append((bounds, useX, useY, pxPad))
+                pxPad = item.pixelPadding() if hasPixelPadding else 0
+                itemBounds.append(bounds + (pxPad,))
             else:
                 if item.flags() & QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemHasNoContents:
                     continue
-                bounds = self.mapFromItemToView(item, item.boundingRect()).boundingRect()
-                itemBounds.append((bounds, True, True, 0))
+                rect = self.mapFromItemToView(item, item.boundingRect()).boundingRect()
+                itemBounds.append(
+                    (rect.left(), rect.top(), rect.right(), rect.bottom(), True, True, 0)
+                )
+        profiler()
 
         ## determine tentative new range
-        range = [None, None]
-        for bounds, useX, useY, px in itemBounds:
+        xRange = None
+        yRange = None
+        for left, top, right, bottom, useX, useY, px in itemBounds:
             if useY:
-                if range[1] is not None:
-                    range[1] = [min(bounds.top(), range[1][0]), max(bounds.bottom(), range[1][1])]
+                if yRange is not None:
+                    yRange = [min(top, yRange[0]), max(bottom, yRange[1])]
                 else:
-                    range[1] = [bounds.top(), bounds.bottom()]
+                    yRange = [top, bottom]
             if useX:
-                if range[0] is not None:
-                    range[0] = [min(bounds.left(), range[0][0]), max(bounds.right(), range[0][1])]
+                if xRange is not None:
+                    xRange = [min(left, xRange[0]), max(right, xRange[1])]
                 else:
-                    range[0] = [bounds.left(), bounds.right()]
-            profiler()
+                    xRange = [left, right]
 
         ## Now expand any bounds that have a pixel margin
         ## This must be done _after_ we have a good estimate of the new range
         ## to ensure that the pixel size is roughly accurate.
         w = self.width()
         h = self.height()
-        if w > 0 and range[0] is not None:
-            pxSize = (range[0][1] - range[0][0]) / w
-            for bounds, useX, useY, px in itemBounds:
+        if w > 0 and xRange is not None:
+            pxSize = (xRange[1] - xRange[0]) / w
+            for left, top, right, bottom, useX, useY, px in itemBounds:
                 if px == 0 or not useX:
                     continue
-                range[0][0] = min(range[0][0], bounds.left() - px*pxSize)
-                range[0][1] = max(range[0][1], bounds.right() + px*pxSize)
-        if h > 0 and range[1] is not None:
-            pxSize = (range[1][1] - range[1][0]) / h
-            for bounds, useX, useY, px in itemBounds:
+                xRange[0] = min(xRange[0], left - px*pxSize)
+                xRange[1] = max(xRange[1], right + px*pxSize)
+        if h > 0 and yRange is not None:
+            pxSize = (yRange[1] - yRange[0]) / h
+            for left, top, right, bottom, useX, useY, px in itemBounds:
                 if px == 0 or not useY:
                     continue
-                range[1][0] = min(range[1][0], bounds.top() - px*pxSize)
-                range[1][1] = max(range[1][1], bounds.bottom() + px*pxSize)
-        return range
+                yRange[0] = min(yRange[0], top - px*pxSize)
+                yRange[1] = max(yRange[1], bottom + px*pxSize)
+        return [xRange, yRange]
+
+    def _itemDataBounds(
+        self,
+        item: QtWidgets.QGraphicsItem,
+        frac: tuple[float, float],
+        orthoRange: tuple[tuple[float, float] | None, tuple[float, float] | None],
+    ) -> tuple[float, float, float, float, bool, bool] | None:
+        """
+        Compute the bounds of an item implementing ``dataBounds``, in view coordinates.
+
+        Parameters
+        ----------
+        item : QGraphicsItem
+            Item implementing ``dataBounds``.
+        frac : tuple of float
+            Fraction of the data of each axis to include.
+        orthoRange : tuple
+            For each axis, an optional ``(min, max)`` range along the other axis.
+
+        Returns
+        -------
+        tuple or None
+            ``(left, top, right, bottom, useX, useY)``: the bounds in view
+            coordinates and whether they apply to the x and y axes of the view.
+            None if the item does not constrain any axis.
+        """
+        useX = True
+        useY = True
+        xr = item.dataBounds(0, frac=frac[0], orthoRange=orthoRange[0])
+        yr = item.dataBounds(1, frac=frac[1], orthoRange=orthoRange[1])
+        if (
+            xr is None or
+            (xr[0] is None and xr[1] is None) or
+            not math.isfinite(xr[0]) or
+            not math.isfinite(xr[1])
+        ):
+            useX = False
+            xr = (0,0)
+        if (
+            yr is None or
+            (yr[0] is None and yr[1] is None) or
+            not math.isfinite(yr[0]) or
+            not math.isfinite(yr[1])
+        ):
+            useY = False
+            yr = (0,0)
+
+        if not any([useX, useY]):
+            return None
+
+        bounds = QtCore.QRectF(xr[0], yr[0], xr[1]-xr[0], yr[1]-yr[0])
+        bounds = self.mapFromItemToView(item, bounds).boundingRect()
+
+        ## If we are ignoring only one axis, we need to check for rotations
+        if useX != useY:  ##   !=  means  xor
+            ang = round(item.transformAngle())
+            if ang == 0 or ang == 180:
+                pass
+            elif ang == 90 or ang == 270:
+                useX, useY = useY, useX
+            else:
+                ## Item is rotated at non-orthogonal angle, ignore bounds entirely.
+                ## Not really sure what is the expected behavior in this case.
+                return None  ## need to check for item rotations and decide how best to apply this boundary.
+        return bounds.left(), bounds.top(), bounds.right(), bounds.bottom(), useX, useY
 
     def childrenBoundingRect(self, *args, **kwargs):
         range = self.childrenBounds(*args, **kwargs)
