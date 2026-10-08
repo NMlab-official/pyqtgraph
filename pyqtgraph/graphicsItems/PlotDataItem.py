@@ -485,6 +485,10 @@ class PlotDataItem(GraphicsObject):
                             this item will be overridden.
         =================== ============================================================
 
+        When the item is added to a :class:`~pyqtgraph.PlotItem`, `downsample`,
+        `autoDownsample`, `downsampleMethod` and `clipToView` are set from the
+        PlotItem's settings, unless they were passed explicitly to this item.
+
         *Meta Keyword Arguments*
 
         =========== ====================================================================
@@ -555,6 +559,10 @@ class PlotDataItem(GraphicsObject):
     sigClicked = QtCore.Signal(object, object)
     sigPointsClicked = QtCore.Signal(object, object, object)
     sigPointsHovered = QtCore.Signal(object, object, object)
+
+    # options that PlotItem.addItem sets from the PlotItem's own settings, unless
+    # they were passed explicitly to this item
+    PLOT_ITEM_OPTS = ('downsample', 'autoDownsample', 'downsampleMethod', 'clipToView')
 
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -627,6 +635,9 @@ class PlotDataItem(GraphicsObject):
             'dynamicRangeHyst': 3.0,
             'data': None,
         }
+        # names of the PLOT_ITEM_OPTS explicitly passed to __init__ or setData;
+        # PlotItem.addItem does not override these with its own settings.
+        self._explicitOpts = set()
         self.setCurveClickable(kwargs.get('clickable', False))
         self.setData(*args, **kwargs)
     
@@ -1274,6 +1285,7 @@ class PlotDataItem(GraphicsObject):
             if k in kwargs:
                 self.opts[k] = kwargs[k]
                 self.setProperty('styleWasChanged', True)
+        self._explicitOpts.update(k for k in self.PLOT_ITEM_OPTS if k in kwargs)
         #curveArgs = {}
         #for k in ['pen', 'shadowPen', 'fillLevel', 'brush']:
             #if k in kwargs:
@@ -1556,7 +1568,13 @@ class PlotDataItem(GraphicsObject):
 
         connect = self.opts['connect'] if isinstance(self.opts['connect'], np.ndarray) else None
         if self.opts['clipToView']:
-            if view is None or view.autoRangeEnabled()[0]:
+            if (
+                view is None
+                # while the item is being added to a ViewBox, it is briefly in the
+                # scene without a parent and getViewBox() returns the GraphicsView
+                or not hasattr(view, 'autoRangeEnabled')
+                or view.autoRangeEnabled()[0]
+            ):
                 pass  # no ViewBox to clip to, or view will autoscale to data range.
             else:
                 # clip-to-view always presumes that x-values are in increasing order

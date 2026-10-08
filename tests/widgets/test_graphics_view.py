@@ -1,3 +1,5 @@
+import pytest
+
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
@@ -78,3 +80,18 @@ def test_basics_graphics_view():
     assert view.currentItem is None
     assert view.sceneObj is None
     assert view.closed is True
+
+
+@pytest.mark.parametrize("widget_class", [pg.PlotWidget, pg.GraphicsLayoutWidget])
+@pytest.mark.parametrize("use_opengl", [True, False, None])
+def test_useOpenGL_is_forwarded(monkeypatch, widget_class, use_opengl):
+    # record the argument instead of creating an OpenGL viewport,
+    # which would require an OpenGL context
+    calls = []
+    monkeypatch.setattr(pg.GraphicsView, 'useOpenGL', lambda self, b=True: calls.append(b))
+
+    kwargs = {} if use_opengl is None else {'useOpenGL': use_opengl}
+    widget = widget_class(**kwargs)
+    expected = pg.getConfigOption('useOpenGL') if use_opengl is None else use_opengl
+    assert calls == [expected]
+    widget.close()

@@ -41,15 +41,16 @@ class PlotWidget(GraphicsView):
     sigRangeChanged = QtCore.Signal(object, object)
     sigTransformChanged = QtCore.Signal(object)
 
-    def __init__(self, parent=None, background='default', plotItem=None, **kwargs):
-        ## start by instantiating the plotItem attribute in order to avoid recursive 
+    def __init__(self, parent=None, background='default', plotItem=None, useOpenGL=None,
+                 **kwargs):
+        ## start by instantiating the plotItem attribute in order to avoid recursive
         ## calls of PlotWidget.__getattr__ - which access self.plotItem!
         self.plotItem = None
-        """When initializing PlotWidget, *parent* and *background* are passed to 
-        :func:`GraphicsWidget.__init__() <pyqtgraph.GraphicsWidget.__init__>`
+        """When initializing PlotWidget, *parent*, *background* and *useOpenGL* are
+        passed to :func:`GraphicsView.__init__() <pyqtgraph.GraphicsView.__init__>`
         and all others are passed
         to :func:`PlotItem.__init__() <pyqtgraph.PlotItem.__init__>`."""
-        GraphicsView.__init__(self, parent, background=background)
+        GraphicsView.__init__(self, parent, useOpenGL=useOpenGL, background=background)
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
         self.enableMouse(False)
         if plotItem is None:

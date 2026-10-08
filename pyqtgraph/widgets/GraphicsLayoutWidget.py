@@ -28,6 +28,9 @@ class GraphicsLayoutWidget(GraphicsView):
                effect.
     title      (str or None) If specified, then set the window title for this
                widget.
+    useOpenGL  (bool or None) Passed to :meth:`GraphicsView.__init__
+               <pyqtgraph.GraphicsView.__init__>`. If None, the 'useOpenGL'
+               configuration option is used.
     \**kwargs  All extra arguments are passed to :meth:`GraphicsLayout.__init__
                <pyqtgraph.GraphicsLayout.__init__>`
     =========  =================================================================
@@ -46,9 +49,10 @@ class GraphicsLayoutWidget(GraphicsView):
     :func:`itemIndex <pyqtgraph.GraphicsLayout.itemIndex>`
     :func:`clear <pyqtgraph.GraphicsLayout.clear>`
     """
-    def __init__(self, parent=None, show=False, size=None, title=None, **kwargs):
+    def __init__(self, parent=None, show=False, size=None, title=None, useOpenGL=None,
+                 **kwargs):
         mkQApp()
-        GraphicsView.__init__(self, parent)
+        GraphicsView.__init__(self, parent, useOpenGL=useOpenGL)
         self.ci = GraphicsLayout(**kwargs)
         for n in ['nextRow', 'nextCol', 'nextColumn', 'addPlot', 'addViewBox', 'addItem', 'getItem', 'addLayout', 'addLabel', 'removeItem', 'itemIndex', 'clear']:
             setattr(self, n, getattr(self.ci, n))

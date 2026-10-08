@@ -141,3 +141,48 @@ def test_plotitem_menu_initialize():
     assert viewbox is not None
     assert viewbox.menu is None
     assert viewbox.menuEnabled() is False
+
+
+def test_PlotItem_plot_keeps_explicit_performance_opts():
+    """Options passed to plot() are not reset to the PlotItem settings."""
+    item = pg.PlotItem()
+    curve = item.plot(
+        np.arange(100), rng.normal(size=100),
+        clipToView=True, autoDownsample=True, downsample=3, downsampleMethod='mean',
+    )
+    assert curve.opts['clipToView'] is True
+    assert curve.opts['autoDownsample'] is True
+    assert curve.opts['downsample'] == 3
+    assert curve.opts['downsampleMethod'] == 'mean'
+
+
+def test_PlotItem_addItem_applies_settings_to_unset_opts():
+    """PlotItem settings are still applied to options not set on the item."""
+    item = pg.PlotItem()
+    item.setDownsampling(ds=4, auto=True, mode='subsample')
+    item.setClipToView(True)
+
+    # no explicit options: all PlotItem settings are applied
+    curve1 = pg.PlotDataItem(rng.normal(size=10))
+    item.addItem(curve1)
+    assert curve1.opts['downsample'] == 4
+    assert curve1.opts['autoDownsample'] is True
+    assert curve1.opts['downsampleMethod'] == 'subsample'
+    assert curve1.opts['clipToView'] is True
+
+    # only the explicit options are kept
+    curve2 = pg.PlotDataItem(rng.normal(size=10), clipToView=False, downsample=2)
+    item.addItem(curve2)
+    assert curve2.opts['downsample'] == 2
+    assert curve2.opts['autoDownsample'] is True
+    assert curve2.opts['downsampleMethod'] == 'subsample'
+    assert curve2.opts['clipToView'] is False
+
+    # options given to setData before adding the item are explicit too
+    curve3 = pg.PlotDataItem()
+    curve3.setData(rng.normal(size=10), autoDownsample=False, downsampleMethod='peak')
+    item.addItem(curve3)
+    assert curve3.opts['downsample'] == 4
+    assert curve3.opts['autoDownsample'] is False
+    assert curve3.opts['downsampleMethod'] == 'peak'
+    assert curve3.opts['clipToView'] is True

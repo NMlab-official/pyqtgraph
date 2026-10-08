@@ -1,3 +1,4 @@
+import sys
 import warnings
 
 import numpy as np
@@ -237,4 +238,29 @@ def test_downsampling_with_connect():
         cs = c.curve.opts['connect']
         assert len(xs) == len(cs)
 
+    w.close()
+
+def test_clipToView_on_plot_does_not_raise(monkeypatch):
+    # while the item is added to the ViewBox, it is briefly in the scene without a
+    # parent, so getViewBox() returns the PlotWidget instead of a ViewBox. An error
+    # raised then happens inside itemChange and goes to sys.excepthook.
+    errors = []
+    monkeypatch.setattr(sys, 'excepthook', lambda *exc_info: errors.append(exc_info))
+
+    w = pg.PlotWidget()
+    c = w.plot(np.arange(1000), np.random.normal(size=1000), clipToView=True)
+    assert errors == []
+    assert c.opts['clipToView'] is True
+    w.close()
+
+def test_clipToView_without_viewbox():
+    # item directly in the scene: getViewBox() returns the GraphicsView,
+    # which provides no autoRangeEnabled(); data is displayed unclipped.
+    w = pg.PlotWidget()
+    x = np.arange(100.)
+    c = pg.PlotDataItem(x, np.random.normal(size=100), clipToView=True)
+    w.scene().addItem(c)
+    assert c.getViewBox() is w
+    xDisp, _ = c.getData()
+    assert np.array_equal(xDisp, x)
     w.close()
