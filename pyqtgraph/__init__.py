@@ -135,6 +135,7 @@ from .graphicsItems.AxisItem import *
 from .graphicsItems.BarGraphItem import *
 from .graphicsItems.BoxplotItem import *
 from .graphicsItems.ButtonItem import *
+from .graphicsItems.CandlestickItem import *
 from .graphicsItems.ColorBarItem import *
 from .graphicsItems.CurvePoint import *
 from .graphicsItems.DateAxisItem import *
