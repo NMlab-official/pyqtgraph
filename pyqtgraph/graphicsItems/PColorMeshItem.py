@@ -27,7 +27,17 @@ class QuadInstances:
         self.pointsarray = Qt.internals.PrimitiveArray(QtCore.QPointF, 2)
         self.resize(0, 0)
 
-    def resize(self, nrows, ncols):
+    def resize(self, nrows: int, ncols: int) -> None:
+        """
+        Allocate the vertices and quads of a mesh of ``nrows`` x ``ncols`` quads.
+
+        Parameters
+        ----------
+        nrows : int
+            Number of rows of quads.
+        ncols : int
+            Number of columns of quads.
+        """
         if nrows == self.nrows and ncols == self.ncols:
             return
 
@@ -35,24 +45,20 @@ class QuadInstances:
         self.ncols = ncols
 
         # (nrows + 1) * (ncols + 1) vertices, (x, y)
-        self.pointsarray.resize((nrows+1)*(ncols+1))
-        points = self.pointsarray.instances()
-        # points is a flattened list of a 2d array of
-        # QPointF(s) of shape (nrows+1, ncols+1)
+        npoints = (nrows+1)*(ncols+1)
+        self.pointsarray.resize(npoints)
+        points = np.fromiter(self.pointsarray.instances(), dtype=object, count=npoints)
+        # points is a 2d array of QPointF(s) of shape (nrows+1, ncols+1)
+        points = points.reshape(nrows+1, ncols+1)
 
         # pre-create quads from those instances of QPointF(s).
         # store the quads as a flattened list of a 2d array
         # of polygons of shape (nrows, ncols)
-        polys = np.ndarray(nrows*ncols, dtype=object)
-        for r in range(nrows):
-            for c in range(ncols):
-                bl = points[(r+0)*(ncols+1)+(c+0)]
-                tl = points[(r+0)*(ncols+1)+(c+1)]
-                br = points[(r+1)*(ncols+1)+(c+0)]
-                tr = points[(r+1)*(ncols+1)+(c+1)]
-                poly = (bl, br, tr, tl)
-                polys[r*ncols+c] = poly
-        self.polys = polys
+        bl = points[:-1, :-1].ravel()
+        br = points[1:, :-1].ravel()
+        tr = points[1:, 1:].ravel()
+        tl = points[:-1, 1:].ravel()
+        self.polys = np.fromiter(zip(bl, br, tr, tl), dtype=object, count=nrows*ncols)
 
     def ndarray(self):
         return self.pointsarray.ndarray()
@@ -275,8 +281,17 @@ class PColorMeshItem(GraphicsObject):
                 self.setLevels( (z_min, z_max), update=False)
 
     def _drawPicture(self) -> QtGui.QPicture:
-        # on entry, the following members are all valid: x, y, z, levels
-        # this function does not alter any state (besides using self.quads)
+        """
+        Draw the quads, grouped by color, into a picture.
+
+        On entry, the following members are all valid: x, y, z, levels. This function
+        does not alter any state (besides using self.quads).
+
+        Returns
+        -------
+        QtGui.QPicture
+            The picture of the quads.
+        """
 
         picture = QtGui.QPicture()
         painter = QtGui.QPainter(picture)
@@ -311,10 +326,9 @@ class PColorMeshItem(GraphicsObject):
             rng = 1
         norm = fn.rescaleData(valid_z, scale / rng, lo, dtype=int, clip=(0, len(lut)-1))
 
-        if QT_LIB.startswith('PyQt'):
-            drawConvexPolygon = lambda x : painter.drawConvexPolygon(*x)
-        else:
-            drawConvexPolygon = painter.drawConvexPolygon
+        drawConvexPolygon = painter.drawConvexPolygon
+        # PyQt takes the points of a polygon as separate arguments
+        unpackPoints = QT_LIB.startswith('PyQt')
 
         self.quads.resize(self.z.shape[0], self.z.shape[1])
         memory = self.quads.ndarray()
@@ -335,8 +349,12 @@ class PColorMeshItem(GraphicsObject):
             indices = sorted_indices[offset:offset+cnt]
             offset += cnt
             painter.setBrush(lut[coloridx])
-            for idx in indices:
-                drawConvexPolygon(polys[idx])
+            if unpackPoints:
+                for poly in polys[indices]:
+                    drawConvexPolygon(*poly)
+            else:
+                for poly in polys[indices]:
+                    drawConvexPolygon(poly)
 
         painter.end()
         return picture
