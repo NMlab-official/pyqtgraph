@@ -1,5 +1,6 @@
 from ..Qt import QtCore, QtGui, QtOpenGL, QtWidgets
 
+import bisect
 import math
 import warnings
 import weakref
@@ -225,7 +226,7 @@ class _VertexCache:
     """
 
     __slots__ = ('_xref', '_yref', '_connect', '_skipFiniteCheck',
-                 'computed', 'vertices', 'polylineFilled')
+                 'computed', 'vertices', 'polylineFilled', 'increasing')
 
     def __init__(self, x: np.ndarray, y: np.ndarray, connect: str,
                  skipFiniteCheck: bool) -> None:
@@ -236,6 +237,8 @@ class _VertexCache:
         self.computed = False
         self.vertices: tuple[np.ndarray, np.ndarray] | None = None
         self.polylineFilled = False
+        # whether the x values of the vertices never decrease; None until needed
+        self.increasing: bool | None = None
 
     def matches(self, x: np.ndarray, y: np.ndarray, connect: str,
                 skipFiniteCheck: bool) -> bool:
@@ -1102,6 +1105,152 @@ class PlotCurveItem(GraphicsObject):
             return False
         return self._getPolylineVertices() is not None
 
+    def _polylineVerticesAreData(self) -> bool:
+        """
+        Tell whether the polyline vertices are the data arrays themselves.
+
+        The line segments drawn by :meth:`_getLineSegments` then join consecutive
+        vertices.
+
+        Returns
+        -------
+        bool
+            True if the curve is a single polyline through all the data points.
+        """
+        vertices = self._getPolylineVertices()
+        return (
+            vertices is not None
+            and vertices[0] is self.xData
+            and vertices[1] is self.yData
+        )
+
+    def _getExposedVertexRange(
+        self,
+        painter: QtGui.QPainter,
+        option: QtWidgets.QStyleOptionGraphicsItem | None,
+        pens: list[QtGui.QPen],
+    ) -> tuple[int, int] | None:
+        """
+        Return the vertices to draw to repaint the exposed area of a polyline.
+
+        When Qt repaints a small part of the item, e.g. behind a moving cursor line,
+        ``option.exposedRect`` covers that part only, and the painter is clipped to it.
+        For a single polyline with increasing x values, the vertices around that
+        rectangle then draw the same pixels inside it as the whole curve.
+
+        This holds for the pens that the raster engine draws with its cosmetic
+        stroker (cosmetic, at most 1 px wide), which rasterizes each segment on its
+        own. Wider pens are stroked as one outline, whose rasterization near the edges
+        of the device or at high zoom levels is not strictly local: the whole curve is
+        drawn for them.
+
+        Parameters
+        ----------
+        painter : QtGui.QPainter
+            The active painter.
+        option : QtWidgets.QStyleOptionGraphicsItem or None
+            Style options passed to :meth:`paint`.
+        pens : list of QtGui.QPen
+            The pens about to stroke the curve.
+
+        Returns
+        -------
+        tuple of int or None
+            ``(start, stop)`` slice of the vertices of :meth:`_getPolylineVertices`
+            to draw, or None to draw the whole curve.
+        """
+        if option is None or self._exportOpts is not False or not pens:
+            return None
+        exposed = option.exposedRect
+        bounds = self.boundingRect()
+        if (
+            exposed.isEmpty()
+            or (exposed.left() <= bounds.left() and exposed.right() >= bounds.right())
+        ):
+            return None
+        for pen in pens:
+            if (
+                not pen.isCosmetic()
+                or pen.widthF() > 1.0
+                # the dash pattern or the brush would depend on the first vertex drawn
+                or pen.style() != QtCore.Qt.PenStyle.SolidLine
+                or not pen.isSolid()
+            ):
+                return None
+        if painter.paintEngine().type() != QtGui.QPaintEngine.Type.Raster:
+            return None
+        # drawPath also fills the path with the brush of the painter, a global shape
+        if painter.brush().style() != QtCore.Qt.BrushStyle.NoBrush:
+            return None
+        transform = painter.transform()
+        if not transform.isAffine() or transform.isRotating() or transform.m11() == 0.0:
+            return None
+        # A 1 px line, antialiased or not, reaches less than 2 pixels around a segment.
+        margin = 4.0 / abs(transform.m11())
+
+        vertices = self._getPolylineVertices()
+        if vertices is None:
+            return None
+        x, y = vertices
+        size = len(x)
+        if size < 4:
+            return None
+        cache = self._vertexCache
+        if cache.increasing is None:
+            cache.increasing = bool(np.all(x[1:] >= x[:-1]))
+        if not cache.increasing:
+            return None
+
+        # The first and last segments drawn get the caps of the polyline, which also
+        # shift their rasterization: they must lie entirely beyond the margin. So the
+        # slice starts one vertex before the last vertex left of the margin, and ends
+        # one vertex after the first vertex right of it.
+        start = max(bisect.bisect_left(x, exposed.left() - margin) - 2, 0)
+        stop = min(bisect.bisect_right(x, exposed.right() + margin) + 2, size)
+        if stop - start > size // 2:
+            # a large part is exposed: the cached geometry of the whole curve is faster
+            return None
+        if x[start] == x[stop - 1] and y[start] == y[stop - 1]:
+            # Qt would stroke this slice as a closed polyline
+            return None
+        return start, stop
+
+    def _getVertexSlicePolyline(self, start: int, stop: int) -> QtGui.QPolygonF:
+        """
+        Return a slice of the polyline vertices as a new ``QPolygonF``.
+
+        Parameters
+        ----------
+        start, stop : int
+            Slice of the vertices of :meth:`_getPolylineVertices`.
+
+        Returns
+        -------
+        QtGui.QPolygonF
+            The vertices ``start`` to ``stop - 1``.
+        """
+        x, y = self._getPolylineVertices()
+        return fn.arrayToQPolygonF(x[start:stop], y[start:stop])
+
+    def _getVertexSliceSegments(self, start: int, stop: int) -> tuple:
+        """
+        Return the line segments joining a slice of the polyline vertices.
+
+        Parameters
+        ----------
+        start, stop : int
+            Slice of the vertices of :meth:`_getPolylineVertices`.
+
+        Returns
+        -------
+        tuple
+            Arguments of ``QPainter.drawLines``.
+        """
+        x, y = self._getPolylineVertices()
+        segments = arrayToLineSegments(x[start:stop], y[start:stop], connect='all',
+                                       finiteCheck=False)
+        return segments.drawargs()
+
     def _getClosingSegments(self):
         # this is only used for fillOutline
         # no point caching with so few elements generated
@@ -1242,7 +1391,9 @@ class PlotCurveItem(GraphicsObject):
 
         The ``QPainterPath`` of the curve is only built when it is drawn: curves drawn
         as line segments (see :meth:`setSegmentedLineMode`) or, when the rendering is
-        identical, as a polyline, do not need it.
+        identical, as a polyline, do not need it. When only a small part of a curve
+        with increasing x values is exposed, only the vertices covering that part are
+        drawn.
 
         Parameters
         ----------
@@ -1256,6 +1407,13 @@ class PlotCurveItem(GraphicsObject):
         profiler = debug.Profiler()
         if self.xData is None or len(self.xData) == 0:
             return
+
+        extendedStyleOption = (
+            QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption)
+        if not self.flags() & extendedStyleOption:
+            # from the next paint on, Qt sets opt.exposedRect to the area to repaint
+            # instead of the whole bounding rectangle (see _getExposedVertexRange)
+            self.setFlag(extendedStyleOption)
 
         # opengl fill mode supports filling to a fillLevel
         # for connect="all" and connect="finite" only.
@@ -1336,23 +1494,38 @@ class PlotCurveItem(GraphicsObject):
                     p.fillPath(path, brush)
                 profiler('draw fill path')
 
-            for pen_kind in ['shadowPen', 'pen']:
-                pen = self.opts[pen_kind]
-                if pen is None or pen.style() == QtCore.Qt.PenStyle.NoPen:
-                    continue
+            pens = [
+                pen for pen in (self.opts['shadowPen'], self.opts['pen'])
+                if pen is not None and pen.style() != QtCore.Qt.PenStyle.NoPen
+            ]
+            # only the vertices needed to repaint the exposed area, if they are few
+            vertexRange = None if do_fill else self._getExposedVertexRange(p, opt, pens)
+
+            for pen in pens:
                 p.setPen(pen)
 
                 if (
                     path_transform is None
                     and self._shouldUseDrawLineSegments(pen)
                 ):
-                    p.drawLines(*self._getLineSegments())
+                    if vertexRange is not None and self._polylineVerticesAreData():
+                        p.drawLines(*self._getVertexSliceSegments(*vertexRange))
+                    else:
+                        p.drawLines(*self._getLineSegments())
                     if do_fill_outline:
                         p.drawLines(self._getClosingSegments())
                 elif self._shouldUseDrawPolyline(p, pen, aa):
-                    polyline = self._getPolyline()
+                    if vertexRange is None:
+                        polyline = self._getPolyline()
+                    else:
+                        polyline = self._getVertexSlicePolyline(*vertexRange)
                     if len(polyline) >= 2:
                         p.drawPolyline(polyline)
+                elif vertexRange is not None:
+                    # the path of the slice, element for element a part of getPath()
+                    path = QtGui.QPainterPath()
+                    path.addPolygon(self._getVertexSlicePolyline(*vertexRange))
+                    p.drawPath(path)
                 else:
                     if do_fill_outline:
                         path = self._getFillPath()
