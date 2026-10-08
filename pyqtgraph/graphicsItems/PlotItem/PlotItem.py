@@ -580,7 +580,7 @@ class PlotItem(GraphicsWidget):
     def viewStateChanged(self):
         self.updateButtons()
 
-    def addItem(self, item, *args, **kwargs):
+    def addItem(self, item: QtWidgets.QGraphicsItem, *args, **kwargs) -> None:
         """
         Add a :class:`~pyqtgraph.GraphicsItem` to the :class:`~pyqtgraph.ViewBox`.
         
@@ -627,6 +627,8 @@ class PlotItem(GraphicsWidget):
             params = kwargs.get('params', {})
             self.itemMeta[item] = params
             self.curves.append(item)
+            # only the parameters of the new curve need to be listed
+            self._addParamListItems(item)
         
         # Toggle log mode if item implements setLogMode and selected in the context menu
         if hasattr(item, 'setLogMode'):
@@ -641,14 +643,13 @@ class PlotItem(GraphicsWidget):
             item.setAlpha(alpha, auto)
             item.setSubtractMeanMode(self.ctrl.subtractMeanCheck.isChecked())
             item.setFftMode(self.ctrl.fftCheck.isChecked())
-            item.setDownsampling(*self.downsampleMode())
-            item.setClipToView(self.clipToViewMode())
+            # options set explicitly on the item are kept
+            item._applyPlotDefaults(*self.downsampleMode(), self.clipToViewMode())
             
             ## Hide older plots if needed
             self.updateDecimation()
             
             ## Add to average if needed
-            self.updateParamList()
             if self.ctrl.averageGroup.isChecked() and 'skipAverage' not in kwargs:
                 self.addAvgCurve(item)
 
@@ -698,7 +699,7 @@ class PlotItem(GraphicsWidget):
             line.setZValue(z)
         return line
 
-    def removeItem(self, item):
+    def removeItem(self, item: QtWidgets.QGraphicsItem) -> None:
         """
         Remove an item from the plot.
 
@@ -718,7 +719,10 @@ class PlotItem(GraphicsWidget):
         if item in self.curves:
             self.curves.remove(item)
             self.updateDecimation()
-            self.updateParamList()
+            if self.itemMeta.get(item):
+                # parameters only used by the removed curve are dropped from the list;
+                # without parameters, the list is unchanged.
+                self.updateParamList()
 
         if self.legend is not None:
             self.legend.removeItem(item)
@@ -955,26 +959,48 @@ class PlotItem(GraphicsWidget):
     def replot(self):
         self.update()
 
-    def updateParamList(self):
+    def updateParamList(self) -> None:
+        """
+        Rebuild the list of curve parameters shown in the averaging menu.
+
+        The list holds each parameter passed in the `params` argument of
+        :meth:`addItem` once, in order of first appearance over all curves. Check
+        states are restored from :attr:`paramList`.
+        """
         self.ctrl.avgParamList.clear()
         ## Check to see that each parameter for each curve is present in the list
         for c in self.curves:
-            for p in list(self.itemMeta.get(c, {}).keys()):
-                if type(p) is tuple:
-                    p = '.'.join(p)
+            self._addParamListItems(c)
 
-                if matches := self.ctrl.avgParamList.findItems(
-                    p, QtCore.Qt.MatchFlag.MatchExactly
-                ):
-                    i = matches[0]
+    def _addParamListItems(self, curve: QtWidgets.QGraphicsItem) -> None:
+        """
+        Add the parameters of one curve to the averaging parameter list.
+
+        Parameters already listed are kept. Appending the parameters of each new curve
+        yields the same list as :meth:`updateParamList`, in O(1) per added curve
+        instead of a rebuild over all curves.
+
+        Parameters
+        ----------
+        curve : :class:`~pyqtgraph.GraphicsItem`
+            Data item whose `params` (see :meth:`addItem`) are added.
+        """
+        for p in list(self.itemMeta.get(curve, {}).keys()):
+            if type(p) is tuple:
+                p = '.'.join(p)
+
+            if matches := self.ctrl.avgParamList.findItems(
+                p, QtCore.Qt.MatchFlag.MatchExactly
+            ):
+                i = matches[0]
+            else:
+                i = QtWidgets.QListWidgetItem(p)
+                if p in self.paramList and self.paramList[p] is True:
+                    i.setCheckState(QtCore.Qt.CheckState.Checked)
                 else:
-                    i = QtWidgets.QListWidgetItem(p)
-                    if p in self.paramList and self.paramList[p] is True:
-                        i.setCheckState(QtCore.Qt.CheckState.Checked)
-                    else:
-                        i.setCheckState(QtCore.Qt.CheckState.Unchecked)
-                    self.ctrl.avgParamList.addItem(i)
-                self.paramList[p] = (i.checkState() == QtCore.Qt.CheckState.Checked)
+                    i.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                self.ctrl.avgParamList.addItem(i)
+            self.paramList[p] = (i.checkState() == QtCore.Qt.CheckState.Checked)
 
     def writeSvg(self, fileName=None):
         """

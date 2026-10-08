@@ -21,6 +21,51 @@ translate = QtCore.QCoreApplication.translate
 __all__ = ['ImageItem']
 
 
+class _LutDerivedCache:
+    """
+    Cache of a value derived from a lookup table.
+
+    The value is kept while the same table object is passed, and recomputed when the
+    table is replaced or its content is modified in place.
+    """
+
+    __slots__ = ('_lut', '_content', '_value', '_valid')
+
+    def __init__(self) -> None:
+        self._lut = None
+        self._content = None
+        self._value = None
+        self._valid = False
+
+    def get(self, lut: np.ndarray | None, derive: Callable) -> object:
+        """
+        Return the value derived from `lut`, computing it if needed.
+
+        Parameters
+        ----------
+        lut : np.ndarray or None
+            Lookup table, on the array module of the image (numpy or cupy).
+        derive : callable
+            Function computing the value from `lut`.
+
+        Returns
+        -------
+        object
+            The cached or newly computed ``derive(lut)``.
+        """
+        if not (
+            self._valid
+            and self._lut is lut
+            # dispatched to cupy.array_equal for cupy arrays
+            and (lut is None or bool(np.array_equal(lut, self._content)))
+        ):
+            self._value = derive(lut)
+            self._lut = lut
+            self._content = None if lut is None else lut.copy()
+            self._valid = True
+        return self._value
+
+
 class ImageItem(GraphicsObject):
     """
     Graphics object used to display image data.
@@ -84,6 +129,7 @@ class ImageItem(GraphicsObject):
         self._deferredLevels = None
         self._imageHasNans = None    # None : not yet known
         self._imageNanLocations = None
+        self._resampledLutCache = _LutDerivedCache()  # 256-entry equivalents of luts
         self._defaultAutoLevels = True
 
         self.axisOrder = getConfigOption('imageAxisOrder')
@@ -292,7 +338,9 @@ class ImageItem(GraphicsObject):
         Notes
         -----
         For performance reasons, if not passing a callable, every effort should be made
-        to keep the number of entries to `<= 256`.
+        to keep the number of entries to `<= 256`. For floating point monochrome
+        images, a larger table is resampled to 256 entries when this changes no
+        displayed color by more than one level per channel.
         """
 
         if lut is not self.lut:
@@ -736,8 +784,10 @@ class ImageItem(GraphicsObject):
         } | kwargs
         return self.setImage(*args, **defaults)
 
-    def render(self):
-        # Convert data to QImage for display.
+    def render(self) -> None:
+        """
+        Convert the image data to the QImage displayed by :meth:`paint`.
+        """
         self._unrenderable = True
         if self.image is None or self.image.size == 0:
             return
@@ -795,6 +845,15 @@ class ImageItem(GraphicsObject):
 
         levels = self.levels
 
+        if (
+            lut is not None
+            and image.ndim == 2
+            and image.dtype.kind == 'f'
+            and lut.dtype == self._xp.uint8
+            and lut.shape[0] > 256
+        ):
+            # keep float mono images on the Indexed8 path, which needs <= 256 entries
+            lut = self._resampledLookupTable(lut)
 
         qimage = None
 
@@ -855,6 +914,31 @@ class ImageItem(GraphicsObject):
 
         self._renderRequired = False
         self._unrenderable = False
+
+    def _resampledLookupTable(self, lut: np.ndarray) -> np.ndarray:
+        """
+        Return a 256-entry equivalent of a lookup table with more than 256 entries.
+
+        The resampled table is cached by identity of `lut`; a table modified in place is
+        resampled again.
+
+        Parameters
+        ----------
+        lut : np.ndarray
+            Lookup table of dtype uint8 with more than 256 entries, on the array module
+            of the image.
+
+        Returns
+        -------
+        np.ndarray
+            A 256-entry table displaying every value with a color at most one level per
+            channel away from its color through `lut`, or `lut` itself if no such table
+            exists (e.g. for tables with sharp color transitions).
+        """
+        resampled = self._resampledLutCache.get(
+            lut, lambda table: functions_qimage._resample_lut(self._xp, table, 256)
+        )
+        return lut if resampled is None else resampled
 
     def paint(self, painter: QtGui.QPainter, *args):
         profile = debug.Profiler()

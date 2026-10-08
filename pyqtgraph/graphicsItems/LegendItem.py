@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import math
+import weakref
 
 from .. import functions as fn
 from ..icons import getGraphPixmap
@@ -32,38 +35,50 @@ class LegendItem(GraphicsWidgetAnchor, GraphicsWidget):
     sigDoubleClicked = QtCore.Signal(object, object)
     sigSampleClicked = QtCore.Signal(object)
 
-    def __init__(self, size=None, offset=None, horSpacing=5, verSpacing=0,
-                 pen=None, brush=None, labelTextColor=None, frame=True,
-                 labelTextSize='9pt', colCount=1, sampleType=None, **kwargs):
+    def __init__(self, size: tuple[float, float] | None = None,
+                 offset: tuple[float, float] | None = None, horSpacing: float = 5,
+                 verSpacing: float = 0, pen: object = None, brush: object = None,
+                 labelTextColor: object = None, frame: bool = True,
+                 labelTextSize: str = '9pt', colCount: int = 1,
+                 sampleType: type | None = None, **kwargs) -> None:
         """
-        ==============  ===============================================================
-        **Arguments:**
-        size            Specifies the fixed size (width, height) of the legend. If
-                        this argument is omitted, the legend will automatically resize
-                        to fit its contents.
-        offset          Specifies the offset position relative to the legend's parent.
-                        Positive values offset from the left or top; negative values
-                        offset from the right or bottom. If offset is None, the
-                        legend must be anchored manually by calling anchor() or
-                        positioned by calling setPos().
-        horSpacing      Specifies the spacing between the line symbol and the label.
-        verSpacing      Specifies the spacing between individual entries of the legend
-                        vertically. (Can also be negative to have them really close)
-        pen             Pen to use when drawing legend border. Any single argument
-                        accepted by :func:`mkPen <pyqtgraph.mkPen>` is allowed.
-        brush           QBrush to use as legend background filling. Any single argument
-                        accepted by :func:`mkBrush <pyqtgraph.mkBrush>` is allowed.
-        labelTextColor  Pen to use when drawing legend text. Any single argument
-                        accepted by :func:`mkPen <pyqtgraph.mkPen>` is allowed.
-        labelTextSize   Size to use when drawing legend text. Accepts CSS style
-                        string arguments, e.g. '9pt'.
-        colCount        Specifies the integer number of columns that the legend should
-                        be divided into. The number of rows will be calculated
-                        based on this argument. This is useful for plots with many
-                        curves displayed simultaneously. Default: 1 column.
-        sampleType      Customizes the item sample class of the `LegendItem`.
-        ==============  ===============================================================
-
+        Parameters
+        ----------
+        size : tuple of float, float, optional
+            Specifies the fixed size (width, height) of the legend. If this argument
+            is omitted, the legend will automatically resize to fit its contents.
+        offset : tuple of float, float, optional
+            Specifies the offset position relative to the legend's parent. Positive
+            values offset from the left or top; negative values offset from the right
+            or bottom. If offset is None, the legend must be anchored manually by
+            calling anchor() or positioned by calling setPos().
+        horSpacing : float, default 5
+            Specifies the spacing between the line symbol and the label.
+        verSpacing : float, default 0
+            Specifies the spacing between individual entries of the legend
+            vertically. (Can also be negative to have them really close)
+        pen : object, optional
+            Pen to use when drawing legend border. Any single argument accepted by
+            :func:`mkPen <pyqtgraph.mkPen>` is allowed.
+        brush : object, optional
+            QBrush to use as legend background filling. Any single argument accepted
+            by :func:`mkBrush <pyqtgraph.mkBrush>` is allowed.
+        labelTextColor : object, optional
+            Pen to use when drawing legend text. Any single argument accepted by
+            :func:`mkPen <pyqtgraph.mkPen>` is allowed.
+        frame : bool, default True
+            Draw the border and the background of the legend.
+        labelTextSize : str, default '9pt'
+            Size to use when drawing legend text. Accepts CSS style string arguments,
+            e.g. '9pt'.
+        colCount : int, default 1
+            Specifies the integer number of columns that the legend should be divided
+            into. The number of rows will be calculated based on this argument. This
+            is useful for plots with many curves displayed simultaneously.
+        sampleType : type, optional
+            Customizes the item sample class of the `LegendItem`.
+        **kwargs
+            Additional options stored in the ``opts`` dictionary.
         """
         GraphicsWidget.__init__(self)
         GraphicsWidgetAnchor.__init__(self)
@@ -78,6 +93,15 @@ class LegendItem(GraphicsWidgetAnchor, GraphicsWidget):
         self.frame = frame
         self.columnCount = colCount
         self.rowCount = 1
+        # Adding or removing entries only marks the size as outdated; the size is
+        # recomputed once per batch, before the next render or export at the latest
+        # (see _requestSizeUpdate).
+        self._sizeUpdatePending = False
+        self._sizeUpdateScene = None  # weak reference, see _requestSizeUpdate
+        self._sizeUpdateTimer = QtCore.QTimer(self)
+        self._sizeUpdateTimer.setSingleShot(True)
+        self._sizeUpdateTimer.setInterval(0)
+        self._sizeUpdateTimer.timeout.connect(self._flushSizeUpdate)
         if size is not None:
             self.setGeometry(QtCore.QRectF(0, 0, self.size[0], self.size[1]))
 
@@ -201,18 +225,24 @@ class LegendItem(GraphicsWidgetAnchor, GraphicsWidget):
             self.anchor(itemPos=anchor, parentPos=anchor, offset=offset)
         return ret
 
-    def addItem(self, item, name):
+    def addItem(self, item: QtWidgets.QGraphicsItem, name: str) -> None:
         """
         Add a new entry to the legend.
 
-        ==============  ========================================================
-        **Arguments:**
-        item            A :class:`~pyqtgraph.PlotDataItem` from which the line
-                        and point style of the item will be determined or an
-                        instance of ItemSample (or a subclass), allowing the
-                        item display to be customized.
-        title           The title to display for this item. Simple HTML allowed.
-        ==============  ========================================================
+        The size of the legend is not recomputed immediately: the update is
+        coalesced with those of the other entries added in the same batch and runs
+        on the next event loop iteration or before the scene is next rendered,
+        whichever comes first. This keeps adding ``n`` entries linear in ``n``.
+        Call :meth:`updateSize` to resize the legend immediately.
+
+        Parameters
+        ----------
+        item : QtWidgets.QGraphicsItem
+            A :class:`~pyqtgraph.PlotDataItem` from which the line and point style
+            of the item will be determined or an instance of ItemSample (or a
+            subclass), allowing the item display to be customized.
+        name : str
+            The title to display for this item. Simple HTML allowed.
         """
         label = LabelItem(name, color=self.opts['labelTextColor'],
                           justify='left', size=self.opts['labelTextSize'])
@@ -225,7 +255,7 @@ class LegendItem(GraphicsWidgetAnchor, GraphicsWidget):
 
         self.items.append((sample, label))
         self._addItemToLayout(sample, label)
-        self.updateSize()
+        self._requestSizeUpdate()
 
     def _addItemToLayout(self, sample, label):
         col = self.layout_.columnCount()
@@ -285,19 +315,24 @@ class LegendItem(GraphicsWidgetAnchor, GraphicsWidget):
             if scene:
                 scene.removeItem(item)
 
-    def removeItem(self, item):
-        """Removes one item from the legend.
+    def removeItem(self, item: QtWidgets.QGraphicsItem | str) -> None:
+        """
+        Remove one item from the legend.
 
-        ==============  ========================================================
-        **Arguments:**
-        item            The item to remove or its name.
-        ==============  ========================================================
+        As for :meth:`addItem`, the size of the legend is updated once per batch,
+        before the next render at the latest; call :meth:`updateSize` to resize the
+        legend immediately.
+
+        Parameters
+        ----------
+        item : QtWidgets.QGraphicsItem or str
+            The item to remove or its name.
         """
         for sample, label in self.items:
             if sample.item is item or label.text == item:
                 self.items.remove((sample, label))  # remove from itemlist
                 self._removeItemFromLayout(sample, label)
-                self.updateSize()  # redraw box
+                self._requestSizeUpdate()  # redraw box
                 return  # return after first match
 
     def clear(self):
@@ -308,7 +343,16 @@ class LegendItem(GraphicsWidgetAnchor, GraphicsWidget):
         self.items = []
         self.updateSize()
 
-    def updateSize(self):
+    def updateSize(self) -> None:
+        """
+        Resize the legend to fit its entries, unless a fixed size was given.
+
+        Any size update requested by :meth:`addItem` or :meth:`removeItem` and not
+        yet performed is completed by this call.
+        """
+        self._sizeUpdatePending = False
+        self._sizeUpdateTimer.stop()
+        self._disconnectSizeUpdate()
         if self.size is not None:
             return
         height = 0
@@ -325,6 +369,66 @@ class LegendItem(GraphicsWidgetAnchor, GraphicsWidget):
             height += row_height
         self.setGeometry(0, 0, width, height)
         return
+
+    def _requestSizeUpdate(self) -> None:
+        """
+        Schedule a single :meth:`updateSize` call for a batch of entry changes.
+
+        ``updateSize`` walks every entry and relays out the whole grid, so calling it
+        for each added entry made adding ``n`` entries quadratic. The update runs
+        once, at the first of: the next event loop iteration (zero-delay timer), the
+        scene's ``sigPrepareForPaint`` emitted before a render (image exports without
+        an event loop included), or :meth:`setExportMode` (SVG exports).
+        """
+        if self._sizeUpdatePending:
+            return
+        self._sizeUpdatePending = True
+        self._sizeUpdateTimer.start()
+        # Connected only while an update is pending, so that renders do not call
+        # back into the legend otherwise.
+        scene = self.scene()
+        if scene is not None and hasattr(scene, 'sigPrepareForPaint'):
+            scene.sigPrepareForPaint.connect(self._flushSizeUpdate)
+            self._sizeUpdateScene = weakref.ref(scene)
+
+    def _disconnectSizeUpdate(self) -> None:
+        """Disconnect the scene signal connected by :meth:`_requestSizeUpdate`."""
+        sceneRef = self._sizeUpdateScene
+        if sceneRef is None:
+            return
+        self._sizeUpdateScene = None
+        scene = sceneRef()
+        if scene is None:
+            return
+        try:
+            scene.sigPrepareForPaint.disconnect(self._flushSizeUpdate)
+        except (TypeError, RuntimeError):
+            pass  # the scene is being deleted
+
+    @QtCore.Slot()
+    def _flushSizeUpdate(self) -> None:
+        """Perform the size update requested by :meth:`_requestSizeUpdate`, if any."""
+        if self._sizeUpdatePending:
+            self.updateSize()
+
+    def setExportMode(self, export: bool, opts: dict | None = None) -> None:
+        """
+        Complete any pending size update before the legend is exported.
+
+        Exporters that paint items one by one, such as the SVG exporter, do not
+        emit ``sigPrepareForPaint``.
+
+        Parameters
+        ----------
+        export : bool
+            True before exporting and False afterward.
+        opts : dict, optional
+            Export options, see :meth:`GraphicsItem.setExportMode
+            <pyqtgraph.GraphicsItem.setExportMode>`.
+        """
+        if export:
+            self._flushSizeUpdate()
+        super().setExportMode(export, opts)
 
     def boundingRect(self):
         return QtCore.QRectF(0, 0, self.width(), self.height())

@@ -1,7 +1,10 @@
 import itertools
 import math
+import operator
 import weakref
 from collections import OrderedDict
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -11,6 +14,9 @@ from .. import getConfigOption
 from ..Point import Point
 from ..Qt import QtCore, QtGui
 from .GraphicsObject import GraphicsObject
+
+if TYPE_CHECKING:
+    from ..GraphicsScene.mouseEvents import HoverEvent
 
 __all__ = ['ScatterPlotItem', 'SpotItem']
 
@@ -136,6 +142,29 @@ def _mkBrush(*args, **kwargs):
         return args[0]
     else:
         return fn.mkBrush(*args, **kwargs)
+
+
+def _isNoneMask(col: np.ndarray) -> np.ndarray:
+    """
+    Return a mask of the entries of an object array that are ``None``.
+
+    The entries are tested by identity. ``np.equal(col, None)`` would instead call the
+    ``__eq__`` method of every entry, which is slow for Qt objects such as ``QPen`` and
+    ``QBrush``.
+
+    Parameters
+    ----------
+    col : numpy.ndarray
+        One-dimensional array, usually of ``object`` dtype.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array of the same length as ``col``, ``True`` where the entry is ``None``.
+    """
+    # iterating over a list is faster than iterating over an object array
+    return np.fromiter(map(operator.is_, col.tolist(), itertools.repeat(None)),
+                       dtype=bool, count=len(col))
 
 
 class SymbolAtlas(object):
@@ -802,7 +831,33 @@ class ScatterPlotItem(GraphicsObject):
             self.data['sourceRect'] = 0
             self.updateSpots()
 
-    def _style(self, opts, data=None, idx=None, scale=None):
+    def _style(self, opts: list[str], data: np.ndarray | None = None,
+               idx: np.ndarray | slice | None = None,
+               scale: float | None = None) -> Iterator[np.ndarray]:
+        """
+        Generate the effective style columns of a set of spots.
+
+        Unset entries (``None`` for ``symbol``, ``pen`` and ``brush``, ``-1`` for
+        ``size``) are replaced by the item default, and hovered spots take the hover
+        style when one is set.
+
+        Parameters
+        ----------
+        opts : list of str
+            Names of the style columns to generate, among ``'symbol'``, ``'size'``,
+            ``'pen'`` and ``'brush'``.
+        data : numpy.ndarray, optional
+            Structured spot array; defaults to ``self.data``.
+        idx : numpy.ndarray or slice, optional
+            Boolean mask or index selecting the spots; defaults to all spots.
+        scale : float, optional
+            Factor applied to the ``size`` column.
+
+        Yields
+        ------
+        numpy.ndarray
+            One new array per name of ``opts``, in the same order.
+        """
         if data is None:
             data = self.data
 
@@ -819,22 +874,45 @@ class ScatterPlotItem(GraphicsObject):
                 if val != _DEFAULT_STYLE[opt]:
                     col[data['hovered'][idx]] = val
 
-            col[np.equal(col, _DEFAULT_STYLE[opt])] = self.opts[opt]
+            default = _DEFAULT_STYLE[opt]
+            if default is None:
+                # identity test: np.equal would call QPen/QBrush.__eq__ per element
+                col[_isNoneMask(col)] = self.opts[opt]
+            else:
+                col[np.equal(col, default)] = self.opts[opt]
 
             if opt == 'size' and scale is not None:
                 col *= scale
 
             yield col
 
-    def _updateMaxSpotSizes(self, **kwargs):
+    def _updateMaxSpotSizes(self, **kwargs) -> None:
+        """
+        Update the maximum spot sizes, which pad the data bounds and bounding rect.
+
+        When they change, the geometry change is announced to the scene and the data
+        bounds change to the view (which caches the data bounds of its items).
+
+        Parameters
+        ----------
+        **kwargs
+            Arguments of :meth:`_style` selecting the spots measured (``data``,
+            ``idx``).
+        """
         if self.opts['pxMode'] and self.opts['useCache']:
             w, pw = 0, self.fragmentAtlas.maxWidth
         else:
             w, pw = max(itertools.chain([(self._maxSpotWidth, self._maxSpotPxWidth)],
                               self._measureSpotSizes(**kwargs)))
+        changed = (w, pw) != (self._maxSpotWidth, self._maxSpotPxWidth)
+        boundsChanged = w != self._maxSpotWidth
+        if changed:
+            self.prepareGeometryChange()  # before the bounding rect changes
         self._maxSpotWidth = w
         self._maxSpotPxWidth = pw
         self.bounds = [None, None]
+        if boundsChanged:
+            self.informViewBoundsChanged()
 
     def _measureSpotSizes(self, **kwargs):
         """Generate pairs (width, pxWidth) for spots in data"""
@@ -884,8 +962,11 @@ class ScatterPlotItem(GraphicsObject):
                 return (None, None)
 
         if frac >= 1.0:
-            self.bounds[ax] = (np.nanmin(d) - self._maxSpotWidth*0.7072, np.nanmax(d) + self._maxSpotWidth*0.7072)
-            return self.bounds[ax]
+            bounds = (np.nanmin(d) - self._maxSpotWidth*0.7072, np.nanmax(d) + self._maxSpotWidth*0.7072)
+            if orthoRange is None:
+                # only the full-range bounds are cached
+                self.bounds[ax] = bounds
+            return bounds
         elif frac <= 0.0:
             raise Exception("Value for parameter 'frac' must be > 0. (got %s)" % str(frac))
         else:
@@ -926,9 +1007,10 @@ class ScatterPlotItem(GraphicsObject):
         return QtCore.QRectF(xmn-px, ymn-py, (2*px)+xmx-xmn, (2*py)+ymx-ymn)
 
     def viewTransformChanged(self):
+        # The cached data bounds do not depend on the view (pixel padding is applied
+        # in boundingRect), so they are kept: recomputing them is O(N).
         self.prepareGeometryChange()
         GraphicsObject.viewTransformChanged(self)
-        self.bounds = [None, None]
 
     def setExportMode(self, *args, **kwargs):
         GraphicsObject.setExportMode(self, *args, **kwargs)
@@ -1023,8 +1105,48 @@ class ScatterPlotItem(GraphicsObject):
                 rec['item'] = SpotItem(rec, self, i)
         return self.data['item']
 
-    def pointsAt(self, pos):
-        return self.points()[self._maskAt(pos)][::-1]
+    def _pointsForIndices(self, idx: np.ndarray) -> np.ndarray:
+        """
+        Return the SpotItems of the given spots, creating only the missing ones.
+
+        Unlike :meth:`points`, which creates a SpotItem for every spot, this method only
+        creates those of ``idx``. Hit tests use it so that their cost does not depend on
+        the total number of spots.
+
+        Parameters
+        ----------
+        idx : numpy.ndarray
+            One-dimensional integer array of spot indices.
+
+        Returns
+        -------
+        numpy.ndarray
+            Object array of :class:`SpotItem`, in the order of ``idx``.
+        """
+        items = self.data['item']
+        for i in idx.tolist():
+            if items[i] is None:
+                items[i] = SpotItem(self.data[i], self, i)
+        return items[idx]
+
+    def pointsAt(self, pos: QtCore.QPointF | QtCore.QRectF) -> np.ndarray:
+        """
+        Return the visible spots overlapping a position or a rectangle.
+
+        Only the SpotItems of the spots found are created.
+
+        Parameters
+        ----------
+        pos : QtCore.QPointF or QtCore.QRectF
+            Position or rectangle in item coordinates.
+
+        Returns
+        -------
+        numpy.ndarray
+            Object array of :class:`SpotItem`, in reverse data order (the spot drawn on
+            top first).
+        """
+        return self._pointsForIndices(np.flatnonzero(self._maskAt(pos))[::-1])
 
     def _maskAt(self, obj):
         """
@@ -1084,7 +1206,18 @@ class ScatterPlotItem(GraphicsObject):
         else:
             ev.ignore()
 
-    def hoverEvent(self, ev):
+    def hoverEvent(self, ev: 'HoverEvent') -> None:
+        """
+        Update the hovered spots, their tool tip, and emit ``sigHovered``.
+
+        Nothing is done unless the item was created with ``hoverable=True``. Only the
+        SpotItems of the hovered spots are created.
+
+        Parameters
+        ----------
+        ev : HoverEvent
+            The hover event delivered by the scene.
+        """
         if self.opts['hoverable']:
             old = self.data['hovered']
 
@@ -1098,7 +1231,7 @@ class ScatterPlotItem(GraphicsObject):
                 self.data['hovered'] = new
                 self.updateSpots()
 
-            points = self.points()[new][::-1]
+            points = self._pointsForIndices(np.flatnonzero(new)[::-1])
 
             # Show information about hovered points in a tool tip
             vb = self.getViewBox()

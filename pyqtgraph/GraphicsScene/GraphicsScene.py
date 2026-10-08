@@ -408,16 +408,41 @@ class GraphicsScene(QtWidgets.QGraphicsScene):
         self.sigItemRemoved.emit(item)
         return ret
 
+    # Above this number of kept items, itemsNearEvent finds the items at the point with
+    # a second scene query rather than by testing each item; see itemsNearEvent.
+    _maxItemsTestedAtPoint = 16
+
     def itemsNearEvent(
         self,
-        event,
-        selMode=QtCore.Qt.ItemSelectionMode.IntersectsItemShape,
-        sortOrder=QtCore.Qt.SortOrder.DescendingOrder,
-        hoverable=False,
-    ):
+        event: object,
+        selMode: QtCore.Qt.ItemSelectionMode = QtCore.Qt.ItemSelectionMode.IntersectsItemShape,
+        sortOrder: QtCore.Qt.SortOrder = QtCore.Qt.SortOrder.DescendingOrder,
+        hoverable: bool = False,
+    ) -> list[QtWidgets.QGraphicsItem]:
         """
-        Return an iterator that iterates first through the items that directly intersect point (in Z order)
-        followed by any other items that are within the scene's click radius.
+        Return the items near the position of an event.
+
+        The items that directly intersect the position come first, followed by the
+        other items within the click radius of the scene (see :meth:`setClickRadius`).
+        Each group is sorted by decreasing absolute z value, i.e. the sum of the z
+        values of the item and of its ancestors.
+
+        Parameters
+        ----------
+        event : MouseClickEvent, MouseDragEvent or HoverEvent
+            The event; its ``buttonDownScenePos()``, or else its ``scenePos()``, is the
+            position.
+        selMode : QtCore.Qt.ItemSelectionMode, default IntersectsItemShape
+            How items are selected, see :meth:`QGraphicsScene.items`.
+        sortOrder : QtCore.Qt.SortOrder, default DescendingOrder
+            Stacking order of the scene query, used for items of equal z value.
+        hoverable : bool, default False
+            If True, return only the items implementing ``hoverEvent``.
+
+        Returns
+        -------
+        list of QGraphicsItem
+            The items near the event position.
         """
         view = self.views()[0]
         tr = view.viewportTransform()
@@ -427,40 +452,42 @@ class GraphicsScene(QtWidgets.QGraphicsScene):
         else:
             point = event.scenePos()
 
-        ## Sort by descending Z-order (don't trust scene.items() to do this either)
-        ## use 'absolute' z value, which is the sum of all item/parent ZValues
-        def absZValue(item):
-            if item is None:
-                return 0
-            return item.zValue() + absZValue(item.parentItem())
-
-        ## Get items, which directly are at the given point (sorted by z-value)
-        items_at_point = self.items(point, selMode, sortOrder, tr)
-        items_at_point.sort(key=absZValue, reverse=True)
-
-        ## Get items, which are within the click radius around the given point (sorted by z-value)
+        ## Region of the click radius around the point
         r = self._clickRadius
-        items_within_radius = []
         rgn = None
         if r > 0:
             rect = view.mapToScene(QtCore.QRect(0, 0, 2 * r, 2 * r)).boundingRect()
             w = rect.width()
             h = rect.height()
             rgn = QtCore.QRectF(point.x() - w / 2, point.y() - h / 2, w, h)
-            items_within_radius = self.items(rgn, selMode, sortOrder, tr)
-            items_within_radius.sort(key=absZValue, reverse=True)
-            # Remove items, which are already in the other list
-            for item in items_at_point:
-                if item in items_within_radius:
-                    items_within_radius.remove(item)
 
-        ## Put both groups of items together, but in the correct order
-        ## The items directly at the given point shall have higher priority
-        all_items = items_at_point + items_within_radius
+        ## Query the scene. In the intersection modes, an item intersecting the point
+        ## also intersects the region around it, so a single query of the region is
+        ## enough: the items at the point are told apart afterwards, among the items
+        ## that are kept only.
+        singleQuery = rgn is not None and selMode in (
+            QtCore.Qt.ItemSelectionMode.IntersectsItemShape,
+            QtCore.Qt.ItemSelectionMode.IntersectsItemBoundingRect,
+        )
+        pointItems = None
+        if rgn is None:
+            candidates = self.items(point, selMode, sortOrder, tr)
+        elif singleQuery:
+            candidates = self.items(rgn, selMode, sortOrder, tr)
+        else:
+            # In the containment modes, an item at the point may be missing from the
+            # region: query both, as the items at the point come first anyway.
+            candidates = self.items(point, selMode, sortOrder, tr)
+            pointItems = set(candidates)
+            candidates += [
+                item for item in self.items(rgn, selMode, sortOrder, tr)
+                if item not in pointItems
+            ]
 
-        ## Remove items, which we don't want, due to several reasons
-        selected_items = []
-        for item in all_items:
+        ## Remove items, which we don't want, due to several reasons (before sorting,
+        ## which is costly)
+        kept = []
+        for item in candidates:
             if hoverable and not hasattr(item, "hoverEvent"):
                 continue
             if item.scene() is not self:
@@ -474,9 +501,155 @@ class GraphicsScene(QtWidgets.QGraphicsScene):
                 rgn is not None
                 and shape.intersects(item.mapFromScene(rgn).boundingRect())
             ) or shape.contains(item.mapFromScene(point)):
-                selected_items.append(item)
+                kept.append(item)
 
-        return selected_items
+        ## Split the items at the point from the items within the radius, keeping the
+        ## relative order of the query. A single item needs no split.
+        if rgn is None or len(kept) < 2:
+            items_at_point = kept
+            items_within_radius = []
+        else:
+            if singleQuery:
+                if len(kept) <= self._maxItemsTestedAtPoint:
+                    pointItems = self._itemsAtScenePoint(kept, point, selMode, tr)
+                else:
+                    pointItems = set(self.items(point, selMode, sortOrder, tr))
+            items_at_point = [item for item in kept if item in pointItems]
+            items_within_radius = [item for item in kept if item not in pointItems]
+
+        ## Sort by descending Z-order (don't trust scene.items() to do this either)
+        ## use 'absolute' z value, which is the sum of all item/parent ZValues.
+        ## The sort is stable: items of equal z value keep the stacking order.
+        absZValues = {}
+
+        def absZValue(item: QtWidgets.QGraphicsItem | None) -> float:
+            # Sum from the topmost ancestor down, as the former recursive
+            # implementation did, memoizing the ancestors shared by the items.
+            chain = []
+            z = 0
+            while item is not None:
+                known = absZValues.get(item)
+                if known is not None:
+                    z = known
+                    break
+                chain.append(item)
+                item = item.parentItem()
+            for ancestor in reversed(chain):
+                z = ancestor.zValue() + z
+                absZValues[ancestor] = z
+            return z
+
+        items_at_point.sort(key=absZValue, reverse=True)
+        items_within_radius.sort(key=absZValue, reverse=True)
+
+        ## The items directly at the given point shall have higher priority
+        return items_at_point + items_within_radius
+
+    @staticmethod
+    def _itemsAtScenePoint(
+        items: list[QtWidgets.QGraphicsItem],
+        point: QtCore.QPointF,
+        selMode: QtCore.Qt.ItemSelectionMode,
+        deviceTransform: QtGui.QTransform,
+    ) -> set[QtWidgets.QGraphicsItem]:
+        """
+        Return the items that ``QGraphicsScene.items(point, selMode, ...)`` would return
+        among items returned by a query of a region containing `point`.
+
+        This mirrors, with the public API, the test applied by Qt to a point query
+        (``QGraphicsSceneIndexPointIntersector`` and ``recursive_items_helper`` in
+        qgraphicssceneindex.cpp, unchanged from Qt 5 to Qt 6): an item is kept if it
+        intersects the point and if each of its ancestors that clips its children, or
+        contains them in its shape, intersects the point too. Visibility and opacity
+        are not tested again: the region query applied the same conditions. The
+        window frame of untransformable top-level widgets, which pyqtgraph does not
+        use, is not considered.
+
+        Parameters
+        ----------
+        items : list of QGraphicsItem
+            Items returned by the region query.
+        point : QtCore.QPointF
+            The point, in scene coordinates.
+        selMode : QtCore.Qt.ItemSelectionMode
+            The selection mode of the queries.
+        deviceTransform : QtGui.QTransform
+            The viewport transformation of the view.
+
+        Returns
+        -------
+        set of QGraphicsItem
+            The items at the point.
+        """
+        GraphicsItemFlag = QtWidgets.QGraphicsItem.GraphicsItemFlag
+        pruningFlags = (
+            GraphicsItemFlag.ItemClipsChildrenToShape
+            | GraphicsItemFlag.ItemContainsChildrenInShape
+        )
+        shapeMode = selMode in (
+            QtCore.Qt.ItemSelectionMode.ContainsItemShape,
+            QtCore.Qt.ItemSelectionMode.IntersectsItemShape,
+        )
+        pointRect = QtCore.QRectF(point, QtCore.QSizeF(1, 1))
+        # memoized per item, ancestors being shared by many items
+        flags = {}
+        untransformable = {}
+        intersects = {}
+
+        def itemFlags(item):
+            value = flags.get(item)
+            if value is None:
+                value = flags[item] = item.flags()
+            return value
+
+        def isUntransformable(item):
+            # True if the item or an ancestor ignores the transformations
+            value = untransformable.get(item)
+            if value is None:
+                parent = item.parentItem()
+                value = bool(itemFlags(item) & GraphicsItemFlag.ItemIgnoresTransformations)
+                value = value or (parent is not None and isUntransformable(parent))
+                untransformable[item] = value
+            return value
+
+        def intersectsPoint(item):
+            value = intersects.get(item)
+            if value is not None:
+                return value
+            brect = item.boundingRect()
+            # _q_adjustRect: give empty bounding rectangles a tiny extent
+            if not brect.width():
+                brect.adjust(-0.00001, 0, 0.00001, 0)
+            if not brect.height():
+                brect.adjust(0, -0.00001, 0, 0.00001)
+            if isUntransformable(item):
+                transform = item.deviceTransform(deviceTransform)
+                itemPoint = (deviceTransform * transform.inverted()[0]).map(point)
+                value = brect.contains(itemPoint)
+                if value and shapeMode:
+                    pointPath = QtGui.QPainterPath()
+                    pointPath.addRect(QtCore.QRectF(itemPoint, QtCore.QSizeF(1, 1)))
+                    value = item.collidesWithPath(pointPath, selMode)
+            else:
+                sceneTransform = item.sceneTransform()
+                value = sceneTransform.mapRect(brect).intersects(pointRect)
+                if value and shapeMode:
+                    value = item.contains(sceneTransform.inverted()[0].map(point))
+            intersects[item] = value
+            return value
+
+        atPoint = set()
+        for item in items:
+            if not intersectsPoint(item):
+                continue
+            parent = item.parentItem()
+            while parent is not None:
+                if itemFlags(parent) & pruningFlags and not intersectsPoint(parent):
+                    break
+                parent = parent.parentItem()
+            else:
+                atPoint.add(item)
+        return atPoint
 
     def getViewWidget(self):
         return self.views()[0]
