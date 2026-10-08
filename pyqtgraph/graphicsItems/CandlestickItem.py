@@ -1,0 +1,1064 @@
+"""
+Vectorized OHLC candlesticks with view culling and level of detail.
+"""
+import math
+
+import numpy as np
+
+from .. import Qt
+from .. import functions as fn
+from ..Qt import QtCore, QtGui
+from .BarGraphItem import _visibleRect
+from .GraphicsObject import GraphicsObject
+
+__all__ = ['CandlestickItem']
+
+# Below this candle width (in device pixels) candles are aggregated, when ``lod`` is on.
+_LOD_MIN_WIDTH_PX = 3.0
+# Default candle width, relative to the median spacing of x.
+_DEFAULT_WIDTH_RATIO = 0.8
+# Levels aggregating at least this many candles per block are computed for all candles
+# and cached; smaller blocks are computed for the visible candles only, which are few.
+_CACHED_MIN_K = 16
+
+
+class _GrowableArray:
+    """
+    One-dimensional float array with a logical length and a geometric capacity.
+
+    Parameters
+    ----------
+    dtype : numpy.dtype, default numpy.float64
+        Element type.
+    """
+
+    def __init__(self, dtype=np.float64) -> None:
+        self._data = np.empty(0, dtype=dtype)
+        self._size = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    @property
+    def view(self) -> np.ndarray:
+        """numpy.ndarray: The ``len(self)`` valid elements (a view, not a copy)."""
+        return self._data[:self._size]
+
+    def clear(self) -> None:
+        """Remove all elements, keeping the capacity."""
+        self._size = 0
+
+    def extend(self, values: np.ndarray) -> None:
+        """
+        Append elements, growing the capacity geometrically when needed.
+
+        Parameters
+        ----------
+        values : numpy.ndarray
+            Elements to append.
+        """
+        need = self._size + len(values)
+        if need > len(self._data):
+            data = np.empty(max(need, len(self._data) * 3 // 2), dtype=self._data.dtype)
+            data[:self._size] = self._data[:self._size]
+            self._data = data
+        self._data[self._size:need] = values
+        self._size = need
+
+    def pop(self) -> None:
+        """Remove the last element."""
+        self._size -= 1
+
+
+class _PrimitiveBuffer:
+    """
+    ``PrimitiveArray`` with a logical length and a geometric capacity.
+
+    The underlying array is only ever resized to its capacity, and drawn through
+    ``drawargs(start, stop)``, so that appending keeps the existing primitives.
+
+    Parameters
+    ----------
+    klass : type
+        ``QtCore.QRectF`` or ``QtCore.QLineF``.
+    """
+
+    def __init__(self, klass: type) -> None:
+        self._array = Qt.internals.PrimitiveArray(klass, 4)
+        self._size = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    def ndarray(self) -> np.ndarray:
+        """
+        Coordinates of the primitives.
+
+        Returns
+        -------
+        numpy.ndarray
+            View of shape ``(len(self), 4)``.
+        """
+        return self._array.ndarray()[:self._size]
+
+    def clear(self) -> None:
+        """Remove all primitives, keeping the capacity."""
+        self._size = 0
+
+    def pop(self) -> None:
+        """Remove the last primitive."""
+        self._size -= 1
+
+    def reserve(self, count: int) -> np.ndarray:
+        """
+        Append ``count`` primitives and return their coordinates, to be filled.
+
+        Parameters
+        ----------
+        count : int
+            Number of primitives to append.
+
+        Returns
+        -------
+        numpy.ndarray
+            Writable view of shape ``(count, 4)``.
+        """
+        need = self._size + count
+        capacity = len(self._array)
+        if need > capacity:
+            kept = self._array.ndarray()[:self._size].copy()
+            self._array.resize(max(need, capacity * 3 // 2))
+            self._array.ndarray()[:self._size] = kept
+        view = self._array.ndarray()[self._size:need]
+        self._size = need
+        return view
+
+    def drawargs(self, start: int, stop: int) -> tuple:
+        """
+        Arguments to draw primitives ``start`` to ``stop - 1``.
+
+        Parameters
+        ----------
+        start, stop : int
+            Range of primitives, within ``len(self)``.
+
+        Returns
+        -------
+        tuple
+            Arguments for ``QPainter.drawRects`` or ``QPainter.drawLines``.
+        """
+        return self._array.drawargs(start, stop)
+
+
+def _geometry(x: np.ndarray, halfWidth: np.ndarray, open: np.ndarray, high: np.ndarray,
+              low: np.ndarray, close: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Body rectangles and wick lines of candles.
+
+    Parameters
+    ----------
+    x, halfWidth : numpy.ndarray
+        Center and half width of the bodies.
+    open, high, low, close : numpy.ndarray
+        Prices, all finite.
+
+    Returns
+    -------
+    bodies : numpy.ndarray
+        ``(x, y, width, height)`` of each body, from open to close.
+    wicks : numpy.ndarray
+        ``(x1, y1, x2, y2)`` of each wick, from low to high.
+    """
+    top = np.maximum(open, close)
+    bottom = np.minimum(open, close)
+    bodies = np.empty((len(x), 4))
+    bodies[:, 0] = x - halfWidth
+    bodies[:, 1] = bottom
+    bodies[:, 2] = 2.0 * halfWidth
+    bodies[:, 3] = top - bottom
+    wicks = np.empty((len(x), 4))
+    wicks[:, 0] = x
+    wicks[:, 1] = np.minimum(low, bottom)
+    wicks[:, 2] = x
+    wicks[:, 3] = np.maximum(high, top)
+    return bodies, wicks
+
+
+class _Side:
+    """Candles of one direction (rising or falling): centers, bodies and wicks."""
+
+    def __init__(self) -> None:
+        self.x = _GrowableArray()
+        self.bodies = _PrimitiveBuffer(QtCore.QRectF)
+        self.wicks = _PrimitiveBuffer(QtCore.QLineF)
+
+    def __len__(self) -> int:
+        return len(self.x)
+
+    def clear(self) -> None:
+        """Remove all candles."""
+        self.x.clear()
+        self.bodies.clear()
+        self.wicks.clear()
+
+    def pop(self) -> None:
+        """Remove the last candle."""
+        self.x.pop()
+        self.bodies.pop()
+        self.wicks.pop()
+
+    def extend(self, x: np.ndarray, bodies: np.ndarray, wicks: np.ndarray,
+               rows: np.ndarray | None = None) -> None:
+        """
+        Append candles, sorted by x and after the existing ones.
+
+        Parameters
+        ----------
+        x : numpy.ndarray
+            Centers of the candles.
+        bodies, wicks : numpy.ndarray
+            Body rectangles and wick lines, shape ``(len(x), 4)``.
+        rows : numpy.ndarray or None, default None
+            Indices of the candles to append; all when ``None``.
+        """
+        if rows is None:
+            self.x.extend(x)
+            self.bodies.reserve(len(x))[:] = bodies
+            self.wicks.reserve(len(x))[:] = wicks
+        elif len(rows):
+            self.x.extend(x[rows])
+            np.take(bodies, rows, axis=0, out=self.bodies.reserve(len(rows)))
+            np.take(wicks, rows, axis=0, out=self.wicks.reserve(len(rows)))
+
+    def visible(self, xmin: float, xmax: float) -> tuple[int, int]:
+        """
+        Range of the candles whose center lies within ``[xmin, xmax]``.
+
+        Parameters
+        ----------
+        xmin, xmax : float
+            Range of x.
+
+        Returns
+        -------
+        tuple of int
+            ``start, stop`` indices.
+        """
+        centers = self.x.view
+        start = int(np.searchsorted(centers, xmin, side='left'))
+        stop = int(np.searchsorted(centers, xmax, side='right'))
+        return start, stop
+
+
+class _Level:
+    """
+    Candles aggregated by blocks of ``k`` consecutive candles.
+
+    Block ``j`` holds candles ``j*k`` to ``(j+1)*k - 1``: blocks are aligned to
+    absolute multiples of ``k``, so that appending candles only changes the last
+    block. Level 1 holds the candles themselves.
+
+    Parameters
+    ----------
+    k : int
+        Number of candles per block.
+    """
+
+    def __init__(self, k: int) -> None:
+        self.k = k
+        self.up = _Side()
+        self.down = _Side()
+        # side holding the last block, which changes if that block is incomplete
+        self._lastSide = None
+
+    def update(self, x: np.ndarray, open: np.ndarray, high: np.ndarray, low: np.ndarray,
+               close: np.ndarray, width: float, fromCandle: int) -> None:
+        """
+        Compute the blocks holding candles ``fromCandle`` and later.
+
+        Parameters
+        ----------
+        x, open, high, low, close : numpy.ndarray
+            All candles, sorted by x.
+        width : float
+            Width of one candle.
+        fromCandle : int
+            Candles before this index are unchanged since the previous update; 0 for
+            a full computation.
+        """
+        k = self.k
+        count = len(x)
+        if fromCandle == 0:
+            self.up.clear()
+            self.down.clear()
+            self._lastSide = None
+        elif fromCandle % k and self._lastSide is not None:
+            self._lastSide.pop()  # the last block was incomplete: compute it again
+        first = fromCandle // k * k
+        if first >= count:
+            return
+        x, open, high, low, close = (a[first:] for a in (x, open, high, low, close))
+        valid = (np.isfinite(open) & np.isfinite(high)
+                 & np.isfinite(low) & np.isfinite(close))
+        allValid = bool(valid.all())
+        if k == 1:
+            if not allValid:
+                x, open, high, low, close = (a[valid] for a in (x, open, high, low, close))
+            halfWidth = np.full(len(x), 0.5 * width)
+        else:
+            x, halfWidth, open, high, low, close = self._aggregate(
+                x, open, high, low, close, valid, allValid, width)
+        if len(x) == 0:
+            self._lastSide = None
+            return
+        bodies, wicks = _geometry(x, halfWidth, open, high, low, close)
+        up = close >= open
+        if up.all():
+            self.up.extend(x, bodies, wicks)
+        elif not up.any():
+            self.down.extend(x, bodies, wicks)
+        else:
+            self.up.extend(x, bodies, wicks, np.flatnonzero(up))
+            self.down.extend(x, bodies, wicks, np.flatnonzero(~up))
+        lastIsValid = bool(valid[len(valid) - 1 - (len(valid) - 1) % k:].any())
+        self._lastSide = (self.up if up[-1] else self.down) if lastIsValid else None
+
+    def _aggregate(self, x: np.ndarray, open: np.ndarray, high: np.ndarray,
+                   low: np.ndarray, close: np.ndarray, valid: np.ndarray, allValid: bool,
+                   width: float) -> tuple[np.ndarray, ...]:
+        """
+        Aggregate candles by blocks of ``self.k``, starting at a block boundary.
+
+        Open is the open of the first candle of the block, close the close of the last
+        one, high the maximum high and low the minimum low. Invalid candles (with a
+        non-finite price) are ignored; blocks without valid candle are dropped.
+
+        Parameters
+        ----------
+        x, open, high, low, close : numpy.ndarray
+            Candles, the first one starting a block.
+        valid : numpy.ndarray
+            Whether all prices of each candle are finite.
+        allValid : bool
+            ``valid.all()``.
+        width : float
+            Width of one candle.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            Center, half width, open, high, low and close of the blocks.
+        """
+        k = self.k
+        count = len(x)
+        starts = np.arange(0, count, k)
+        sizes = np.minimum(k, count - starts)
+        ends = starts + sizes - 1
+        center = 0.5 * (x[starts] + x[ends])
+        halfWidth = 0.5 * width * sizes
+        if allValid:
+            return (center, halfWidth, open[starts], np.maximum.reduceat(high, starts),
+                    np.minimum.reduceat(low, starts), close[ends])
+        index = np.arange(count)
+        firstValid = np.minimum.reduceat(np.where(valid, index, count), starts)
+        lastValid = np.maximum.reduceat(np.where(valid, index, -1), starts)
+        keep = firstValid < count
+        high = np.fmax.reduceat(np.where(valid, high, np.nan), starts)
+        low = np.fmin.reduceat(np.where(valid, low, np.nan), starts)
+        return (center[keep], halfWidth[keep], open[firstValid[keep]], high[keep],
+                low[keep], close[lastValid[keep]])
+
+
+class CandlestickItem(GraphicsObject):
+    """
+    OHLC candlesticks, drawn with a handful of vectorized calls.
+
+    Each candle has a body from its open to its close price, filled with
+    ``upBrush`` and outlined with ``upPen`` when the close is at or above the open,
+    with ``downBrush`` and ``downPen`` otherwise, and a wick from its low to its high
+    price, drawn below the body with ``wickPen`` (or with the pen of the body when
+    ``wickPen`` is ``None``).
+
+    Candles are stored sorted by x; only the candles within the visible x range are
+    drawn. When ``lod`` is enabled and candles are narrower than 3 device pixels,
+    consecutive candles are aggregated by blocks of ``k`` (a power of two): open of
+    the first candle, close of the last one, highest high and lowest low. Blocks
+    are aligned to multiples of ``k``, so that they do not change while panning.
+    Levels of 16 candles per block or more are computed once for all candles and
+    cached per ``k`` (appending candles only updates their last block); smaller
+    blocks are computed for the visible candles only, which are few.
+
+    Candles with a non-finite x are ignored; candles with a non-finite price are
+    not drawn.
+
+    The item implements the ``plotData`` interface, so that a :class:`PlotItem`
+    auto-ranges on it and lists it in its legend when it has a name.
+    """
+
+    _optionNames = ('upBrush', 'downBrush', 'upPen', 'downPen', 'wickPen', 'width',
+                    'lod', 'name')
+    _dataNames = ('x', 'open', 'high', 'low', 'close')
+
+    def __init__(self, **opts) -> None:
+        """
+        Create the item, optionally with data and options.
+
+        Parameters
+        ----------
+        **opts
+            x, open, high, low, close : array_like, optional
+                Candles, passed to :meth:`setData` when given (all together).
+            width : float or None, default None
+                Width of the candle bodies, in x units. ``None`` uses 0.8 times the
+                median spacing of x (0.8 with fewer than two distinct x).
+            upBrush, downBrush : QBrush or color, optional
+                Fill of rising and falling candles; green and red by default.
+            upPen, downPen : QPen or color, optional
+                Outline of rising and falling candles, and their wicks unless
+                ``wickPen`` is set; green and red by default. ``None`` disables it.
+            wickPen : QPen or color or None, default None
+                Pen of all wicks; ``None`` uses ``upPen`` and ``downPen``.
+            lod : bool, default True
+                Aggregate candles narrower than 3 device pixels.
+            name : str or None, default None
+                Name of the item, e.g. shown by a legend.
+        """
+        GraphicsObject.__init__(self)
+        self._x = _GrowableArray()
+        self._open = _GrowableArray()
+        self._high = _GrowableArray()
+        self._low = _GrowableArray()
+        self._close = _GrowableArray()
+        self._width = 1.0
+        self._autoWidth = True
+        # cached levels of detail (k >= _CACHED_MIN_K), for all candles
+        self._levels = {}
+        # level of detail computed for the visible candles only, and its key
+        self._window = None
+        self._windowKey = None
+        # incremented by every data change, invalidates the window
+        self._version = 0
+        self._yBounds = None
+        self._upBrush = fn.mkBrush('g')
+        self._downBrush = fn.mkBrush('r')
+        self._upPen = fn.mkPen('g')
+        self._downPen = fn.mkPen('r')
+        self._wickPen = None
+        self._lod = True
+        self._name = None
+        self._updatePenWidth()
+
+        data = {key: opts.pop(key) for key in self._dataNames if key in opts}
+        width = opts.pop('width', None)
+        self.setOpts(**opts)
+        if data:
+            self.setData(width=width, **data)
+        elif width is not None:
+            self.width = width
+
+    # ------------------------------------------------------------------ data
+
+    def setData(self, *, x: np.ndarray, open: np.ndarray, high: np.ndarray,
+                low: np.ndarray, close: np.ndarray, width: float | None = None) -> None:
+        """
+        Replace all candles.
+
+        Parameters
+        ----------
+        x : array_like
+            Position of the candles, e.g. timestamps. Need not be sorted.
+        open, high, low, close : array_like
+            Prices, same length as ``x``.
+        width : float or None, default None
+            Width of the candle bodies. ``None`` keeps a width set explicitly before
+            (by ``width`` or :meth:`setOpts`), and otherwise uses 0.8 times the median
+            spacing of x.
+        """
+        x, open, high, low, close = self._normalize(x, open, high, low, close)
+        if len(x) > 1 and not (x[1:] >= x[:-1]).all():
+            order = np.argsort(x, kind='stable')
+            x, open, high, low, close = (a[order] for a in (x, open, high, low, close))
+        for store, values in zip(self._stores(), (x, open, high, low, close)):
+            store.clear()
+            store.extend(values)
+        if width is not None:
+            self._width = self._checkWidth(width)
+            self._autoWidth = False
+        elif self._autoWidth:
+            self._width = self._defaultWidth()
+        self._dataChanged(0)
+
+    def appendData(self, *, x: np.ndarray, open: np.ndarray, high: np.ndarray,
+                   low: np.ndarray, close: np.ndarray) -> None:
+        """
+        Append candles, e.g. while streaming.
+
+        Appending candles that follow the existing ones (x at or after the last x)
+        only computes the new candles and the last aggregated block of each level of
+        detail. Otherwise all candles are sorted again, as by :meth:`setData`.
+
+        Parameters
+        ----------
+        x : array_like
+            Position of the new candles.
+        open, high, low, close : array_like
+            Prices of the new candles, same length as ``x``.
+        """
+        x, open, high, low, close = self._normalize(x, open, high, low, close)
+        if len(x) == 0:
+            return
+        count = len(self._x)
+        follows = (count == 0 or x[0] >= self._x.view[-1]) and bool((x[1:] >= x[:-1]).all())
+        if not follows:
+            old = (store.view for store in self._stores())
+            new = (x, open, high, low, close)
+            merged = [np.concatenate((a, b)) for a, b in zip(old, new)]
+            self.setData(**dict(zip(self._dataNames, merged)))
+            return
+        for store, values in zip(self._stores(), (x, open, high, low, close)):
+            store.extend(values)
+        if self._autoWidth and count < 2:
+            self._width = self._defaultWidth()
+            self._dataChanged(0)
+        else:
+            self._dataChanged(count)
+
+    def getData(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Positions and close prices of the candles, sorted by x.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            ``x`` and ``close`` (read-only views).
+        """
+        return self._readOnly(self._x), self._readOnly(self._close)
+
+    def getOriginalDataset(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Positions and close prices of the candles, as exported by :class:`CSVExporter`.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            Same as :meth:`getData`.
+        """
+        return self.getData()
+
+    def _stores(self) -> tuple[_GrowableArray, ...]:
+        """
+        Storage of the candles.
+
+        Returns
+        -------
+        tuple of _GrowableArray
+            x, open, high, low and close.
+        """
+        return self._x, self._open, self._high, self._low, self._close
+
+    @staticmethod
+    def _normalize(*arrays) -> list[np.ndarray]:
+        """
+        Convert candle arrays to float64 and drop candles with a non-finite x.
+
+        Parameters
+        ----------
+        *arrays : array_like
+            x, open, high, low and close.
+
+        Returns
+        -------
+        list of numpy.ndarray
+            One-dimensional arrays of equal length.
+        """
+        arrays = [np.asarray(a, dtype=np.float64).reshape(-1) for a in arrays]
+        if len({len(a) for a in arrays}) != 1:
+            raise ValueError('x, open, high, low and close must have the same length')
+        finite = np.isfinite(arrays[0])
+        if not finite.all():
+            arrays = [a[finite] for a in arrays]
+        return arrays
+
+    def _defaultWidth(self) -> float:
+        """
+        Default candle width: 0.8 times the median spacing of x.
+
+        Returns
+        -------
+        float
+            Width in x units; 0.8 when it cannot be determined.
+        """
+        x = self._x.view
+        if len(x) > 1:
+            steps = np.diff(x)
+            steps = steps[steps > 0]
+            if len(steps):
+                return _DEFAULT_WIDTH_RATIO * float(np.median(steps))
+        return _DEFAULT_WIDTH_RATIO
+
+    @staticmethod
+    def _checkWidth(width: float) -> float:
+        """
+        Validate a candle width.
+
+        Parameters
+        ----------
+        width : float
+            Width in x units.
+
+        Returns
+        -------
+        float
+            The width.
+        """
+        width = float(width)
+        if not (math.isfinite(width) and width >= 0):
+            raise ValueError(f'width must be a finite non-negative number, got {width}')
+        return width
+
+    def _dataChanged(self, fromCandle: int) -> None:
+        """
+        Update the cached geometry after a data or width change.
+
+        Parameters
+        ----------
+        fromCandle : int
+            Index of the first new candle after an append; 0 when all candles or the
+            width changed.
+        """
+        self._version += 1
+        if fromCandle == 0:
+            self._levels = {}
+            self._yBounds = None
+        else:
+            arrays = [store.view for store in self._stores()]
+            for level in self._levels.values():
+                level.update(*arrays, self._width, fromCandle)
+            if self._yBounds is not None:
+                low, high = self._yRange(fromCandle, len(self._x))
+                if low is not None:
+                    lo, hi = self._yBounds
+                    self._yBounds = (low if lo is None else min(lo, low),
+                                     high if hi is None else max(hi, high))
+        self.prepareGeometryChange()
+        self.update()
+        self.informViewBoundsChanged()
+
+    def _level(self, k: int, xmin: float, xmax: float) -> _Level:
+        """
+        Candles aggregated by blocks of ``k``, at least those within an x range.
+
+        Levels with ``k >= 16`` cover all candles and are cached until the data
+        changes (appending only updates them). Smaller blocks are computed for the
+        candles within the range only, plus one block on each side.
+
+        Parameters
+        ----------
+        k : int
+            Number of candles per block; 1 for the candles themselves.
+        xmin, xmax : float
+            Range of x that must be covered.
+
+        Returns
+        -------
+        _Level
+            The level.
+        """
+        arrays = [store.view for store in self._stores()]
+        if k >= _CACHED_MIN_K:
+            level = self._levels.get(k)
+            if level is None:
+                level = _Level(k)
+                level.update(*arrays, self._width, 0)
+                self._levels[k] = level
+            return level
+        x = arrays[0]
+        start = int(np.searchsorted(x, xmin, side='left')) // k - 1
+        stop = -(-int(np.searchsorted(x, xmax, side='right')) // k) + 1
+        start, stop = max(start, 0) * k, min(stop * k, len(x))
+        key = (k, start, stop, self._version)
+        if self._windowKey != key:
+            if self._window is None:
+                self._window = _Level(k)
+            self._window.k = k
+            self._window.update(*(a[start:stop] for a in arrays), self._width, 0)
+            self._windowKey = key
+        return self._window
+
+    # --------------------------------------------------------------- options
+
+    def setOpts(self, **opts) -> None:
+        """
+        Set several options at once.
+
+        Parameters
+        ----------
+        **opts
+            Any of ``upBrush``, ``downBrush``, ``upPen``, ``downPen``, ``wickPen``,
+            ``width``, ``lod`` and ``name``; see the properties of the same name.
+        """
+        unknown = set(opts) - set(self._optionNames)
+        if unknown:
+            names = ', '.join(sorted(unknown))
+            raise TypeError(f'unknown CandlestickItem option(s): {names}')
+        for key, value in opts.items():
+            if key == 'name':
+                self._name = value
+            else:
+                setattr(self, key, value)
+
+    @property
+    def upBrush(self) -> QtGui.QBrush:
+        """QtGui.QBrush: Fill of the rising candles (close at or above open)."""
+        return self._upBrush
+
+    @upBrush.setter
+    def upBrush(self, brush) -> None:
+        self._upBrush = fn.mkBrush(brush)
+        self.update()
+
+    @property
+    def downBrush(self) -> QtGui.QBrush:
+        """QtGui.QBrush: Fill of the falling candles (close below open)."""
+        return self._downBrush
+
+    @downBrush.setter
+    def downBrush(self, brush) -> None:
+        self._downBrush = fn.mkBrush(brush)
+        self.update()
+
+    @property
+    def upPen(self) -> QtGui.QPen:
+        """QtGui.QPen: Outline of the rising candles, and their wicks by default."""
+        return self._upPen
+
+    @upPen.setter
+    def upPen(self, pen) -> None:
+        self._upPen = fn.mkPen(pen)
+        self._penChanged()
+
+    @property
+    def downPen(self) -> QtGui.QPen:
+        """QtGui.QPen: Outline of the falling candles, and their wicks by default."""
+        return self._downPen
+
+    @downPen.setter
+    def downPen(self, pen) -> None:
+        self._downPen = fn.mkPen(pen)
+        self._penChanged()
+
+    @property
+    def wickPen(self) -> QtGui.QPen | None:
+        """QtGui.QPen or None: Pen of all wicks; ``None`` uses ``upPen``/``downPen``."""
+        return self._wickPen
+
+    @wickPen.setter
+    def wickPen(self, pen) -> None:
+        self._wickPen = None if pen is None else fn.mkPen(pen)
+        self._penChanged()
+
+    @property
+    def width(self) -> float:
+        """
+        float: Width of the candle bodies, in x units.
+
+        Setting ``None`` restores the default, 0.8 times the median spacing of x.
+        """
+        return self._width
+
+    @width.setter
+    def width(self, width: float | None) -> None:
+        if width is None:
+            self._autoWidth = True
+            width = self._defaultWidth()
+        else:
+            self._autoWidth = False
+            width = self._checkWidth(width)
+        if width != self._width:
+            self._width = width
+            self._dataChanged(0)
+
+    @property
+    def lod(self) -> bool:
+        """bool: Whether candles narrower than 3 device pixels are aggregated."""
+        return self._lod
+
+    @lod.setter
+    def lod(self, lod: bool) -> None:
+        self._lod = bool(lod)
+        self.update()
+
+    @property
+    def ohlc(self) -> tuple[np.ndarray, ...]:
+        """
+        tuple of numpy.ndarray: The candles, sorted by x.
+
+        ``(x, open, high, low, close)``, as read-only views.
+        """
+        return tuple(self._readOnly(store) for store in self._stores())
+
+    @property
+    def opts(self) -> dict:
+        """
+        dict: Description of the legend sample, as read by :class:`LegendItem`.
+
+        The sample is a rising candle: no line, a symbol filled with ``upBrush``.
+        """
+        return {
+            'name': self._name,
+            'pen': None,
+            'brush': self._upBrush,
+            'symbol': _legendSymbol(),
+            'size': 16,
+        }
+
+    @staticmethod
+    def _readOnly(store: _GrowableArray) -> np.ndarray:
+        """
+        Read-only view of a candle array.
+
+        Parameters
+        ----------
+        store : _GrowableArray
+            Candle storage.
+
+        Returns
+        -------
+        numpy.ndarray
+            View that cannot be written to.
+        """
+        view = store.view
+        view.flags.writeable = False
+        return view
+
+    def _penChanged(self) -> None:
+        """Update the pen widths used by the bounds after a pen change."""
+        self._updatePenWidth()
+        self.prepareGeometryChange()
+        self.update()
+        self.informViewBoundsChanged()
+
+    def _updatePenWidth(self) -> None:
+        """Store the widest pen widths, ``[non-cosmetic in data units, cosmetic in px]``."""
+        widths = [0.0, 0.0]
+        for pen in (self._upPen, self._downPen, self._wickPen):
+            if pen is not None and pen.style() != QtCore.Qt.PenStyle.NoPen:
+                cosmetic = int(pen.isCosmetic())
+                widths[cosmetic] = max(widths[cosmetic], pen.widthF())
+        self._penWidth = widths
+
+    # ----------------------------------------------------- plotData interface
+
+    def implements(self, interface: str | None = None) -> bool | list[str]:
+        """
+        Interfaces implemented by the item.
+
+        Parameters
+        ----------
+        interface : str or None, default None
+            Interface name to test.
+
+        Returns
+        -------
+        bool or list of str
+            Whether ``interface`` is implemented, or the list of interfaces.
+        """
+        interfaces = ['plotData']
+        if interface is None:
+            return interfaces
+        return interface in interfaces
+
+    def name(self) -> str | None:
+        """
+        Name of the item, e.g. shown by a legend.
+
+        Returns
+        -------
+        str or None
+            The ``name`` option.
+        """
+        return self._name
+
+    # -------------------------------------------------------------- geometry
+
+    def _yRange(self, start: int, stop: int) -> tuple[float | None, float | None]:
+        """
+        Lowest and highest price of a range of candles.
+
+        Parameters
+        ----------
+        start, stop : int
+            Range of candles.
+
+        Returns
+        -------
+        tuple of float or None
+            ``(None, None)`` when the range has no finite price.
+        """
+        if stop <= start:
+            return None, None
+        span = slice(start, stop)
+        low = min(np.fmin.reduce(store.view[span])
+                  for store in (self._low, self._open, self._close))
+        high = max(np.fmax.reduce(store.view[span])
+                   for store in (self._high, self._open, self._close))
+        if math.isnan(low) or math.isnan(high):
+            return None, None
+        return float(low), float(high)
+
+    def dataBounds(self, ax: int, frac: float = 1.0,
+                   orthoRange: tuple[float, float] | None = None
+                   ) -> tuple[float | None, float | None]:
+        """
+        Range of the data along an axis.
+
+        Parameters
+        ----------
+        ax : int
+            0 for x, 1 for y.
+        frac : float, default 1.0
+            Ignored; the full range is always returned.
+        orthoRange : tuple of float or None, default None
+            For ``ax=1``, only the candles intersecting this x range are considered,
+            so that the y range fits the visible candles. Ignored for ``ax=0``.
+
+        Returns
+        -------
+        tuple of float or None
+            ``(min, max)``, or ``(None, None)`` without data.
+        """
+        count = len(self._x)
+        if count == 0:
+            return None, None
+        penPad = 0.5 * self._penWidth[0]
+        if ax == 0:
+            x = self._x.view
+            pad = 0.5 * self._width + penPad
+            return float(x[0]) - pad, float(x[-1]) + pad
+        if orthoRange is None:
+            if self._yBounds is None:
+                self._yBounds = self._yRange(0, count)
+            low, high = self._yBounds
+        else:
+            x = self._x.view
+            halfWidth = 0.5 * self._width
+            xmin, xmax = min(orthoRange), max(orthoRange)
+            start = int(np.searchsorted(x, xmin - halfWidth, side='left'))
+            stop = int(np.searchsorted(x, xmax + halfWidth, side='right'))
+            low, high = self._yRange(start, stop)
+        if low is None:
+            return None, None
+        return low - penPad, high + penPad
+
+    def pixelPadding(self) -> float:
+        """
+        Padding needed around the data bounds for cosmetic pens.
+
+        Returns
+        -------
+        float
+            Half the widest cosmetic pen width, in device pixels.
+        """
+        return (self._penWidth[1] or 1) * 0.5
+
+    def boundingRect(self) -> QtCore.QRectF:
+        """
+        Bounds of all candles, including pens.
+
+        Returns
+        -------
+        QtCore.QRectF
+            Rectangle in item coordinates; empty without data.
+        """
+        xmn, xmx = self.dataBounds(ax=0)
+        ymn, ymx = self.dataBounds(ax=1)
+        if xmn is None or ymn is None:
+            return QtCore.QRectF()
+        px = py = 0.0
+        pxPad = self.pixelPadding()
+        if pxPad > 0:
+            px, py = self.pixelVectors()
+            px = 0.0 if px is None else px.length() * pxPad
+            py = 0.0 if py is None else py.length() * pxPad
+        return QtCore.QRectF(xmn - px, ymn - py, (2 * px) + xmx - xmn, (2 * py) + ymx - ymn)
+
+    # -------------------------------------------------------------- painting
+
+    def _lodFactor(self, pxPerUnit: float) -> int:
+        """
+        Number of candles aggregated per drawn candle.
+
+        Parameters
+        ----------
+        pxPerUnit : float
+            Device pixels per unit of x.
+
+        Returns
+        -------
+        int
+            The smallest power of two making aggregated candles at least 3 device
+            pixels wide; 1 when candles are wide enough or ``lod`` is off.
+        """
+        count = len(self._x)
+        widthPx = self._width * pxPerUnit
+        if not self._lod or count < 2 or widthPx <= 0 or widthPx >= _LOD_MIN_WIDTH_PX:
+            return 1
+        k = 2 ** math.ceil(math.log2(_LOD_MIN_WIDTH_PX / widthPx))
+        return min(k, 2 ** math.ceil(math.log2(count)))
+
+    def paint(self, p: QtGui.QPainter, *args) -> None:
+        """
+        Draw the visible candles, aggregated when zoomed out.
+
+        Parameters
+        ----------
+        p : QtGui.QPainter
+            Destination painter, mapping item coordinates to the device.
+        *args
+            ``QStyleOptionGraphicsItem`` and widget, unused.
+        """
+        if len(self._x) == 0:
+            return
+        tr = p.combinedTransform()
+        pxPerUnit = math.hypot(tr.m11(), tr.m12())  # device pixels per unit of x
+        k = self._lodFactor(pxPerUnit)
+        rect = _visibleRect(self, p) if pxPerUnit > 0 else None
+        if rect is None:
+            xmin, xmax = -math.inf, math.inf
+        else:
+            # bodies extend beyond their center by half their width, outlines by half
+            # the pen width, plus antialiasing
+            pad = (0.5 * self._width * k + 0.5 * self._penWidth[0]
+                   + (0.5 * (self._penWidth[1] or 1) + 1.0) / pxPerUnit)
+            xmin, xmax = rect.left() - pad, rect.right() + pad
+        level = self._level(k, xmin, xmax)
+        sides = (
+            (level.up, self._upPen, self._upBrush),
+            (level.down, self._downPen, self._downBrush),
+        )
+        ranges = [side.visible(xmin, xmax) for side, _, _ in sides]
+        for (side, pen, _), (start, stop) in zip(sides, ranges):
+            if stop > start:
+                p.setPen(pen if self._wickPen is None else self._wickPen)
+                p.drawLines(*side.wicks.drawargs(start, stop))
+        for (side, pen, brush), (start, stop) in zip(sides, ranges):
+            if stop > start:
+                p.setPen(pen)
+                p.setBrush(brush)
+                p.drawRects(*side.bodies.drawargs(start, stop))
+
+
+def _legendSymbol() -> QtGui.QPainterPath:
+    """
+    Candle-shaped legend symbol, a filled body and wick in a unit square.
+
+    Returns
+    -------
+    QtGui.QPainterPath
+        Path centered on the origin, spanning -0.5 to 0.5.
+    """
+    path = QtGui.QPainterPath()
+    path.setFillRule(QtCore.Qt.FillRule.WindingFill)
+    path.addRect(QtCore.QRectF(-0.25, -0.3, 0.5, 0.6))
+    path.addRect(QtCore.QRectF(-0.04, -0.5, 0.08, 1.0))
+    return path
