@@ -8,10 +8,13 @@ applications de marchés financiers. Le travail en cours suit `PERFORMANCE_PLAN.
 ## Commandes
 
 ```bash
-# Environnement (numpy est la seule dépendance obligatoire ; une liaison Qt est requise)
-python -m pip install numpy scipy pyqt6 pytest pytest-qt pytest-xdist -e .
+# Environnement : venv `.venv` à la racine (ignoré par git). numpy est la seule dépendance
+# obligatoire ; une liaison Qt est requise. Dans la suite, `python` désigne le Python du venv.
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install numpy scipy pyqt6 pytest pytest-qt pytest-xdist mypy -e .
+.venv/Scripts/Activate.ps1                # activation PowerShell ; bash : source .venv/Scripts/activate
 
-# Qt sans écran (certains tests ne tournent qu'avec la plateforme offscreen)
+# Qt sans écran (certains tests ne tournent qu'avec offscreen ; sous Windows, voir plus bas)
 export QT_QPA_PLATFORM=offscreen          # PowerShell : $env:QT_QPA_PLATFORM='offscreen'
 
 # Tests
@@ -37,8 +40,19 @@ make -C doc html              # pip install -r doc/requirements.txt ; graphviz (
 python -m pyqtgraph.examples  # application de démonstration
 ```
 
-- Lancer Python/pytest **depuis la racine du dépôt** : une installation non éditable de
-  pyqtgraph peut exister dans `site-packages` et masquer le code local ailleurs.
+- Toujours passer par `.venv` (`.venv/Scripts/python.exe`, ou `python` une fois le venv activé),
+  lancé **depuis la racine du dépôt**. Le Python système (3.14) a un pyqtgraph 0.14 non éditable
+  dans le `site-packages` utilisateur, qui masque le code local, et il n'a ni pytest-qt ni
+  pytest-xdist.
+- `.venv/Lib/site-packages/sitecustomize.py`, propre au venv et non versionné, fait
+  `os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")`. Les wheels PyQt6 n'embarquent
+  plus de polices : en `offscreen`, l'avertissement `QFontDatabase` ferait échouer les tests. À
+  recréer avec le venv.
+- Sous Windows, lancer les tests sans `offscreen` : avec, 6 tests (dockarea, exporters,
+  imageview, histogramlutwidget) échouent sur l'avertissement Qt
+  `This plugin does not support propagateSizeHints()`.
+- `tests/test_reload.py` a besoin des `.pyc` : il échoue si `PYTHONDONTWRITEBYTECODE=1`, valeur
+  présente dans l'environnement des sessions Claude Code (`Remove-Item Env:PYTHONDONTWRITEBYTECODE`).
 - `filterwarnings = "error"` (pyproject) : tout avertissement Python fait échouer un test, et
   `qt_log_level_fail = "WARNING"` fait de même pour les messages Qt (pytest-qt).
 
