@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 
 import pyqtgraph as pg
-import pyqtgraph.exporters
+from pyqtgraph.exporters import ImageExporter
 from pyqtgraph.graphicsItems.AxisItem import AxisItem, _opaqueGridPen
 from pyqtgraph.Qt import QtGui
 from tests.perf_helpers import count_calls, process_events, show_and_wait
@@ -197,7 +197,7 @@ def test_export_keeps_translucent_grid(grid_widget):
     plot_item = grid_widget.getPlotItem()
 
     def export() -> np.ndarray:
-        exporter = pg.exporters.ImageExporter(plot_item)
+        exporter = ImageExporter(plot_item)
         exporter.parameters()['width'] = 300
         image = exporter.export(toBytes=True)
         image = image.convertToFormat(QtGui.QImage.Format.Format_ARGB32)
