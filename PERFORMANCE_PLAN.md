@@ -1039,7 +1039,7 @@ Tâches à petit gain ou à arbitrage nécessaire. Ne pas les démarrer avant la
 | T4.6 | Mettre en cache `np.arange(len(y))` quand x est omis | `PlotDataItem.setData` (l. 1296), `PlotCurveItem.updateData` (l. 612) | 20 ms à 1e7. |
 | T4.7 | `DontSavePainterState` sur `GraphicsView` | `widgets/GraphicsView.py` | −10 % avec plus de 400 objets, **mais** plusieurs `paint()` ne restaurent pas l'état du painter (`TextItem`, marqueurs d'`InfiniteLine`) : audit préalable obligatoire. |
 | T4.8 | Pyramide min/max (LOD) pour la décimation `'peak'` : blocs calculés en O(blocs · log ds) au lieu de O(points) | `graphicsItems/_MinMaxPyramid.py`, `PlotDataItem._PeakBlockCache` | Zoom x à 1e7 (S14) : calcul des données 4,1-4,5 → 2,2 ms/pas (numpy), 1,2 ms (`useNumba`) en vue complète. |
-| T4.9 | Option `autoReduce` (opt-in) : clip + `'peak'` automatiques au-delà de N points par pixel | `PlotDataItem.setAutoReduce`, option de configuration `autoReduce` | Pan x à 1e7 (S14) : 195 → 1,4 ms/pas par rapport aux options par défaut. |
+| T4.9 | Option `autoReduce` (activée par défaut, `2.0`) : clip + `'peak'` automatiques au-delà de N points par pixel | `PlotDataItem.setAutoReduce`, option de configuration `autoReduce` | Pan x à 1e7 (S14) : 195 → 1,4 ms/pas par rapport aux options par défaut. |
 
 **Statut de la phase 4** (détails dans les messages de commit) :
 - ☑ T4.1 (option `useDeviceCache`), T4.5 (copie ARGB32 en cache), T4.6 (cache de `np.arange`).
@@ -1049,8 +1049,9 @@ Tâches à petit gain ou à arbitrage nécessaire. Ne pas les démarrer avant la
 - ☒ T4.7 écartée après audit : `DontSavePainterState` change 14 % des pixels d'une image S05,
   car de nombreuses méthodes `paint()` ne restaurent pas l'état du painter.
 - ☑ T4.8 (pyramide construite au 2e changement de facteur pour les mêmes données, prolongée par
-  `appendData` ; utilisée à partir de ds ≥ 768, ou ≥ 256 avec `useNumba`), T4.9 (option
-  désactivée par défaut, x croissants vérifiés une fois par jeu de données).
+  `appendData` ; utilisée à partir de ds ≥ 768, ou ≥ 256 avec `useNumba`), T4.9 (x croissants
+  vérifiés une fois par jeu de données ; option activée par défaut à `2.0` points par pixel,
+  `pg.setConfigOptions(autoReduce=None)` pour revenir au comportement d'origine).
 
 ---
 
