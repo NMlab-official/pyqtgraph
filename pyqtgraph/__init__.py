@@ -3,7 +3,7 @@ PyQtGraph - Scientific Graphics and GUI Library for Python
 www.pyqtgraph.org
 """
 
-__version__ = '0.15.0.dev0'
+__version__ = '0.15.0.dev1'
 
 # pyright: reportMissingImports=false, reportUnusedImport=false
 
