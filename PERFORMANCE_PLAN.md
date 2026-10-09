@@ -1041,6 +1041,7 @@ Tâches à petit gain ou à arbitrage nécessaire. Ne pas les démarrer avant la
 | T4.8 | Pyramide min/max (LOD) pour la décimation `'peak'` : blocs calculés en O(blocs · log ds) au lieu de O(points) | `graphicsItems/_MinMaxPyramid.py`, `PlotDataItem._PeakBlockCache` | Zoom x à 1e7 (S14) : calcul des données 4,1-4,5 → 2,2 ms/pas (numpy), 1,2 ms (`useNumba`) en vue complète. |
 | T4.9 | Option `autoReduce` (activée par défaut, `2.0`) : clip + `'peak'` automatiques au-delà de N points par pixel | `PlotDataItem.setAutoReduce`, option de configuration `autoReduce` | Pan x à 1e7 (S14) : 195 → 1,4 ms/pas par rapport aux options par défaut. |
 | T4.10 | `AxisItem` : coût par image en pan/zoom (`tickValues` sans `np.isclose`, points des ticks sans `Point.__init__`, `drawLines` en paires de points, dessin direct au lieu d'enregistrer puis rejouer un `QPicture`) | `AxisItem.tickValues`, `generateDrawSpecs`, `drawPicture`, `_buildPicture`, `_AxisPicture` | Axes par image (S15, 1200×700, DPR 1,5) : sans grille 1,07 → 0,66 ms (PyQt6), 1,16 → 0,72 ms (PySide6) en zoom ; avec grille 2,35 → 1,93 ms. |
+| T4.11 | Grille de `AxisItem` : lignes horizontales et verticales remplies par `fillRect` sur les pixels exacts du traceur cosmétique de Qt, au lieu de `drawLines` (~8 ns/pixel) | `AxisItem._fillAxisAlignedLines`, `drawPicture` | Axes par image avec grille (S15, DPR 1,5) : 1,88-2,11 → 1,05-1,26 ms (PyQt6), 1,93-2,35 → 1,13-1,41 ms (PySide6). |
 
 **Statut de la phase 4** (détails dans les messages de commit) :
 - ☑ T4.1 (option `useDeviceCache`), T4.5 (copie ARGB32 en cache), T4.6 (cache de `np.arange`).
@@ -1064,9 +1065,17 @@ Tâches à petit gain ou à arbitrage nécessaire. Ne pas les démarrer avant la
   8 160 images pan/zoom (PyQt6/PySide6, DPR 1 / 1,25 / 1,5 / 2, axes numériques, log, dates,
   grille opaque ou translucide, polices, libellés), cas limites (police du widget, image à
   300 dpi, pinceaux épais ou à motif, opacité, surcharge de `drawPicture`), export SVG
-  identique octet par octet ; PyQt5 inchangé. Reste avec grille : ~1,3 ms/image de tracé des
-  lignes 1 px par le traceur cosmétique de Qt (~8 ns/pixel), à remplacer par des `fillRect`
-  seulement en reproduisant exactement son arrondi.
+  identique octet par octet ; PyQt5 inchangé.
+- ☑ T4.11 : quand l'axe dessine directement (Qt 6, voir T4.10) et que la grille est affichée,
+  chaque ligne horizontale ou verticale d'un pinceau cosmétique plein de 0 ou 1 px est
+  remplie par `fillRect` sur les pixels mêmes du traceur cosmétique de Qt 6 (extrémités
+  tronquées en 26.6, demi-pixel d'extrémité sauf `FlatCap`, colonne ou rangée `v >> 6`) ;
+  avec `FlatCap`, les lignes d'un niveau doivent avoir le même sens (le traceur ajoute une
+  extrémité à une ligne de sens opposé à la précédente). Sinon `drawLines`. Ticks courts sans
+  grille : `drawLines`, plus rapide. Vérifié identique au pixel : ~5 000 jeux de lignes
+  aléatoires (DPR 1 à 3, échelles négatives, clips rectangle et région, opacité, couleurs
+  translucides, ARGB32 prémultiplié et RGB32) contre `drawLines`, plus les vérifications de
+  T4.10. Les lignes verticales restent ~2,7 ns/pixel (un pixel par rangée).
 
 ---
 
@@ -1132,7 +1141,7 @@ réelle.
 | S12 | `PColorMeshItem` 400×200 | 316 ms | — (optionnel) |
 | — | `childrenBounds`, 400 objets | 4,86 ms par appel | 0,86 ms (prototype) |
 | — | `AxisItem.generateDrawSpecs` | ~1,5 ms par axe par changement | −35 % |
-| S15 | axes par image, pan/zoom, 10 courbes × 1e5, 1200×700, plateforme `windows` DPR 1,5, PyQt6 (mesuré après T4.9) | sans grille 0,61-1,07 ms ; avec grille 1,93-2,35 ms | 0,38-0,66 ms ; 1,70-1,93 ms (T4.10) |
+| S15 | axes par image, pan/zoom, 10 courbes × 1e5, 1200×700, plateforme `windows` DPR 1,5, PyQt6 (mesuré après T4.9) | sans grille 0,61-1,07 ms ; avec grille 1,93-2,35 ms | 0,38-0,66 ms ; 1,70-1,93 ms (T4.10), 1,05-1,26 ms (T4.11) |
 
 ---
 

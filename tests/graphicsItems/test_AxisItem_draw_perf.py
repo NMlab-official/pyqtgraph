@@ -10,6 +10,9 @@ Performance regression tests of the AxisItem drawing during a pan or a zoom.
   at most one pixel wide, no tick with equal ends, ``drawPicture`` not overridden.
   Otherwise the picture is recorded and replayed as before. The tests compare both
   drawings pixel for pixel.
+- When drawing directly, grid lines (horizontal or vertical, cosmetic, one pixel wide)
+  are filled as rectangles of the pixels the cosmetic stroker of Qt would draw:
+  compared with ``drawLines`` on many random lines, transformations and clips.
 """
 from __future__ import annotations
 
@@ -21,9 +24,14 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.graphicsItems import AxisItem as axisModule
-from pyqtgraph.graphicsItems.AxisItem import _DIRECT_DRAWING, AxisItem, _tickLevelValues
+from pyqtgraph.graphicsItems.AxisItem import (
+    _DIRECT_DRAWING,
+    AxisItem,
+    _fillAxisAlignedLines,
+    _tickLevelValues,
+)
 from pyqtgraph.Point import Point
-from pyqtgraph.Qt import QtGui
+from pyqtgraph.Qt import QtCore, QtGui
 from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
@@ -378,5 +386,151 @@ def test_labels_are_drawn_with_the_font_they_were_measured_with(monkeypatch):
         assert fonts
         assert all(f.family() == QtGui.QFont().family() for f in fonts)
         assert all(f.pointSizeF() == QtGui.QFont().pointSizeF() for f in fonts)
+    finally:
+        pw.close()
+
+
+# --------------------------------------------------------------------------------------
+# grid lines filled
+# --------------------------------------------------------------------------------------
+
+Qt = QtCore.Qt
+
+
+def _line_image(draw: Callable[[QtGui.QPainter], None], setup: Callable[[QtGui.QPainter], None],
+                dpr: float, fmt: QtGui.QImage.Format) -> np.ndarray:
+    image = QtGui.QImage(int(160 * dpr), int(120 * dpr), fmt)
+    image.setDevicePixelRatio(dpr)
+    image.fill(QtGui.QColor(20, 30, 40))
+    painter = QtGui.QPainter(image)
+    try:
+        setup(painter)
+        painter.setRenderHint(painter.RenderHint.Antialiasing, False)
+        draw(painter)
+    finally:
+        painter.end()
+    return pg.functions.ndarray_from_qimage(image).copy()
+
+
+def _fill(p: QtGui.QPainter, pen: QtGui.QPen, points: list[QtCore.QPointF]) -> bool:
+    p.setPen(pen)
+    transform = p.deviceTransform()
+    return _fillAxisAlignedLines(p, pen, points, transform, transform.inverted()[0])
+
+
+def _random_case(rng: np.random.Generator) -> tuple:
+    dpr = float(rng.choice([1.0, 1.25, 1.5, 2.0, 3.0]))
+    scale = (float(rng.choice([1.0, 0.7, 1.3, -1.0])), float(rng.choice([1.0, 1.7, -1.0])))
+    shift = rng.uniform(-20, 20, 2)
+    clip = rng.choice(['none', 'rect', 'region'])
+    clipRect = QtCore.QRectF(*rng.uniform(-30, 80, 2), *rng.uniform(20, 150, 2))
+    opacity = float(rng.choice([1.0, 0.5, 0.33]))
+
+    def setup(p: QtGui.QPainter) -> None:
+        p.translate(*shift)
+        p.scale(*scale)
+        if clip == 'rect':
+            p.setClipRect(clipRect)
+        elif clip == 'region':
+            p.setClipRegion(QtGui.QRegion(10, 10, 50, 80) | QtGui.QRegion(40, 70, 100, 30))
+        p.setOpacity(opacity)
+
+    color = QtGui.QColor(*(int(c) for c in rng.integers(0, 256, 3)),
+                         int(rng.choice([255, 128, 37])))
+    pen = QtGui.QPen(color, float(rng.choice([0.0, 1.0])))
+    pen.setCosmetic(True)
+    pen.setCapStyle(rng.choice([Qt.PenCapStyle.SquareCap, Qt.PenCapStyle.FlatCap,
+                                Qt.PenCapStyle.RoundCap]))
+    points = []
+    for _ in range(int(rng.integers(1, 12))):
+        # coordinates on or near the device pixel boundaries
+        def coordinate() -> float:
+            base = int(rng.integers(-30, 150))
+            frac = float(rng.choice([0.0, 0.5, 0.25, 1 / 64, 1 / 128, 0.5 - 1 / 64, rng.random()]))
+            return (base + frac) / dpr + float(rng.choice([0.0, 1e-9, -1e-9]))
+        c, a, b = coordinate(), coordinate(), coordinate()
+        if rng.random() < 0.5:
+            points += [QtCore.QPointF(c, a), QtCore.QPointF(c, b)]
+        else:
+            points += [QtCore.QPointF(a, c), QtCore.QPointF(b, c)]
+    fmt = rng.choice([QtGui.QImage.Format.Format_ARGB32_Premultiplied,
+                      QtGui.QImage.Format.Format_RGB32])
+    return dpr, setup, pen, points, fmt
+
+
+@direct_drawing
+def test_filled_lines_have_the_pixels_of_the_cosmetic_stroker():
+    rng = np.random.default_rng(11)
+    filled = 0
+    for _ in range(400):
+        dpr, setup, pen, points, fmt = _random_case(rng)
+        applicable = []
+        image = _line_image(lambda p: applicable.append(_fill(p, pen, points)), setup, dpr, fmt)
+        if not applicable[0]:
+            # nothing drawn when a line or the pen does not qualify
+            np.testing.assert_array_equal(image, _line_image(lambda p: None, setup, dpr, fmt))
+            continue
+        filled += 1
+        expected = _line_image(lambda p: (p.setPen(pen), p.drawLines(points)), setup, dpr, fmt)
+        np.testing.assert_array_equal(image, expected)
+    assert filled > 200
+
+
+@pytest.mark.parametrize('case', ['slanted', 'dashed', 'wide', 'non-cosmetic', 'pattern',
+                                  'opposite flat', 'point'])
+def test_other_lines_are_not_filled(case):
+    pen = QtGui.QPen(QtGui.QColor('red'), 1.0)
+    pen.setCosmetic(True)
+    points = [QtCore.QPointF(10, 10), QtCore.QPointF(10, 50),
+              QtCore.QPointF(20, 10), QtCore.QPointF(20, 50)]
+    if case == 'slanted':
+        points[3] = QtCore.QPointF(21, 50)
+    elif case == 'dashed':
+        pen.setStyle(Qt.PenStyle.DashLine)
+    elif case == 'wide':
+        pen.setWidthF(2.0)
+    elif case == 'non-cosmetic':
+        pen.setCosmetic(False)
+    elif case == 'pattern':
+        pen.setBrush(QtGui.QBrush(QtGui.QColor('red'), Qt.BrushStyle.Dense4Pattern))
+    elif case == 'opposite flat':
+        # the stroker adds a cap to a line reversing the direction of the previous one
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        points[2:] = [QtCore.QPointF(20, 50), QtCore.QPointF(20, 10)]
+    elif case == 'point':
+        points[3] = QtCore.QPointF(20, 10)
+    fmt = QtGui.QImage.Format.Format_ARGB32_Premultiplied
+    result = []
+    image = _line_image(lambda p: result.append(_fill(p, pen, points)), lambda p: p.scale(1.5, 1.5),
+                        1.0, fmt)
+    assert result == [False]
+    np.testing.assert_array_equal(image, _line_image(lambda p: None, lambda p: None, 1.0, fmt))
+
+
+@direct_drawing
+@pytest.mark.parametrize('grid', [False, True])
+def test_grid_lines_are_filled(grid, monkeypatch):
+    # rendered by grab() without being shown: no window activation disturbing the
+    # paint counts of tests running in parallel
+    pw = _plot()
+    if grid:
+        _setup_grid(pw)
+    _grab(pw)
+    results = []
+
+    def fill(*args):
+        results.append(_fillAxisAlignedLines(*args))
+        return results[-1]
+
+    monkeypatch.setattr(axisModule, '_fillAxisAlignedLines', fill)
+    try:
+        for axis in _axes(pw):
+            axis.picture = None
+        _grab(pw)
+        if grid:
+            # one call per tick level of each axis, all filled
+            assert len(results) >= 4 and all(results)
+        else:
+            assert results == []  # short ticks: drawLines is faster
     finally:
         pw.close()

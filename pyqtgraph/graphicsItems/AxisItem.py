@@ -292,6 +292,121 @@ def _drawnAsReplayed(specs: tuple) -> bool:
     return True
 
 
+# Transformations keeping lines axis-aligned, for which the raster engine fills a
+# rectangle with whole device pixels; see _fillAxisAlignedLines.
+_AXIS_ALIGNED_TRANSFORMS = (
+    QtGui.QTransform.TransformationType.TxNone,
+    QtGui.QTransform.TransformationType.TxTranslate,
+    QtGui.QTransform.TransformationType.TxScale,
+)
+
+
+def _fillAxisAlignedLines(
+    p: QtGui.QPainter,
+    pen: QtGui.QPen,
+    points: list[QtCore.QPointF],
+    transform: QtGui.QTransform,
+    inverse: QtGui.QTransform
+) -> bool:
+    """
+    Draw horizontal and vertical lines as filled rectangles of whole device pixels.
+
+    The raster engine draws the lines of a cosmetic pen at most one pixel wide with
+    its cosmetic stroker, one pixel at a time: about 8 ns per pixel, the main cost of a
+    grid. Filling the pixels of a horizontal line costs a few times less. This function
+    fills the very pixels the stroker of Qt 6 draws, unantialiased, for a solid pen one
+    pixel wide (or zero), each line mapped by ``transform``:
+
+    - ends in 26.6 fixed point, truncated: ``int(x * 64)``;
+    - for a vertical line, the column ``x >> 6`` and the rows from ``(y1 + 32) >> 6``
+      to ``(y2 + 32) >> 6`` excluded, ``y1 <= y2``, each end moved by half a pixel
+      outwards (``32``) unless the cap is flat; horizontal lines likewise;
+    - the stroker adds a cap to a line drawn in the opposite direction of the
+      previous one: with a flat cap, the lines must have a single direction.
+
+    Each rectangle is filled with the pen color, under the opacity, composition mode
+    and clipping of ``p``, which the raster engine applies as to the pixels of a line.
+    Lines clipped by the stroker (outside the device) differ in pixels outside the
+    device only.
+
+    Parameters
+    ----------
+    p : QtGui.QPainter
+        The painter, with the raster engine and no antialiasing.
+    pen : QtGui.QPen
+        The pen of the lines.
+    points : list of QtCore.QPointF
+        The lines, as point pairs.
+    transform : QtGui.QTransform
+        ``p.deviceTransform()``, from local to device coordinates.
+    inverse : QtGui.QTransform
+        The inverse of ``transform``.
+
+    Returns
+    -------
+    bool
+        False, without drawing anything, if a line or the pen does not qualify: the
+        caller then draws the lines with ``drawLines``.
+    """
+    if (
+        pen.style() != QtCore.Qt.PenStyle.SolidLine
+        or pen.brush().style() != QtCore.Qt.BrushStyle.SolidPattern
+        or not pen.isCosmetic()
+        or pen.widthF() not in (0.0, 1.0)
+    ):
+        return False
+    caps = pen.capStyle() != QtCore.Qt.PenCapStyle.FlatCap
+    direction = None
+    rects = []
+    mapPoint = transform.map
+    for i in range(0, len(points), 2):
+        a = mapPoint(points[i])
+        b = mapPoint(points[i + 1])
+        if a == b:  # drawn as a point, as by the stroker
+            return False
+        ax, ay, bx, by = a.x(), a.y(), b.x(), b.y()
+        # also rejects NaN; the stroker clips lines to the device
+        if not (abs(ax) < 1e6 and abs(ay) < 1e6 and abs(bx) < 1e6 and abs(by) < 1e6):
+            return False
+        x1, y1, x2, y2 = int(ax * 64.0), int(ay * 64.0), int(bx * 64.0), int(by * 64.0)
+        if x1 == x2 and y1 == y2:
+            continue  # not drawn
+        if x1 != x2 and y1 != y2:
+            return False
+        if not caps:
+            lineDirection = (x1 == x2, x1 < x2 or y1 < y2)  # orientation, sign
+            if direction is None:
+                direction = lineDirection
+            elif lineDirection != direction:
+                return False
+        if x1 == x2:
+            if y1 > y2:
+                y1, y2 = y2, y1
+            if caps:
+                y1 -= 32
+                y2 += 32
+            top = (y1 + 32) >> 6
+            bottom = (y2 + 32) >> 6
+            if bottom > top:
+                rects.append(QtCore.QRectF(x1 >> 6, top, 1, bottom - top))
+        else:
+            if x1 > x2:
+                x1, x2 = x2, x1
+            if caps:
+                x1 -= 32
+                x2 += 32
+            left = (x1 + 32) >> 6
+            right = (x2 + 32) >> 6
+            if right > left:
+                rects.append(QtCore.QRectF(left, y1 >> 6, right - left, 1))
+    color = pen.color()
+    mapRect = inverse.mapRect
+    for rect in rects:
+        # mapped back by the engine and rounded to the whole pixels of rect
+        p.fillRect(mapRect(rect), color)
+    return True
+
+
 # Resolution a QPicture is recorded for; see _AxisPicture.play.
 _resolutionPicture = None
 
@@ -2607,7 +2722,9 @@ class AxisItem(GraphicsWidget):
         the ticks as point pairs. The text antialiasing hint of ``p`` is used as it is:
         the axis used to draw into a ``QtGui.QPicture``, which does not replay that
         hint. When :meth:`paint` draws directly, the tick font is not set: ``p`` has
-        the font the labels were measured with (see :class:`_AxisPicture`).
+        the font the labels were measured with (see :class:`_AxisPicture`), and the
+        grid lines are filled as rectangles of the same pixels when possible (see
+        :func:`_fillAxisAlignedLines`).
 
         Parameters
         ----------
@@ -2630,23 +2747,41 @@ class AxisItem(GraphicsWidget):
         p.drawLine(p1, p2)
         # p.translate(0.5,0)  ## resolves some damn pixel ambiguity
 
-        ## draw ticks: one drawLines call per run of ticks sharing a pen (a tick level)
+        ## draw ticks: one drawLines call per run of ticks sharing a pen (a tick level);
+        ## grid lines are long, filled when that draws their pixels (drawing directly
+        ## ensures Qt 6 and the raster engine, see _fillAxisAlignedLines)
+        transform = inverse = None
+        if (
+            self._drawingDirectly and self.grid is not False
+            and p.compositionMode() == QtGui.QPainter.CompositionMode.CompositionMode_SourceOver
+        ):
+            transform = p.deviceTransform()
+            if transform.type() in _AXIS_ALIGNED_TRANSFORMS:
+                inverse, invertible = transform.inverted()
+                if not invertible:
+                    inverse = None
+
+        def drawRun(pen: QtGui.QPen, points: list[QtCore.QPointF]) -> None:
+            if inverse is None or not _fillAxisAlignedLines(p, pen, points, transform, inverse):
+                p.drawLines(points)
+
         background = self._pictureGridBackground
         points = []
-        lastPen = None
+        lastPen = runPen = None
         for pen, p1, p2 in tickSpecs:
             if pen is not lastPen:
                 if points:
-                    p.drawLines(points)
+                    drawRun(runPen, points)
                     points = []
                 lastPen = pen
                 if background is not None:
                     pen = _opaqueGridPen(pen, background)
                 p.setPen(pen)
+                runPen = pen
             points.append(p1)
             points.append(p2)
         if points:
-            p.drawLines(points)
+            drawRun(runPen, points)
         profiler('draw ticks')
 
         # Draw all text; when drawing directly, the painter has the font the labels
