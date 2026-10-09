@@ -117,6 +117,48 @@ class _LRUCache:
         self._data.clear()
 
 
+# Blended colors, ``(color QRgba, background QRgb) -> QColor``; see _opaqueGridPen.
+_blendedColorCache = _LRUCache(256)
+
+
+def _opaqueGridPen(pen: QtGui.QPen, background: int) -> QtGui.QPen:
+    """
+    Return an opaque pen drawing like ``pen`` over an opaque background.
+
+    The color is computed by the raster paint engine itself, which blends ``pen``'s
+    color over the background, so that drawing the returned pen over that background
+    gives the very pixels that ``pen`` gives.
+
+    Parameters
+    ----------
+    pen : QtGui.QPen
+        The translucent pen.
+    background : int
+        The opaque background color, as a QRgb value.
+
+    Returns
+    -------
+    QtGui.QPen
+        ``pen`` itself if it is opaque or not a solid color pen, else an opaque copy.
+    """
+    color = pen.color()
+    if pen.brush().style() != QtCore.Qt.BrushStyle.SolidPattern or color.alpha() == 255:
+        return pen
+    key = (color.rgba(), background)
+    blended = _blendedColorCache.get(key)
+    if blended is None:
+        image = QtGui.QImage(1, 1, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QtGui.QColor.fromRgba(background))
+        painter = QtGui.QPainter(image)
+        painter.fillRect(QtCore.QRect(0, 0, 1, 1), color)  # blended: SourceOver
+        painter.end()
+        blended = image.pixelColor(0, 0)
+        _blendedColorCache.put(key, blended)
+    opaquePen = QtGui.QPen(pen)
+    opaquePen.setColor(blended)
+    return opaquePen
+
+
 class AxisItem(GraphicsWidget):
     """
     GraphicsItem showing a single plot axis with ticks, values, and label.
@@ -179,6 +221,9 @@ class AxisItem(GraphicsWidget):
         self._buildingPicture = False
         self.label = QtWidgets.QGraphicsTextItem(self)
         self.picture = None
+        # Background color (QRgb) the grid pens of the picture were blended with, or
+        # None if they were not; see the ``opaqueGrid`` style option.
+        self._pictureGridBackground = None
         self.orientation = orientation
 
         if orientation in {'left', 'right'}:
@@ -212,6 +257,7 @@ class AxisItem(GraphicsWidget):
             'maxTickLevel': 2,
             'maxTextLevel': 2,
             'tickAlpha': None,  ## If not none, use this alpha for all ticks.
+            'opaqueGrid': False,  ## blend grid lines with a known opaque background
         }
 
         self.textWidth = 30  ## Keeps track of maximum width / height of tick text
@@ -364,6 +410,24 @@ class AxisItem(GraphicsWidget):
                                   - 1: Show major ticks and one level of minor ticks
                                   - 2: Show major ticks and two levels of minor ticks
                                     (higher CPU usage)
+
+            opaqueGrid            ``bool``
+                                  default: False
+
+                                  If ``True``, translucent grid lines are drawn with
+                                  an opaque pen, whose color is the grid color blended
+                                  with the background: that of the
+                                  :class:`~pyqtgraph.GraphicsView`, which the
+                                  background color of the linked view must match if
+                                  it is set. Over that background, the result is
+                                  identical, and much faster to draw with the raster
+                                  paint engine, especially with a fractional device
+                                  pixel ratio. But grid lines are drawn over the items
+                                  of the view (data, ticks of the other axis), which
+                                  they then hide where they cross them instead of
+                                  tinting them. Translucent pens are kept if the
+                                  background is not a known opaque color, and for
+                                  exports.
             ===================== ======================================================
 
         Raises
@@ -942,6 +1006,20 @@ class AxisItem(GraphicsWidget):
         self.updateAutoSIPrefix()
 
     def updateAutoSIPrefix(self):
+        self.autoSIPrefixScale, self.labelUnitPrefix = self._autoSIPrefix()
+        self._updateLabel()
+
+    def _autoSIPrefix(self) -> tuple[float, str]:
+        """
+        Compute the automatic SI prefix scaling for the current range.
+
+        Returns
+        -------
+        tuple of (float, str)
+            The scale applied to the tick values and the prefix of the label units;
+            ``(1.0, '')`` if the label is hidden or the range is out of the SI prefix
+            enable ranges.
+        """
         scale = 1.0
         prefix = ''
         if self.label.isVisible():
@@ -949,10 +1027,7 @@ class AxisItem(GraphicsWidget):
             scaling_value = max(abs(_range[0]), abs(_range[1])) * self.scale
             if any(low <= scaling_value <= high for low, high in self.getSIPrefixEnableRanges()):
                 (scale, prefix) = fn.siScale(scaling_value, power=self.unitPower)
-
-        self.autoSIPrefixScale = scale
-        self.labelUnitPrefix = prefix
-        self._updateLabel()
+        return scale, prefix
 
     def setRange(self, mn: float, mx: float):
         """
@@ -978,11 +1053,16 @@ class AxisItem(GraphicsWidget):
             raise ValueError(f"Not setting range to [{mn}, {mx}]")
         self.range = [mn, mx]
         if self.autoSIPrefix:
-            # XXX: Will already update once!
-            self.updateAutoSIPrefix()
-        else:
-            self._invalidatePicture()
-            self.update()
+            scale, prefix = self._autoSIPrefix()
+            if scale != self.autoSIPrefixScale or prefix != self.labelUnitPrefix:
+                # the label text changes; this also redraws the ticks
+                self.autoSIPrefixScale = scale
+                self.labelUnitPrefix = prefix
+                self._updateLabel()
+                return
+            # same label text: only the ticks change, skip the costly label update
+        self._invalidatePicture()
+        self.update()
 
     def linkedView(self):
         """
@@ -1122,7 +1202,11 @@ class AxisItem(GraphicsWidget):
         widget : QtWidgets.QWidget or None
             The widget painted on, unused.
         """
-        if self.picture is None:
+        if self.picture is None or (
+            self.style['opaqueGrid'] and self.grid is not False
+            # the background changed, or an export started or ended
+            and self._gridBackgroundRgb() != self._pictureGridBackground
+        ):
             self.picture = self._buildPicture()
         self.picture.play(p)
 
@@ -1159,6 +1243,11 @@ class AxisItem(GraphicsWidget):
             profiler('generate specs')
             if constraints is not None and self._sizeConstraints() != constraints:
                 return None
+            # set even without specs: paint compares it to the current background
+            self._pictureGridBackground = (
+                self._gridBackgroundRgb()
+                if self.style['opaqueGrid'] and self.grid is not False else None
+            )
             if specs is not None:
                 self.drawPicture(painter, *specs)
                 profiler('draw picture')
@@ -1179,6 +1268,41 @@ class AxisItem(GraphicsWidget):
         return (self.minimumWidth(), self.maximumWidth(),
                 self.minimumHeight(), self.maximumHeight())
 
+    def _gridBackgroundRgb(self) -> int | None:
+        """
+        Return the opaque background color under the grid lines, if it is known.
+
+        Grid lines are drawn over the linked view: over the background of the graphics
+        views showing the scene, and over the background color of the linked view if
+        it is set. The ends of the grid lines can lie a pixel outside the background
+        of the linked view: both backgrounds must have the same color.
+
+        Returns
+        -------
+        int or None
+            The background color as a QRgb value, or None while exporting, without a
+            linked view, or if the background is not a single opaque color.
+        """
+        if self._exportOpts is not False:
+            return None
+        view = self.linkedView()
+        scene = self.scene()
+        if view is None or scene is None:
+            return None
+        brushes = [v.backgroundBrush() for v in scene.views()]
+        rectItem = getattr(view, 'background', None)
+        if isinstance(rectItem, QtWidgets.QGraphicsRectItem) and rectItem.isVisible():
+            brushes.append(rectItem.brush())
+        colors = set()
+        for brush in brushes:
+            if brush.style() != QtCore.Qt.BrushStyle.SolidPattern:
+                return None
+            colors.add(brush.color().rgba())
+        if len(colors) != 1:
+            return None
+        rgb = colors.pop()
+        return rgb if rgb >> 24 == 0xFF else None
+
     def _invalidatePicture(self) -> None:
         """
         Drop the picture of the axis and have it built when the scene prepares.
@@ -1190,7 +1314,9 @@ class AxisItem(GraphicsWidget):
         Qt computes the regions to repaint, and a new size of the tick labels is laid
         out before the paint instead of after it, which cost a second paint.
         Otherwise :meth:`paint` builds the picture, as it does for hidden axes and for
-        subclasses overriding :meth:`paint`, which may not use the picture.
+        subclasses overriding :meth:`paint`, which may not use the picture. :meth:`paint`
+        also rebuilds a picture whose grid pens were blended with another background
+        than the current one (see the ``opaqueGrid`` style option).
 
         Changes made while the picture is built (see :meth:`_buildPicture`) only drop
         the picture: the built picture is assigned afterwards. The size constraints
@@ -2112,10 +2238,22 @@ class AxisItem(GraphicsWidget):
         p.drawLine(p1, p2)
         # p.translate(0.5,0)  ## resolves some damn pixel ambiguity
 
-        ## draw ticks
+        ## draw ticks: one drawLines call per run of ticks sharing a pen (a tick level)
+        background = self._pictureGridBackground
+        lines = []
+        lastPen = None
         for pen, p1, p2 in tickSpecs:
-            p.setPen(pen)
-            p.drawLine(p1, p2)
+            if pen is not lastPen:
+                if lines:
+                    p.drawLines(lines)
+                    lines = []
+                lastPen = pen
+                if background is not None:
+                    pen = _opaqueGridPen(pen, background)
+                p.setPen(pen)
+            lines.append(QtCore.QLineF(p1, p2))
+        if lines:
+            p.drawLines(lines)
         profiler('draw ticks')
 
         # Draw all text
