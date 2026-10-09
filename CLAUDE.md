@@ -132,3 +132,6 @@ mettre à jour à chaque tâche), scénarios S01..S14 de `benchmarks/scenarios.p
 - Python ≥ 3.12, Qt 5.15 ou ≥ 6.8 ; PyQt5, PyQt6 et PySide6 doivent tous fonctionner.
 - Messages de commit en anglais, préfixés par le composant ou la tâche :
   `AxisItem: …`, `Tests: …`, `T4.4: …`.
+- Pull requests rédigées en anglais, même quand la conversation est en français : titre préfixé
+  comme les commits (`PlotDataItem: …`), description en sections `## What`, `## Why`,
+  `## Notes for the review` (mesures, tests lancés, changements de comportement).
