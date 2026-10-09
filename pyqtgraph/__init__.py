@@ -39,8 +39,8 @@ CONFIG_OPTIONS = {
                                  # change in the future.
     'useCupy': False,  # When True, attempt to use cupy ( currently only with ImageItem and related functions )
     'useNumba': False, # When True, use numba
-    'autoReduce': None,  # PlotDataItem: points per pixel above which dense increasing-x data is
-                         # clipped to the view and downsampled automatically; None disables it
+    'autoReduce': 2.0,  # PlotDataItem: points per pixel above which dense increasing-x data is
+                        # clipped to the view and downsampled automatically; None disables it
     'segmentedLineMode': 'auto',  # segmented line mode, controls if lines are plotted in segments or continuous
                                   # 'auto': whether lines are plotted in segments is automatically decided using pen properties and whether anti-aliasing is enabled
                                   # 'on' or True: lines are always plotted in segments

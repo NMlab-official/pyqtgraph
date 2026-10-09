@@ -711,7 +711,7 @@ class PlotDataItem(GraphicsObject):
                             See :meth:`setClipToView` for more information.
 
         autoReduce          ``float`` or ``None``, default inherited from
-                            ``pyqtgraph.getConfigOption('autoReduce')`` (``None``)
+                            ``pyqtgraph.getConfigOption('autoReduce')`` (``2.0``)
 
                             Number of data points per pixel of view width above which
                             the data is clipped to the view and downsampled
@@ -1477,7 +1477,7 @@ class PlotDataItem(GraphicsObject):
         increase is never reduced by this option.
 
         The default for new items is the ``autoReduce`` configuration option
-        (``None`` unless set with :func:`~pyqtgraph.setConfigOptions`). Explicit
+        (``2.0`` unless set with :func:`~pyqtgraph.setConfigOptions`). Explicit
         :meth:`setClipToView` and :meth:`setDownsampling` settings still apply.
 
         Parameters

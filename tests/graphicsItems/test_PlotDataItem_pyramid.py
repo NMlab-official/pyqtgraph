@@ -363,9 +363,25 @@ def _dense_line(n=1_000_000, seed=10):
     return np.arange(n, dtype=float), np.cumsum(rng.standard_normal(n))
 
 
-def test_auto_reduce_is_disabled_by_default(plot_widget):
+def test_auto_reduce_is_enabled_by_default(plot_widget):
     x, y = _dense_line()
     item = plot_widget.plot(x, y)
+    assert item.opts['autoReduce'] == 2.0
+    plot_widget.setXRange(2e5, 4e5, padding=0)
+    process_events()
+    # the data is clipped to the view and downsampled
+    xd, yd = item.getData()
+    assert len(xd) < len(x)
+    assert xd[0] < 2e5 and xd[-1] > 4e5
+
+
+def test_auto_reduce_disabled_by_configuration(plot_widget):
+    x, y = _dense_line()
+    try:
+        pg.setConfigOptions(autoReduce=None)
+        item = plot_widget.plot(x, y)
+    finally:
+        pg.setConfigOptions(autoReduce=2.0)
     assert item.opts['autoReduce'] is None
     plot_widget.setXRange(2e5, 4e5, padding=0)
     process_events()
@@ -375,13 +391,15 @@ def test_auto_reduce_is_disabled_by_default(plot_widget):
 
 
 def test_auto_reduce_configuration_option():
-    assert pg.getConfigOption('autoReduce') is None
+    assert pg.getConfigOption('autoReduce') == 2.0
     try:
         pg.setConfigOptions(autoReduce=10)
         assert pg.PlotDataItem().opts['autoReduce'] == 10
-    finally:
         pg.setConfigOptions(autoReduce=None)
-    assert pg.PlotDataItem().opts['autoReduce'] is None
+        assert pg.PlotDataItem().opts['autoReduce'] is None
+    finally:
+        pg.setConfigOptions(autoReduce=2.0)
+    assert pg.PlotDataItem().opts['autoReduce'] == 2.0
     for value in (0, -1, math.inf, math.nan):
         with pytest.raises(ValueError):
             pg.setConfigOption('autoReduce', value)
@@ -389,7 +407,7 @@ def test_auto_reduce_configuration_option():
             pg.PlotDataItem().setAutoReduce(value)
         with pytest.raises(ValueError):
             pg.PlotDataItem([1, 2, 3], autoReduce=value)
-    assert pg.getConfigOption('autoReduce') is None
+    assert pg.getConfigOption('autoReduce') == 2.0
 
 
 @pytest.mark.parametrize('use_setter', [False, True])
