@@ -1,8 +1,7 @@
 import numpy as np
 
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtWidgets
-from tests.perf_helpers import count_calls, paints_per_update, show_and_wait
+from tests.perf_helpers import count_calls, paints_per_update
 
 app = pg.mkQApp()
 
@@ -57,28 +56,5 @@ def test_paints_per_update_autorange_streaming():
 
     try:
         assert paints_per_update(pw, pg.PlotCurveItem, update, n=10) <= 1.05
-    finally:
-        pw.close()
-
-
-def test_show_and_wait_keeps_the_window_out_of_activation_and_input():
-    # Activation changes and mouse moves repaint a window: the windows of tests running
-    # in parallel, and the mouse cursor, used to add paints to the counted ones.
-    pw = pg.PlotWidget()
-    pw.resize(300, 200)
-    try:
-        show_and_wait(pw)
-        flags = pw.windowFlags()
-        assert flags & QtCore.Qt.WindowType.WindowDoesNotAcceptFocus
-        assert flags & QtCore.Qt.WindowType.WindowTransparentForInput
-        assert pw.testAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        if QtWidgets.QApplication.platformName() == 'windows':
-            # the offscreen platform activates any window shown
-            assert not pw.isActiveWindow()
-        # shown again after being hidden: the window is kept as is
-        pw.hide()
-        show_and_wait(pw)
-        assert pw.windowFlags() == flags
-        assert pw.windowHandle().isExposed()
     finally:
         pw.close()

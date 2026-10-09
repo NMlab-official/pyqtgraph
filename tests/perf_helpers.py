@@ -138,13 +138,6 @@ def show_and_wait(widget: QtWidgets.QWidget, timeout: int = 5000) -> None:
     ``QTest.qWaitForWindowExposed`` is not used: it also runs the deferred deletions
     of Qt, after which PySide6 crashed when later tests destroyed their widgets.
 
-    A window not yet visible is shown without being activated, and never takes the
-    focus nor the input of the window system (mouse, keyboard). Otherwise, it is
-    repainted whenever its activation changes, e.g. as the windows of tests running
-    in parallel open and close, and when the mouse cursor moves over it (the
-    auto-range button of a plot appears): paint counts depended on other processes.
-    Events sent to its widgets with ``QApplication.sendEvent`` are still delivered.
-
     Parameters
     ----------
     widget : QtWidgets.QWidget
@@ -152,14 +145,6 @@ def show_and_wait(widget: QtWidgets.QWidget, timeout: int = 5000) -> None:
     timeout : int, default 5000
         Maximum waiting time in milliseconds.
     """
-    top = widget.window()
-    if not top.isVisible():
-        top.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        flags = (top.windowFlags()
-                 | QtCore.Qt.WindowType.WindowDoesNotAcceptFocus
-                 | QtCore.Qt.WindowType.WindowTransparentForInput)
-        if flags != top.windowFlags():
-            top.setWindowFlags(flags)
     widget.show()
     window = widget.window().windowHandle()
     app = QtWidgets.QApplication.instance()
