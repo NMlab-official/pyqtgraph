@@ -106,6 +106,11 @@ python -m pyqtgraph.examples  # application de démonstration
 - PySide6 met en cache, par objet, la surcharge Python d'une méthode virtuelle (`paint`…) trouvée au
   premier appel : un compteur posé après le premier rendu ne voit rien (voir `perf_helpers.py`).
 - Attendre l'exposition de la fenêtre avant de mesurer ou comparer un rendu (`show_and_wait`).
+  `show_and_wait` affiche la fenêtre sans l'activer et la rend transparente aux entrées : sinon,
+  les fenêtres des autres workers (`-n 4`) qui prennent ou rendent l'activation, et le curseur
+  souris, ajoutent des rendus. Une fenêtre comptée doit donc être affichée par `show_and_wait`
+  (pas par `show()`), et un test qui a besoin du focus ou de la souris système ne peut pas
+  l'utiliser.
 - Quand un changement touche au rendu, il doit rester identique au pixel près : comparer une
   `QImage` rendue avant/après ou s'appuyer sur les tests d'images existants.
 
