@@ -1042,6 +1042,7 @@ Tâches à petit gain ou à arbitrage nécessaire. Ne pas les démarrer avant la
 | T4.9 | Option `autoReduce` (activée par défaut, `2.0`) : clip + `'peak'` automatiques au-delà de N points par pixel | `PlotDataItem.setAutoReduce`, option de configuration `autoReduce` | Pan x à 1e7 (S14) : 195 → 1,4 ms/pas par rapport aux options par défaut. |
 | T4.10 | `AxisItem` : coût par image en pan/zoom (`tickValues` sans `np.isclose`, points des ticks sans `Point.__init__`, `drawLines` en paires de points, dessin direct au lieu d'enregistrer puis rejouer un `QPicture`) | `AxisItem.tickValues`, `generateDrawSpecs`, `drawPicture`, `_buildPicture`, `_AxisPicture` | Axes par image (S15, 1200×700, DPR 1,5) : sans grille 1,07 → 0,66 ms (PyQt6), 1,16 → 0,72 ms (PySide6) en zoom ; avec grille 2,35 → 1,93 ms. |
 | T4.11 | Grille de `AxisItem` : lignes horizontales et verticales remplies par `fillRect` sur les pixels exacts du traceur cosmétique de Qt, au lieu de `drawLines` (~8 ns/pixel) | `AxisItem._fillAxisAlignedLines`, `drawPicture` | Axes par image avec grille (S15, DPR 1,5) : 1,88-2,11 → 1,05-1,26 ms (PyQt6), 1,93-2,35 → 1,13-1,41 ms (PySide6). |
+| T4.12 | `autoReduce` : un bloc `'peak'` par pixel physique au lieu de `autoDownsampleFactor` (5) échantillons par pixel ; mise à jour d'affichage demandée par un changement de vue différée au prochain rendu, comme celle de `setData` | `PlotDataItem._displayReduction`, `_autoReduceBlocksPerPixel`, `setExportMode`, `viewRangeChanged` | 10 courbes × 1e5 (1200×700, DPR 1,5, PySide6) : pan XY 11,8 → 5,6 ms/image, zoom 14,4 → 7,1 ms ; 3 et 6 événements de zoom par image : 9,4 → 6,5 et 12,2 → 6,6 ms. |
 
 **Statut de la phase 4** (détails dans les messages de commit) :
 - ☑ T4.1 (option `useDeviceCache`), T4.5 (copie ARGB32 en cache), T4.6 (cache de `np.arange`).
@@ -1076,6 +1077,17 @@ Tâches à petit gain ou à arbitrage nécessaire. Ne pas les démarrer avant la
   aléatoires (DPR 1 à 3, échelles négatives, clips rectangle et région, opacité, couleurs
   translucides, ARGB32 prémultiplié et RGB32) contre `drawLines`, plus les vérifications de
   T4.10. Les lignes verticales restent ~2,7 ns/pixel (un pixel par rangée).
+- ☑ T4.12 (PR #12) : avec `autoReduce` et la méthode `'peak'`, le facteur de décimation vise
+  `devicePixelRatioF()` blocs par pixel de largeur de vue, soit un bloc min/max par pixel
+  physique : même enveloppe, 3 à 5 fois moins de points dessinés. Export image : la résolution
+  de l'export (`resolutionScale`, recalcul dans `setExportMode`) ; export vectoriel et
+  `autoDownsample` explicite : `autoDownsampleFactor`, inchangé. Rendu : aucune différence
+  visible sur un agrandissement ; pixels différents des données complètes 0,13 % → 0,42 % sur
+  une vue partielle (changement de rendu accepté avec `autoReduce`, qui est une approximation).
+  `viewRangeChanged` passe par `_requestDisplayUpdate` : les changements de vue d'une même
+  image (rafale de molette ou de pavé tactile) calculent les données affichées une seule fois.
+  Limite : un changement de rapport de pixels (fenêtre déplacée vers un autre écran) n'est pris
+  en compte qu'au changement de vue suivant.
 
 ---
 
