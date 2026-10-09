@@ -14,7 +14,7 @@ import pyqtgraph as pg
 from pyqtgraph.exporters import SVGExporter
 from pyqtgraph.graphicsItems.LegendItem import LegendItem
 from pyqtgraph.Qt import QtGui
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -77,8 +77,7 @@ def _build(col_count: int, eager: bool) -> tuple[pg.PlotWidget, LegendItem]:
     """
     widget = pg.PlotWidget()
     widget.resize(600, 400)
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     legend = widget.addLegend(colCount=col_count)
     for name in _names(N_ENTRIES):
         widget.plot([0, 1, 2], name=name)
@@ -90,8 +89,7 @@ def _build(col_count: int, eager: bool) -> tuple[pg.PlotWidget, LegendItem]:
 
 def test_adding_entries_coalesces_size_updates():
     widget = pg.PlotWidget()
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     legend = widget.addLegend()
     with count_calls(LegendItem, 'updateSize') as calls:
         for name in _names(N_ENTRIES):

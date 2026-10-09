@@ -5,9 +5,11 @@ These tests check deterministic invariants (calls made, objects created, cache
 entries) instead of durations, see ``tests/perf_helpers.py``.
 """
 import numpy as np
+import pytest
 
 import pyqtgraph as pg
 from pyqtgraph import functions as fn
+from pyqtgraph.graphicsItems import ScatterPlotItem as ScatterPlotItemModule
 from pyqtgraph.graphicsItems.ScatterPlotItem import (
     SymbolAtlas,
     _brushValueKey,
@@ -20,7 +22,7 @@ from pyqtgraph.graphicsItems.ScatterPlotItem import (
     renderSymbol,
 )
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -191,8 +193,7 @@ def _renderInView(items, xRange=(0, 10), yRange=(0, 10), size=(160, 120)):
     for item in items:
         vb.addItem(item)
     vb.setRange(xRange=xRange, yRange=yRange, padding=0)
-    view.show()
-    process_events()
+    show_and_wait(view)
     img = view.grab().toImage()
     view.close()
     return img
@@ -402,7 +403,8 @@ def test_atlas_queried_once_per_unique_style():
     step = 4 * scatter.fragmentAtlas.devicePixelRatio()
     combinations = set(zip(_quantizeSizes(sizes, step).tolist(), colors.tolist()))
     assert lookups == [5, len(combinations)]
-    assert len(combinations) <= 4 * 41
+    # sizes in [5, 15] quantized with `step` levels per pixel, times 4 colors
+    assert len(combinations) <= 4 * (int(np.ceil((15 - 5) * step)) + 1)
 
 
 def test_rgba_array_fast_path(monkeypatch):
@@ -562,6 +564,14 @@ class _ReferenceScatter(pg.ScatterPlotItem):
     def paint(self, p, option, widget):
         if not self.opts['pxMode']:
             return super().paint(p, option, widget)
+        if self.opts['useCache']:
+            # as the real paint: re-render the atlas for the pixel ratio of the widget
+            dpr = self.fragmentAtlas.devicePixelRatio()
+            if widget is not None and (dprNew := widget.devicePixelRatioF()) != dpr:
+                self.fragmentAtlas.setDevicePixelRatio(dprNew)
+                self.fragmentAtlas.clear()
+                self.data['sourceRect'] = 0
+                self.updateSpots()
         mask = _referenceMask(self, self.viewRect())
         pts = _referencePoints(p.transform(), self, mask)
         p.resetTransform()
@@ -663,8 +673,7 @@ def test_paint_arrays_cached_until_spots_change():
     view.resize(200, 150)
     scatter = pg.ScatterPlotItem(x=rng.random(n), y=rng.random(n), size=5)
     vb.addItem(scatter)
-    view.show()
-    process_events()
+    show_and_wait(view)
     with count_calls(_SpotArrays, '__init__') as builds:
         for i in range(5):  # pans: the arrays are reused
             vb.setRange(xRange=(i * 0.1, 1 + i * 0.1), yRange=(0, 1), padding=0)
@@ -713,7 +722,20 @@ def _scatterUnderCrosshair(**kwargs):
     return pw, scatter, line
 
 
-def test_device_cache_off_by_default():
+@pytest.fixture
+def integral_screens(monkeypatch):
+    # the device cache is only used when every screen has an integral pixel ratio
+    monkeypatch.setattr(ScatterPlotItemModule, '_screensHaveIntegralPixelRatio', lambda: True)
+
+
+def test_device_cache_not_used_with_fractional_pixel_ratio(monkeypatch):
+    monkeypatch.setattr(ScatterPlotItemModule, '_screensHaveIntegralPixelRatio', lambda: False)
+    scatter = pg.ScatterPlotItem(x=[0], y=[0], useDeviceCache=True)
+    assert scatter.opts['useDeviceCache'] is True
+    assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.NoCache
+
+
+def test_device_cache_off_by_default(integral_screens):
     scatter = pg.ScatterPlotItem(x=[0], y=[0])
     assert scatter.opts['useDeviceCache'] is False
     assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.NoCache
@@ -723,7 +745,7 @@ def test_device_cache_off_by_default():
     assert scatter.cacheMode() == QtWidgets.QGraphicsItem.CacheMode.NoCache
 
 
-def test_device_cache_not_used_with_other_composition_modes():
+def test_device_cache_not_used_with_other_composition_modes(integral_screens):
     plus = QtGui.QPainter.CompositionMode.CompositionMode_Plus
     sourceOver = QtGui.QPainter.CompositionMode.CompositionMode_SourceOver
     scatter = pg.ScatterPlotItem(x=[0], y=[0], useDeviceCache=True, compositionMode=plus)
@@ -735,8 +757,7 @@ def test_device_cache_not_used_with_other_composition_modes():
 def _scatterRepaintsPerUpdate(pw, update, n=10, warmup=3):
     # Count the Python-level fragment preparation done by each scatter paint rather
     # than wrapping the paint virtual, which is unreliable with PySide6.
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     for i in range(warmup):
         update(i)
         process_events()
@@ -748,6 +769,8 @@ def _scatterRepaintsPerUpdate(pw, update, n=10, warmup=3):
 
 
 def test_device_cache_spares_repaints_under_crosshair():
+    if not ScatterPlotItemModule._screensHaveIntegralPixelRatio():
+        pytest.skip("fractional device pixel ratio: the device cache is not used")
     rates = {}
     images = {}
     for cached in (False, True):

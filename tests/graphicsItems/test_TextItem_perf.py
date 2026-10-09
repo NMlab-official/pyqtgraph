@@ -12,7 +12,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -86,8 +86,7 @@ def _text_scales(items):
 def test_no_paint_signal_connection_in_viewbox():
     widget, vb = _make_plot()
     scene = widget.scene()
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     before = _paint_receivers(scene)
     texts = []
     for i in range(20):
@@ -108,8 +107,7 @@ def test_no_paint_signal_connection_in_viewbox():
 def test_paint_signal_connection_kept_when_needed():
     widget, vb = _make_plot()
     scene = widget.scene()
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     before = _paint_receivers(scene)
     # the parent of this text can be rotated at any time
     parent = QtWidgets.QGraphicsRectItem(0, 0, 1, 1)
@@ -132,8 +130,7 @@ def test_paint_signal_connection_kept_when_needed():
     before = _paint_receivers(view.scene())
     text = pg.TextItem('scene')
     view.scene().addItem(text)
-    view.show()
-    process_events()
+    show_and_wait(view)
     assert _paint_receivers(view.scene()) == before + 1
     view.close()
 
@@ -141,8 +138,7 @@ def test_paint_signal_connection_kept_when_needed():
 def test_line_label_paint_sync_follows_line_parent():
     widget, vb = _make_plot()
     scene = widget.scene()
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     before = _paint_receivers(scene)
     line = pg.InfiniteLine(pos=5, angle=0, label='{value:0.1f}')
     vb.addItem(line)
@@ -165,8 +161,7 @@ def test_pan_keeps_transform_and_text_offset():
         text.setPos(i, i)
         vb.addItem(text)
         texts.append(text)
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     with count_calls(pg.TextItem, 'setTransform') as transforms, \
          count_calls(pg.TextItem, 'updateTextPos') as offsets:
         for i in range(5):
@@ -192,8 +187,7 @@ def test_transform_update_triggers_auto_range_only_if_needed(monkeypatch, ensure
         text.setPos(i, i)
         vb.addItem(text)
         texts.append(text)
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     notified = []
     original = pg.ViewBox.itemBoundsChanged
 
@@ -219,8 +213,7 @@ def test_line_label_follows_line_rotation_immediately():
     line = pg.InfiniteLine(pos=(5, 5), angle=30, label='label',
                            labelOpts={'rotateAxis': (1, 0)})
     vb.addItem(line)
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     line.setAngle(70)
     # no paint in between: the line updates its label itself
     ref = pg.TextItem('label', rotateAxis=(1, 0))
@@ -237,8 +230,7 @@ def test_hidden_text_updated_when_shown_again(hide_parent):
     widget, vb = _make_plot()
     text = pg.TextItem('hidden', anchor=(0.5, 0.5))
     vb.addItem(text)
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     hidden = vb.innerSceneItem() if hide_parent else text
     hidden.hide()
     vb.scaleBy((0.25, 0.5))
@@ -252,8 +244,7 @@ def test_rendering_after_view_changes_matches_fresh_view():
     final_range = dict(xRange=(-1.5, 12.25), yRange=(0.75, 9.5))
     widget, vb = _make_plot()
     items, line, parent = _add_scene(vb)
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     steps = [
         lambda: vb.setRange(xRange=(1.3, 11.7), yRange=(-0.4, 9.1), padding=0),
         lambda: vb.scaleBy((0.37, 0.61)),

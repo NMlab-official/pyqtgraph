@@ -73,6 +73,7 @@ qt_log_level_fail = "WARNING"
 qt_log_ignore = [
   "XcbConnection: XCB error",
   "Registering dynamic slot.*FigureCanvasQTAgg", # ignore PySide6 warnings in Matplotlib < 3.10.1
+  "loadUiType: pyside6-uic.* could not be found", # PySide6 6.12, handled by pyqtgraph.Qt.loadUiType
 ]
 # xvfb
 xvfb_args = ["-ac", "+extension", "GLX", "+render"]

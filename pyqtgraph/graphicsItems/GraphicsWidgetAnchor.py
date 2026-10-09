@@ -1,4 +1,5 @@
 from ..Point import Point
+from ..Qt import QtCore
 
 __all__ = ['GraphicsWidgetAnchor']
 
@@ -93,6 +94,10 @@ class GraphicsWidgetAnchor(object):
             offset = itemPos - parentPos
             self.anchor(anchorPos, anchorPos, offset)
     
+    # Declared as a slot: PySide6 6.12 warns when a signal is connected to an
+    # undecorated method ("Registering dynamic slot"), which the test suite treats
+    # as a failure.
+    @QtCore.Slot()
     def __geometryChanged(self):
         if self.__parent is None:
             return

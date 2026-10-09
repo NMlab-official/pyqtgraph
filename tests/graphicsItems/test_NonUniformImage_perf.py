@@ -13,7 +13,7 @@ import pyqtgraph as pg
 import pyqtgraph.functions as fn
 from pyqtgraph.graphicsItems.NonUniformImage import NonUniformImage
 from pyqtgraph.Qt import QtCore, QtGui
-from tests.perf_helpers import count_calls
+from tests.perf_helpers import count_calls, show_and_wait
 
 app = pg.mkQApp()
 
@@ -336,8 +336,7 @@ def test_in_view_box():
     view.resize(200, 160)
     item = _item(seed=10, border=fn.mkPen('g'))
     viewbox.addItem(item)
-    view.show()
-    app.processEvents()
+    show_and_wait(view)
     rendered = view.grab().toImage()
     assert item._rendered is not None
     assert item.picture is None
