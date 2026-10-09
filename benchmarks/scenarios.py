@@ -1,11 +1,12 @@
 """
-Reproducible end-to-end performance scenarios (S01 to S14).
+Reproducible end-to-end performance scenarios (S01 to S15).
 
 The scenario identifiers S01 to S12 match ``PERFORMANCE_PLAN.md`` at the root of the
 repository; S13 covers the CandlestickItem added by its task T3.2, S14 the pan and
-zoom of a long line with 'peak' downsampling (min/max pyramid). Every scenario
-prints one line per variant with the median duration and, where relevant, call
-counters (paints per update, ``setData`` calls, ...).
+zoom of a long line with 'peak' downsampling (min/max pyramid), S15 the cost of the
+axes per pan or zoom frame. Every scenario prints one line per variant with the
+median duration and, where relevant, call counters (paints per update, ``setData``
+calls, ...).
 
 Usage::
 
@@ -1318,6 +1319,75 @@ def s14_pan_zoom_x(full: bool) -> list[Result]:
     return results
 
 
+def s15_axes_pan_zoom(full: bool) -> list[Result]:
+    """
+    S15: cost of the axes of a PlotWidget per pan or zoom frame.
+
+    A 1200x700 PlotWidget shows 10 lines of 1e5 points (random walks), without and
+    with grid. A frame pans the view by 1 % of its range along x, y or both, or zooms
+    it by 2 % (the direction changes every 20 frames), then repaints the viewport
+    synchronously. The time spent building the axis drawings when the scene prepares
+    (``AxisItem._prepareForPaint``) and painting the axes (``AxisItem.paint``) is
+    accumulated over the frames. Run with an on-screen Qt platform, e.g.
+    ``QT_QPA_PLATFORM=windows``, to measure at the device pixel ratio of the screen.
+
+    Parameters
+    ----------
+    full : bool
+        Unused.
+
+    Returns
+    -------
+    list of Result
+        One result per (grid, action): the duration of a frame, with the time spent in
+        the axes and the axis specifications generated per frame as counters.
+    """
+    results = []
+    rng = np.random.default_rng(0)
+    lines = [np.cumsum(rng.standard_normal(100_000)) + 50 * i for i in range(10)]
+    for grid in (False, True):
+        for action in ('pan x', 'pan y', 'pan xy', 'zoom'):
+            # entered before the first paint: with PySide6, an item keeps calling the
+            # paint method it found when first painted
+            with _TimeAccumulator(pg.AxisItem, '_prepareForPaint') as prepare, \
+                    _TimeAccumulator(pg.AxisItem, 'paint') as paint, \
+                    CallCounter(pg.AxisItem, 'generateDrawSpecs') as specs:
+                pw = _plot_widget(1200, 700)
+                for i, y in enumerate(lines):
+                    pw.plot(y, pen=pg.intColor(i, len(lines)))
+                if grid:
+                    pw.showGrid(x=True, y=True)
+                vb = pw.getViewBox()
+                vb.autoRange(padding=0.05)
+                _process(5)
+                (x0, x1), (y0, y1) = vb.viewRange()
+                dx, dy = 0.01 * (x1 - x0), 0.01 * (y1 - y0)
+                state = {'i': 0}
+
+                def frame() -> None:
+                    i = state['i'] = state['i'] + 1
+                    sign = 1.0 if (i // 20) % 2 == 0 else -1.0
+                    if action == 'zoom':
+                        scale = 0.98 if sign > 0 else 1 / 0.98
+                        vb.scaleBy((scale, scale))
+                    else:
+                        vb.translateBy(x=sign * dx if 'x' in action else None,
+                                       y=sign * dy if 'y' in action else None)
+                    pw.viewport().repaint()
+
+                for _ in range(10):
+                    frame()
+                start = prepare.ms + paint.ms
+                specs.reset()
+                ms, frames = _timed(frame, repeat=200, warmup=0)
+                results.append(Result(
+                    f'S15[{"grid" if grid else "no grid"},{action}]', ms, 'ms/frame',
+                    {'axes ms/frame': (prepare.ms + paint.ms - start) / frames,
+                     'specs/frame': specs.count / frames}))
+                pw.close()
+    return results
+
+
 SCENARIOS: dict[str, Callable[[bool], list[Result]]] = {
     'S01': s01_streaming_line,
     'S02': s02_pan_y,
@@ -1333,6 +1403,7 @@ SCENARIOS: dict[str, Callable[[bool], list[Result]]] = {
     'S12': s12_non_uniform,
     'S13': s13_candlesticks,
     'S14': s14_pan_zoom_x,
+    'S15': s15_axes_pan_zoom,
 }
 
 
@@ -1379,7 +1450,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('scenarios', nargs='*', help='scenario ids (S01 ... S14)')
+    parser.add_argument('scenarios', nargs='*', help='scenario ids (S01 ... S15)')
     parser.add_argument('--full', action='store_true', help='include the largest sizes')
     parser.add_argument('--numba', action='store_true',
                         help="set the 'useNumba' configuration option")

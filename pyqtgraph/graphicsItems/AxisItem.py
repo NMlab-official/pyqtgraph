@@ -1,5 +1,6 @@
 import sys
 import weakref
+from bisect import bisect_left
 from collections import OrderedDict
 from collections.abc import Hashable
 from math import ceil, copysign, floor, frexp, isfinite, log10, sqrt
@@ -32,6 +33,380 @@ _TICK_TEXT_FLAGS = {
 
 # Rectangle in which tick labels are measured, see AxisItem._measureTickText.
 _TEXT_MEASURE_RECT = QtCore.QRectF(0, 0, 100, 100)
+
+# Whether the axes may draw directly instead of replaying a QPicture: Qt 5 lays the
+# text of a picture out again when replaying it, which can move a label by a pixel.
+_DIRECT_DRAWING = int(QtCore.qVersion().split('.')[0]) >= 6
+
+# Render hints, besides Antialiasing, that a replayed QPicture set to their recorded
+# value, off for the pictures the axes used to record; see _AxisPicture.play.
+_REPLAYED_RENDER_HINTS = QtGui.QPainter.RenderHint.SmoothPixmapTransform
+if hasattr(QtGui.QPainter.RenderHint, 'NonCosmeticBrushPatterns'):  # Qt >= 6.4
+    _REPLAYED_RENDER_HINTS |= QtGui.QPainter.RenderHint.NonCosmeticBrushPatterns
+
+_newPoint = Point.__new__
+_initPointF = QtCore.QPointF.__init__
+
+
+def _point(x: float, y: float) -> Point:
+    """
+    Return ``Point(x, y)``, skipping the argument parsing of ``Point.__init__``.
+
+    :meth:`AxisItem.generateDrawSpecs` creates two points per tick.
+
+    Parameters
+    ----------
+    x, y : float
+        Coordinates of the point.
+
+    Returns
+    -------
+    Point
+        The new point.
+    """
+    point = _newPoint(Point)
+    _initPointF(point, x, y)
+    return point
+
+
+def _tickLevelValuesNumpy(
+    levels: list[tuple[float, float]],
+    minVal: float,
+    maxVal: float,
+    scale: float
+) -> list[tuple[float, list[float]]]:
+    """
+    Compute the tick values of each level by comparing all value pairs with numpy.
+
+    Reference implementation of :func:`_tickLevelValues`, used for the inputs its
+    faster path does not handle.
+
+    Parameters
+    ----------
+    levels : list of tuple of float, float
+        ``(spacing, offset)`` of each tick level, as returned by
+        :meth:`AxisItem.tickSpacing`.
+    minVal, maxVal : float
+        The range of values, scaled, with ``minVal <= maxVal``.
+    scale : float
+        The scale of the axis, see :meth:`AxisItem.setScale`.
+
+    Returns
+    -------
+    list of tuple of float, list of float
+        ``(spacing, values)`` of each level, as returned by :meth:`AxisItem.tickValues`.
+    """
+    ticks = []
+    allValues = np.array([])
+    for spacing, offset in levels:
+        ## determine starting tick
+        start = (ceil((minVal-offset) / spacing) * spacing) + offset
+
+        ## determine number of ticks
+        num = int((maxVal-start) / spacing) + 1
+        values = (np.arange(num) * spacing + start) / scale
+        ## remove any ticks that were present in higher levels
+        ## we assume here that if the difference between a tick value and a previously seen tick value
+        ## is less than spacing/100, then they are 'equal' and we can ignore the new tick.
+        close = np.any(
+            np.isclose(
+                allValues,
+                values[:, np.newaxis],
+                rtol=0,
+                atol=spacing/scale*0.01
+            ),
+            axis=-1
+        )
+        values = values[~close]
+        allValues = np.concatenate([allValues, values])
+        ticks.append((spacing/scale, values.tolist()))
+    return ticks
+
+
+def _isPlainPositive(value: object, types: tuple[type, ...]) -> bool:
+    """
+    Tell whether ``value`` is a finite positive number of exactly one of ``types``.
+
+    Parameters
+    ----------
+    value : object
+        The value to test.
+    types : tuple of type
+        The accepted types; subclasses, e.g. numpy scalars, are not accepted.
+
+    Returns
+    -------
+    bool
+        True if ``value`` is such a number.
+    """
+    return type(value) in types and isfinite(value) and value > 0
+
+
+def _tickLevelValues(
+    levels: list[tuple[float, float]],
+    minVal: float,
+    maxVal: float,
+    scale: float
+) -> list[tuple[float, list[float]]]:
+    """
+    Compute the tick values of each level, dropping those already in a previous level.
+
+    A value is dropped when it is within 1 % of the spacing of its level of a value of
+    a previous level. The result equals that of :func:`_tickLevelValuesNumpy`, value
+    for value, which compares all the value pairs with numpy: for the few dozen ticks
+    of an axis, that costs more than the comparisons themselves. When the spacings and
+    the scale are positive and all numbers are finite Python floats (or ints for the
+    offsets and the scale), the values of a level are in non-decreasing order, and the
+    values close to a previous value are found by bisection instead. Other inputs use
+    :func:`_tickLevelValuesNumpy`.
+
+    Parameters
+    ----------
+    levels : list of tuple of float, float
+        ``(spacing, offset)`` of each tick level, as returned by
+        :meth:`AxisItem.tickSpacing`.
+    minVal, maxVal : float
+        The range of values, scaled, with ``minVal <= maxVal``.
+    scale : float
+        The scale of the axis, see :meth:`AxisItem.setScale`.
+
+    Returns
+    -------
+    list of tuple of float, list of float
+        ``(spacing, values)`` of each level, as returned by :meth:`AxisItem.tickValues`.
+    """
+    if not _isPlainPositive(scale, (float, int)) or not all(
+        _isPlainPositive(spacing, (float,))
+        and type(offset) in (float, int) and isfinite(offset)
+        # numpy warns about a non-finite tolerance
+        and isfinite(spacing/scale*0.01)
+        for spacing, offset in levels
+    ):
+        return _tickLevelValuesNumpy(levels, minVal, maxVal, scale)
+    ticks = []
+    previous = []
+    for spacing, offset in levels:
+        start = (ceil((minVal-offset) / spacing) * spacing) + offset
+        num = int((maxVal-start) / spacing) + 1
+        # the operations of the numpy version, in the same order: the same values
+        values = [(k * spacing + start) / scale for k in range(num)]
+        if values and not (isfinite(values[0]) and isfinite(values[-1])):
+            return _tickLevelValuesNumpy(levels, minVal, maxVal, scale)
+        if previous and values:
+            atol = spacing/scale*0.01
+            count = len(values)
+            close = set()
+            for prev in previous:
+                # values are sorted, and so are their distances to prev on each side
+                # of its insertion point: scan both sides while they are close
+                k = j = bisect_left(values, prev)
+                while k < count and abs(prev - values[k]) <= atol:
+                    close.add(k)
+                    k += 1
+                k = j - 1
+                while k >= 0 and abs(prev - values[k]) <= atol:
+                    close.add(k)
+                    k -= 1
+            if close:
+                values = [v for k, v in enumerate(values) if k not in close]
+        previous.extend(values)
+        ticks.append((spacing/scale, values))
+    return ticks
+
+
+def _pinnedFont(font: QtGui.QFont) -> QtGui.QFont:
+    """
+    Return a copy of ``font`` with all its attributes marked as set.
+
+    A painter resolves the attributes of a font that are not set against the font of
+    its device: a widget painter would draw the default font as the font of the widget.
+    A font read from a data stream has all its attributes set, as had the fonts a
+    replayed ``QtGui.QPicture`` drew text with.
+
+    Parameters
+    ----------
+    font : QtGui.QFont
+        The font.
+
+    Returns
+    -------
+    QtGui.QFont
+        The copy.
+    """
+    data = QtCore.QByteArray()
+    stream = QtCore.QDataStream(data, QtCore.QIODevice.OpenModeFlag.WriteOnly)
+    stream << font
+    pinned = QtGui.QFont()
+    stream = QtCore.QDataStream(data, QtCore.QIODevice.OpenModeFlag.ReadOnly)
+    stream >> pinned
+    return pinned
+
+
+def _isThinCosmeticPen(pen: object) -> bool:
+    """
+    Tell whether ``pen`` is a cosmetic pen at most one pixel wide.
+
+    Parameters
+    ----------
+    pen : object
+        The pen of a drawing specification.
+
+    Returns
+    -------
+    bool
+        True for such a ``QtGui.QPen``.
+    """
+    return isinstance(pen, QtGui.QPen) and pen.isCosmetic() and pen.widthF() <= 1
+
+
+def _drawnAsReplayed(specs: tuple) -> bool:
+    """
+    Tell whether :meth:`AxisItem.drawPicture` draws ``specs`` as a replayed picture.
+
+    A ``QtGui.QPicture`` records each line as a two-point polyline, or as a filled
+    rectangle if its ends are equal. The raster engine draws lines and two-point
+    polylines alike with cosmetic pens at most one pixel wide, but strokes them
+    differently with wider pens near pixel boundaries. With Qt 6, the text is drawn
+    alike (see ``_DIRECT_DRAWING``).
+
+    Parameters
+    ----------
+    specs : tuple
+        The value returned by :meth:`AxisItem.generateDrawSpecs`.
+
+    Returns
+    -------
+    bool
+        True if drawing ``specs`` directly with the raster engine gives the pixels of
+        the replayed picture.
+    """
+    axisSpec, tickSpecs, _ = specs
+    lastPen = None
+    for pen, p1, p2 in (axisSpec, *tickSpecs):
+        if pen is not lastPen:
+            if not _isThinCosmeticPen(pen):
+                return False
+            lastPen = pen
+        if p1 == p2:  # fuzzy, as the comparison made when recording
+            return False
+    return True
+
+
+# Resolution a QPicture is recorded for; see _AxisPicture.play.
+_resolutionPicture = None
+
+
+def _drawsAtPictureResolution(p: QtGui.QPainter) -> bool:
+    """
+    Tell whether ``p`` paints with the raster engine at the resolution of pictures.
+
+    A replayed picture is scaled by the ratio of the resolution of the painted device to
+    the resolution pictures are recorded for, that of the primary screen.
+
+    Parameters
+    ----------
+    p : QtGui.QPainter
+        The active painter.
+
+    Returns
+    -------
+    bool
+        True for the raster engine, on a device whose logical resolution is that of the
+        primary screen.
+    """
+    global _resolutionPicture
+    engine = p.paintEngine()
+    device = p.device()
+    if (
+        engine is None or device is None
+        or engine.type() != QtGui.QPaintEngine.Type.Raster
+    ):
+        return False
+    if _resolutionPicture is None:
+        _resolutionPicture = QtGui.QPicture()
+    return (device.logicalDpiX() == _resolutionPicture.logicalDpiX()
+            and device.logicalDpiY() == _resolutionPicture.logicalDpiY())
+
+
+class _AxisPicture:
+    """
+    Drawing specifications of an axis, which :meth:`AxisItem.paint` draws.
+
+    The axis used to record its specifications into a ``QtGui.QPicture`` when they
+    changed and to replay the picture when painted. Recording costs about as much as
+    drawing, and replaying draws again: drawing the specifications directly costs half
+    as much when the axis is painted once per change, e.g. while panning or zooming,
+    and about as much as a replay otherwise. The drawing is that of the replayed
+    picture, see :meth:`play`; when it may not be, the picture is recorded when the
+    specifications are generated and replayed, as before.
+
+    Parameters
+    ----------
+    axis : AxisItem
+        The axis, referenced weakly.
+    specs : tuple or None
+        The value returned by :meth:`AxisItem.generateDrawSpecs`; None draws nothing.
+    font : QtGui.QFont
+        The font of the painter the tick labels were measured with, with all its
+        attributes set (see :func:`_pinnedFont`).
+    picture : QtGui.QPicture or None
+        The picture ``specs`` were recorded into, or None if they may be drawn
+        directly (see :func:`_drawnAsReplayed`).
+    """
+
+    __slots__ = ('_axis', '_specs', '_font', '_direct', '_picture')
+
+    def __init__(
+        self,
+        axis: 'AxisItem',
+        specs: tuple | None,
+        font: QtGui.QFont,
+        picture: QtGui.QPicture | None
+    ) -> None:
+        self._axis = weakref.ref(axis)
+        self._specs = specs
+        self._font = font
+        self._direct = picture is None
+        self._picture = picture
+
+    def play(self, p: QtGui.QPainter) -> None:
+        """
+        Draw the axis with ``p`` by calling :meth:`AxisItem.drawPicture`.
+
+        The specifications are drawn directly with the raster engine at the resolution
+        of the primary screen, unless they were recorded into a picture: as a replayed
+        picture did, the labels are drawn with the font they were measured with, the
+        render hints that a picture replays are set as recorded, and the painter state
+        is left as the drawing leaves it. Otherwise the picture is replayed, recorded
+        first if needed.
+
+        Parameters
+        ----------
+        p : QtGui.QPainter
+            The painter, in the local coordinates of the axis.
+        """
+        axis = self._axis()
+        if self._specs is None or axis is None:
+            return
+        if self._direct and _drawsAtPictureResolution(p):
+            p.setFont(self._font)
+            p.setRenderHints(_REPLAYED_RENDER_HINTS, False)
+            axis._drawingDirectly = True
+            try:
+                axis.drawPicture(p, *self._specs)
+            finally:
+                axis._drawingDirectly = False
+            return
+        if self._picture is None:
+            picture = QtGui.QPicture()
+            painter = QtGui.QPainter(picture)
+            try:
+                painter.setFont(self._font)
+                axis.drawPicture(painter, *self._specs)
+            finally:
+                painter.end()
+            self._picture = picture
+        self._picture.play(p)
 
 
 class _LRUCache:
@@ -219,6 +594,11 @@ class AxisItem(GraphicsWidget):
         self._preparingScene = None
         # True while _buildPicture runs: the picture it builds is assigned afterwards.
         self._buildingPicture = False
+        # The font the tick labels were last measured with, and its copy given to
+        # _AxisPicture (see _pinnedFont), or None.
+        self._labelFonts = None
+        # True while _AxisPicture.play draws directly: drawPicture keeps the font.
+        self._drawingDirectly = False
         self.label = QtWidgets.QGraphicsTextItem(self)
         self.picture = None
         # Background color (QRgb) the grid pens of the picture were blended with, or
@@ -1190,9 +1570,11 @@ class AxisItem(GraphicsWidget):
         """
         Paint the axis, its ticks and tick labels.
 
-        The picture is normally built when the scene prepares, before Qt computes the
-        regions to repaint (see :meth:`_invalidatePicture`). It is built here if it
-        was not, e.g. outside a :class:`GraphicsScene <pyqtgraph.GraphicsScene>`.
+        The picture, the drawing specifications of the axis, is normally built when
+        the scene prepares, before Qt computes the regions to repaint (see
+        :meth:`_invalidatePicture`). It is built here if it was not, e.g. outside a
+        :class:`GraphicsScene <pyqtgraph.GraphicsScene>`. :meth:`drawPicture` then
+        draws it.
 
         Parameters
         ----------
@@ -1211,26 +1593,28 @@ class AxisItem(GraphicsWidget):
             self.picture = self._buildPicture()
         self.picture.play(p)
 
-    def _buildPicture(self, keepSize: bool = False) -> QtGui.QPicture | None:
+    def _buildPicture(self, keepSize: bool = False) -> _AxisPicture | None:
         """
-        Generate the drawing specifications and draw them into a new picture.
+        Generate the drawing specifications that :meth:`paint` draws.
 
-        Generating the specifications measures the tick labels, which may change the
-        size constraints of the axis (see :meth:`_updateMaxTextSize`); the layout
-        applies them later.
+        Generating the specifications measures the tick labels with a painter on a
+        ``QtGui.QPicture``, which may change the size constraints of the axis (see
+        :meth:`_updateMaxTextSize`); the layout applies them later. The specifications
+        are drawn into the picture only if drawing them directly when painted may not
+        give the pixels of the replayed picture, see :class:`_AxisPicture`.
 
         Parameters
         ----------
         keepSize : bool, default False
             If True and the size constraints of the axis changed while generating the
-            specifications, return None without drawing: the picture would be drawn for
-            a geometry about to change.
+            specifications, return None: the specifications are for a geometry about
+            to change.
 
         Returns
         -------
-        QtGui.QPicture or None
-            The picture, or None if ``keepSize`` is True and the size constraints
-            changed.
+        _AxisPicture or None
+            The specifications, or None if ``keepSize`` is True and the size
+            constraints changed.
         """
         profiler = debug.Profiler()
         picture = QtGui.QPicture()
@@ -1249,13 +1633,23 @@ class AxisItem(GraphicsWidget):
                 self._gridBackgroundRgb()
                 if self.style['opaqueGrid'] and self.grid is not False else None
             )
-            if specs is not None:
+            font = painter.font()
+            # a drawPicture override may draw anything: record its drawing, replayed
+            direct = (
+                _DIRECT_DRAWING
+                and specs is not None
+                and getattr(self.drawPicture, '__func__', None) is AxisItem.drawPicture
+                and _drawnAsReplayed(specs)
+            )
+            if specs is not None and not direct:
                 self.drawPicture(painter, *specs)
                 profiler('draw picture')
         finally:
             self._buildingPicture = False
             painter.end()
-        return picture
+        if self._labelFonts is None or self._labelFonts[0] != font:
+            self._labelFonts = (font, _pinnedFont(font))
+        return _AxisPicture(self, specs, self._labelFonts[1], None if direct else picture)
 
     def _sizeConstraints(self) -> tuple[float, float, float, float]:
         """
@@ -1609,7 +2003,12 @@ class AxisItem(GraphicsWidget):
         return levels
 
 
-    def tickValues(self, minVal:float, maxVal:float, size: float):
+    def tickValues(
+        self,
+        minVal: float,
+        maxVal: float,
+        size: float
+    ) -> list[tuple[float | None, list[float]]]:
         """
         Return the values and spacing of ticks to draw.
 
@@ -1639,33 +2038,9 @@ class AxisItem(GraphicsWidget):
         minVal *= self.scale
         maxVal *= self.scale
 
-        ticks = []
         tickLevels = self.tickSpacing(minVal, maxVal, size)
-        allValues = np.array([])
-        for i in range(len(tickLevels)):
-            spacing, offset = tickLevels[i]
-
-            ## determine starting tick
-            start = (ceil((minVal-offset) / spacing) * spacing) + offset
-
-            ## determine number of ticks
-            num = int((maxVal-start) / spacing) + 1
-            values = (np.arange(num) * spacing + start) / self.scale
-            ## remove any ticks that were present in higher levels
-            ## we assume here that if the difference between a tick value and a previously seen tick value
-            ## is less than spacing/100, then they are 'equal' and we can ignore the new tick.
-            close = np.any(
-                np.isclose(
-                    allValues,
-                    values[:, np.newaxis],
-                    rtol=0,
-                    atol=spacing/self.scale*0.01
-                ),
-                axis=-1
-            )
-            values = values[~close]
-            allValues = np.concatenate([allValues, values])
-            ticks.append((spacing/self.scale, values.tolist()))
+        ## ticks closer than spacing/100 to a tick of a higher level are removed
+        ticks = _tickLevelValues(tickLevels, minVal, maxVal, self.scale)
         if self.logMode:
             return self.logTickValues(minVal, maxVal, size, ticks)
         return ticks
@@ -2053,7 +2428,6 @@ class AxisItem(GraphicsWidget):
         ## draw three different intervals, long ticks first
         tickSpecs = []
         for i in range(len(tickLevels)):
-            tickPositions.append([])
             ticks = tickLevels[i][1]
 
             ## length of tick
@@ -2086,21 +2460,18 @@ class AxisItem(GraphicsWidget):
                 tickEnd += tickLength*tickDir
             tickStartF = float(tickStart)
             tickEndF = float(tickEnd)
-            positions = tickPositions[i]
-            for v in ticks:
-                ## determine actual position to draw this tick
-                x = (v * xScale) - offset
-                if x < xMin or x > xMax:  ## last check to make sure no out-of-bounds ticks are drawn
-                    positions.append(None)
-                    continue
-                positions.append(x)
-
-                # Point(a, b) takes the fast two-argument path of Point.__init__
-                xf = float(x)
-                if axis == 0:
-                    tickSpecs.append((tickPen, Point(tickStartF, xf), Point(tickEndF, xf)))
-                else:
-                    tickSpecs.append((tickPen, Point(xf, tickStartF), Point(xf, tickEndF)))
+            ## determine actual position to draw each tick; None for out-of-bounds
+            ## ticks, which are not drawn
+            positions = [(v * xScale) - offset for v in ticks]
+            positions = [None if x < xMin or x > xMax else x for x in positions]
+            tickPositions.append(positions)
+            visible = [float(x) for x in positions if x is not None]
+            if axis == 0:
+                tickSpecs.extend([(tickPen, _point(tickStartF, xf), _point(tickEndF, xf))
+                                  for xf in visible])
+            else:
+                tickSpecs.extend([(tickPen, _point(xf, tickStartF), _point(xf, tickEndF))
+                                  for xf in visible])
         profiler('compute ticks')
 
 
@@ -2170,22 +2541,15 @@ class AxisItem(GraphicsWidget):
                     rects.append(size)
                     textRects.append(size)
 
-            if textRects:
-                ## measure all text, make sure there's enough room
-                if axis == 0:
-                    textSize = np.sum([r[1] for r in textRects])
-                    textSize2 = np.max([r[0] for r in textRects])
-                else:
-                    textSize = np.sum([r[0] for r in textRects])
-                    textSize2 = np.max([r[1] for r in textRects])
-            else:
-                textSize = 0
-                textSize2 = 0
+            ## measure all text, make sure there's enough room: textSize along the
+            ## axis, textSize2 across it (sizes are finite: max equals np.max)
+            textSize2 = max([r[axis] for r in textRects]) if textRects else 0
 
             if i > 0:  ## always draw top level
                 ## If the strings are too crowded, stop drawing text now.
                 ## We use three different crowding limits based on the number
                 ## of texts drawn so far.
+                textSize = np.sum([r[1 - axis] for r in textRects]) if textRects else 0
                 textFillRatio = float(textSize) / lengthInPixels
                 finished = False
                 for nTexts, limit in self.style['textFillLimits']:
@@ -2227,11 +2591,38 @@ class AxisItem(GraphicsWidget):
 
         return axisSpec, tickSpecs, textSpecs
 
-    def drawPicture(self, p, axisSpec, tickSpecs, textSpecs):
+    def drawPicture(
+        self,
+        p: QtGui.QPainter,
+        axisSpec: tuple,
+        tickSpecs: list[tuple],
+        textSpecs: list[tuple]
+    ) -> None:
+        """
+        Draw the axis line, the ticks and the tick labels.
+
+        :meth:`paint` calls this method with the specifications generated by
+        :meth:`generateDrawSpecs`. The ticks of each run sharing a pen object (a tick
+        level) are drawn with a single ``drawLines`` call, which takes the end points of
+        the ticks as point pairs. The text antialiasing hint of ``p`` is used as it is:
+        the axis used to draw into a ``QtGui.QPicture``, which does not replay that
+        hint. When :meth:`paint` draws directly, the tick font is not set: ``p`` has
+        the font the labels were measured with (see :class:`_AxisPicture`).
+
+        Parameters
+        ----------
+        p : QtGui.QPainter
+            The painter, in the local coordinates of the axis.
+        axisSpec : tuple
+            The pen, start point and end point of the axis line.
+        tickSpecs : list of tuple
+            The pen, start point and end point (``QtCore.QPointF``) of each tick.
+        textSpecs : list of tuple
+            The bounding rectangle, alignment flags and text of each tick label.
+        """
         profiler = debug.Profiler()
 
         p.setRenderHint(p.RenderHint.Antialiasing, False)
-        p.setRenderHint(p.RenderHint.TextAntialiasing, True)
 
         ## draw long line along axis
         pen, p1, p2 = axisSpec
@@ -2241,24 +2632,26 @@ class AxisItem(GraphicsWidget):
 
         ## draw ticks: one drawLines call per run of ticks sharing a pen (a tick level)
         background = self._pictureGridBackground
-        lines = []
+        points = []
         lastPen = None
         for pen, p1, p2 in tickSpecs:
             if pen is not lastPen:
-                if lines:
-                    p.drawLines(lines)
-                    lines = []
+                if points:
+                    p.drawLines(points)
+                    points = []
                 lastPen = pen
                 if background is not None:
                     pen = _opaqueGridPen(pen, background)
                 p.setPen(pen)
-            lines.append(QtCore.QLineF(p1, p2))
-        if lines:
-            p.drawLines(lines)
+            points.append(p1)
+            points.append(p2)
+        if points:
+            p.drawLines(points)
         profiler('draw ticks')
 
-        # Draw all text
-        if self.style['tickFont'] is not None:
+        # Draw all text; when drawing directly, the painter has the font the labels
+        # were measured with, the tick font as a picture recorded it
+        if self.style['tickFont'] is not None and not self._drawingDirectly:
             p.setFont(self.style['tickFont'])
         p.setPen(self.textPen())
         bounding = self.boundingRect().toAlignedRect()
