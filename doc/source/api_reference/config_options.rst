@@ -45,7 +45,8 @@ segmentedLineMode  str                 'auto'             For 'on', lines are al
 autoReduce         float or None       2.0                Default of the ``autoReduce`` option of new PlotDataItems: number of data
                                                           points per pixel of view width above which a line whose x values increase
                                                           is clipped to the view and downsampled automatically (``'peak'`` by
-                                                          default). ``None`` disables it. See :meth:`PlotDataItem.setAutoReduce
+                                                          default). ``None`` disables it. Curves drawn by OpenGL (``useOpenGL``) are
+                                                          not reduced. See :meth:`PlotDataItem.setAutoReduce
                                                           <pyqtgraph.PlotDataItem.setAutoReduce>`.
 ================== =================== ================== ================================================================================
 

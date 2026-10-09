@@ -7,6 +7,7 @@ assert durations (see ``benchmarks/scenarios.py``, scenario S14, for the timings
 """
 import importlib.util
 import math
+import types
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ import pytest
 import pyqtgraph as pg
 from pyqtgraph.graphicsItems import PlotDataItem as pdi_module
 from pyqtgraph.graphicsItems._MinMaxPyramid import MinMaxPyramid
+from pyqtgraph.Qt import QtWidgets
 from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
@@ -487,6 +489,46 @@ def test_view_changes_of_a_frame_compute_the_display_once(plot_widget):
     assert updates.count == 1
     xd, _ = item.getData()
     assert xd[0] <= 1.95e5 and xd[-1] >= 4.05e5
+
+
+@pytest.fixture
+def opengl_viewport(monkeypatch):
+    """Make PlotDataItem see any viewport as an OpenGL one (no OpenGL context needed)."""
+    monkeypatch.setattr(pdi_module, 'OpenGLHelpers',
+                        types.SimpleNamespace(GraphicsViewGLWidget=QtWidgets.QWidget))
+
+
+def test_auto_reduce_off_for_curves_drawn_by_opengl(plot_widget, opengl_viewport):
+    x, y = _dense_line()
+    line = plot_widget.plot(x, y, autoReduce=2)
+    filled = plot_widget.plot(x, y, autoReduce=2, fillLevel=0.0, brush='b')
+    outlined = plot_widget.plot(x, y, autoReduce=2, fillLevel=0.0, brush='b',
+                                fillOutline=True)
+    xs = np.linspace(2e5, 4e5, 20_000)
+    symbols = plot_widget.plot(xs, np.sin(xs), autoReduce=2, symbol='o')
+    plot_widget.getPlotItem().enableAutoRange(False)
+    plot_widget.setXRange(2e5, 4e5, padding=0)
+    process_events()
+    # drawn by OpenGL: all the data
+    for item in (line, filled):
+        assert item._drawnWithOpenGL(plot_widget.getViewBox())
+        assert _unreduced(*item.getData(), x, y)
+    # drawn by QPainter: reduced
+    assert len(outlined.getData()[0]) < 0.1 * len(x)
+    assert len(symbols.getData()[0]) < 0.5 * len(xs)
+    # exports are drawn by QPainter: reduced, and back after the export
+    try:
+        line.setExportMode(True, {'resolutionScale': 1.0})
+        assert len(line.getData()[0]) < 0.1 * len(x)
+    finally:
+        line.setExportMode(False)
+    assert _unreduced(*line.getData(), x, y)
+
+
+def test_auto_reduce_on_without_opengl(plot_widget):
+    item = _reduced_view(plot_widget, autoReduce=2)
+    assert not item._drawnWithOpenGL(plot_widget.getViewBox())
+    assert len(item.getData()[0]) < 0.1 * 1_000_000
 
 
 def test_auto_reduce_below_the_threshold_keeps_the_data(plot_widget):
