@@ -4,6 +4,8 @@ Performance regression tests of ScatterPlotItem.
 These tests check deterministic invariants (calls made, objects created, cache
 entries) instead of durations, see ``tests/perf_helpers.py``.
 """
+import time
+
 import numpy as np
 import pytest
 
@@ -102,18 +104,25 @@ def test_style_size_default_and_hover():
 def test_size_change_updates_auto_range():
     pw = pg.PlotWidget()
     pw.resize(300, 200)
-    pw.show()
-    scatter = pg.ScatterPlotItem(x=[0., 1.], y=[0., 1.], size=0.1, pxMode=False)
-    pw.addItem(scatter)
-    for _ in range(5):
-        app.processEvents()
-    (x0, x1), _ = pw.getViewBox().viewRange()
-    scatter.setSize(50)  # pads the data bounds by 0.7 * 50 in data units
-    for _ in range(5):
-        app.processEvents()
-    (x0b, x1b), _ = pw.getViewBox().viewRange()
-    assert x0b < x0 - 30 and x1b > x1 + 30
-    pw.close()
+    # the auto-range of a view that is not exposed yet waits for its first paint
+    show_and_wait(pw)
+    try:
+        scatter = pg.ScatterPlotItem(x=[0., 1.], y=[0., 1.], size=0.1, pxMode=False)
+        pw.addItem(scatter)
+        process_events(5)
+        (x0, x1), _ = pw.getViewBox().viewRange()
+        scatter.setSize(50)  # pads the data bounds by 0.7 * 50 in data units
+        # the new range is applied before the next paint; slow CI runners may need
+        # more than a few event loop passes to deliver it
+        deadline = time.monotonic() + 5.0
+        while True:
+            process_events(1)
+            (x0b, x1b), _ = pw.getViewBox().viewRange()
+            if (x0b < x0 - 30 and x1b > x1 + 30) or time.monotonic() > deadline:
+                break
+        assert x0b < x0 - 30 and x1b > x1 + 30
+    finally:
+        pw.close()
 
 
 # --------------------------------------------------------------------------------------
