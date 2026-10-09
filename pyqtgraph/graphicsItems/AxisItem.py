@@ -257,7 +257,7 @@ class AxisItem(GraphicsWidget):
             'maxTickLevel': 2,
             'maxTextLevel': 2,
             'tickAlpha': None,  ## If not none, use this alpha for all ticks.
-            'opaqueGrid': False,  ## blend grid lines with a known opaque background
+            'opaqueGrid': True,  ## blend grid lines with a known opaque background
         }
 
         self.textWidth = 30  ## Keeps track of maximum width / height of tick text
@@ -412,7 +412,7 @@ class AxisItem(GraphicsWidget):
                                     (higher CPU usage)
 
             opaqueGrid            ``bool``
-                                  default: False
+                                  default: True
 
                                   If ``True``, translucent grid lines are drawn with
                                   an opaque pen, whose color is the grid color blended
@@ -427,7 +427,8 @@ class AxisItem(GraphicsWidget):
                                   they then hide where they cross them instead of
                                   tinting them. Translucent pens are kept if the
                                   background is not a known opaque color, and for
-                                  exports.
+                                  exports. Set to ``False`` to draw translucent grid
+                                  lines over the items.
             ===================== ======================================================
 
         Raises

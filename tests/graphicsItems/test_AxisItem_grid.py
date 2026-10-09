@@ -3,9 +3,9 @@ Tests of the grid drawing and range updates of :class:`~pyqtgraph.AxisItem`.
 
 - The ticks of a level are drawn with one ``drawLines`` call: the pixels are those of
   one ``drawLine`` call per tick.
-- With the ``opaqueGrid`` style option, translucent grid lines are drawn with an opaque
-  pen blended with the known opaque background, which the raster engine draws much
-  faster: identical pixels over the background, translucent pens kept otherwise.
+- With the ``opaqueGrid`` style option (default), translucent grid lines are drawn with
+  an opaque pen blended with the known opaque background, which the raster engine draws
+  much faster: identical pixels over the background, translucent pens kept otherwise.
 - ``setRange`` updates the label only when the automatic SI prefix changes.
 """
 from __future__ import annotations
@@ -65,6 +65,11 @@ def _axes(widget: pg.PlotWidget) -> list[AxisItem]:
     return [widget.getPlotItem().getAxis(side) for side in ('bottom', 'left')]
 
 
+def _set_opaque_grid(widget: pg.PlotWidget, opaque: bool) -> None:
+    for axis in _axes(widget):
+        axis.setStyle(opaqueGrid=opaque)
+
+
 def _grab(widget: pg.PlotWidget) -> np.ndarray:
     """
     Repaint the axes of ``widget`` and return its pixels.
@@ -102,6 +107,8 @@ def test_ticks_drawn_by_level_are_pixel_identical(grid_widget, grid):
     grid_widget.plot(np.cumsum(np.random.default_rng(0).standard_normal(500)) * 5 + 1000,
                      pen=pg.mkPen('y', width=2))
     grid_widget.showGrid(x=grid[0], y=grid[1])
+    # the reference draws the pens as given: translucent grid pens
+    _set_opaque_grid(grid_widget, False)
     image = _grab(grid_widget)
     for axis in _axes(grid_widget):
         axis.drawPicture = types.MethodType(_reference_draw_picture, axis)
@@ -117,6 +124,7 @@ def test_opaque_grid_is_pixel_identical_over_the_background(grid_widget, backgro
         # a ViewBox background of the color of the view background
         grid_widget.getViewBox().setBackgroundColor(background)
     grid_widget.showGrid(x=True, y=False)
+    _set_opaque_grid(grid_widget, False)
     expected = _grab(grid_widget)
     axis = grid_widget.getPlotItem().getAxis('bottom')
     axis.setStyle(opaqueGrid=True)
@@ -144,11 +152,15 @@ def test_opaque_grid_pens_are_opaque(grid_widget):
     assert _opaqueGridPen(opaque_pen, background) is opaque_pen
 
 
-def test_opaque_grid_is_off_by_default(grid_widget):
+def test_opaque_grid_is_on_by_default(grid_widget):
     grid_widget.showGrid(x=True, y=True)
-    process_events()
+    _repaint(grid_widget)
     for axis in _axes(grid_widget):
-        assert axis.style['opaqueGrid'] is False
+        assert axis.style['opaqueGrid'] is True
+        assert axis._pictureGridBackground == QtGui.QColor('black').rgba()
+    _set_opaque_grid(grid_widget, False)
+    _repaint(grid_widget)
+    for axis in _axes(grid_widget):
         assert axis._pictureGridBackground is None
 
 
@@ -191,9 +203,9 @@ def test_export_keeps_translucent_grid(grid_widget):
         image = image.convertToFormat(QtGui.QImage.Format.Format_ARGB32)
         return pg.functions.ndarray_from_qimage(image).copy()
 
+    _set_opaque_grid(grid_widget, False)
     expected = export()
-    for axis in _axes(grid_widget):
-        axis.setStyle(opaqueGrid=True)
+    _set_opaque_grid(grid_widget, True)
     _repaint(grid_widget)
     assert all(axis._pictureGridBackground is not None for axis in _axes(grid_widget))
     assert np.array_equal(export(), expected)
