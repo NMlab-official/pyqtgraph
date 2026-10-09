@@ -10,7 +10,7 @@ import numpy as np
 from .. import debug as debug
 from .. import functions as fn
 from .. import getConfigOption
-from ..Qt import QtCore, QtGui, QtWidgets
+from ..Qt import OpenGLHelpers, QtCore, QtGui, QtWidgets
 from ._MinMaxPyramid import MinMaxPyramid
 from .GraphicsObject import GraphicsObject
 from .PlotCurveItem import PlotCurveItem, _arangeBuffer
@@ -1473,6 +1473,10 @@ class PlotDataItem(GraphicsObject):
           without `orthoRange`) are those of all the data, as without clipping.
         * As with :meth:`setClipToView`, the data is not clipped while the x-axis
           auto-range of the view is enabled; it is still downsampled if needed.
+        * With an OpenGL viewport (``useOpenGL``), a curve drawn by OpenGL is not
+          reduced: the graphics card draws all the data faster. Symbols, step mode,
+          fills that OpenGL does not draw and exports are still reduced. Switching
+          the viewport is taken into account at the next view change.
 
         Checking that the `x` values increase costs one pass over the data per
         :meth:`setData` once the threshold is exceeded (none when `x` is omitted,
@@ -1532,8 +1536,9 @@ class PlotDataItem(GraphicsObject):
         -------
         bool
             ``True`` if the item is in a :class:`~pyqtgraph.ViewBox`, its data holds
-            more than `autoReduce` points per pixel of view width, and its `x` values
-            increase.
+            more than `autoReduce` points per pixel of view width, its `x` values
+            increase, and the curve is not drawn by OpenGL (see
+            :meth:`_drawnWithOpenGL`).
         """
         density = self.opts['autoReduce']
         mapped = self._datasetMapped
@@ -1546,7 +1551,52 @@ class PlotDataItem(GraphicsObject):
         ):
             return False
         width = view.width()
-        return bool(width > 0 and len(x) > density * width and mapped.xIncreasing())
+        return bool(
+            width > 0
+            and len(x) > density * width
+            and not self._drawnWithOpenGL(view)
+            and mapped.xIncreasing()
+        )
+
+    def _drawnWithOpenGL(self, view: QtCore.QObject) -> bool:
+        """
+        Test whether the displayed data is drawn by OpenGL only.
+
+        With an OpenGL viewport (``useOpenGL``), :class:`PlotCurveItem` draws the line,
+        and its fill below a level, with OpenGL: the graphics card draws all the data
+        faster than it is clipped and downsampled, so `autoReduce` does not apply.
+        It still applies to symbols, step mode, fills that OpenGL does not draw, and
+        exports, which are drawn by a :class:`QPainter`.
+
+        Parameters
+        ----------
+        view : :class:`~pyqtgraph.ViewBox`
+            The view of the item.
+
+        Returns
+        -------
+        bool
+            ``True`` if the curve is drawn by OpenGL and there is no symbol.
+        """
+        widget = view.getViewWidget()
+        if (
+            widget is None
+            or not isinstance(widget.viewport(), OpenGLHelpers.GraphicsViewGLWidget)
+            or self._exportOpts is not False
+        ):
+            return False
+        opts = self.opts
+        if opts['symbol'] is not None or opts['stepMode']:
+            return False
+        level = opts['fillLevel']
+        connect = opts['connect']
+        # fills drawn by PlotCurveItem.paintGL
+        return level is None or (
+            isinstance(level, (int, float))
+            and isinstance(connect, str)
+            and connect in ('auto', 'all', 'finite')
+            and not opts['fillOutline']
+        )
 
     def _applyPlotDefaults(
         self,

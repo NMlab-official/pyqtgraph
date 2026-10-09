@@ -1042,6 +1042,9 @@ Tâches à petit gain ou à arbitrage nécessaire. Ne pas les démarrer avant la
 | T4.9 | Option `autoReduce` (activée par défaut, `2.0`) : clip + `'peak'` automatiques au-delà de N points par pixel | `PlotDataItem.setAutoReduce`, option de configuration `autoReduce` | Pan x à 1e7 (S14) : 195 → 1,4 ms/pas par rapport aux options par défaut. |
 | T4.10 | `AxisItem` : coût par image en pan/zoom (`tickValues` sans `np.isclose`, points des ticks sans `Point.__init__`, `drawLines` en paires de points, dessin direct au lieu d'enregistrer puis rejouer un `QPicture`) | `AxisItem.tickValues`, `generateDrawSpecs`, `drawPicture`, `_buildPicture`, `_AxisPicture` | Axes par image (S15, 1200×700, DPR 1,5) : sans grille 1,07 → 0,66 ms (PyQt6), 1,16 → 0,72 ms (PySide6) en zoom ; avec grille 2,35 → 1,93 ms. |
 | T4.11 | Grille de `AxisItem` : lignes horizontales et verticales remplies par `fillRect` sur les pixels exacts du traceur cosmétique de Qt, au lieu de `drawLines` (~8 ns/pixel) | `AxisItem._fillAxisAlignedLines`, `drawPicture` | Axes par image avec grille (S15, DPR 1,5) : 1,88-2,11 → 1,05-1,26 ms (PyQt6), 1,93-2,35 → 1,13-1,41 ms (PySide6). |
+| T4.12 | `autoReduce` : un bloc `'peak'` par pixel physique au lieu de `autoDownsampleFactor` (5) échantillons par pixel ; mise à jour d'affichage demandée par un changement de vue différée au prochain rendu, comme celle de `setData` | `PlotDataItem._displayReduction`, `_autoReduceBlocksPerPixel`, `setExportMode`, `viewRangeChanged` | 10 courbes × 1e5 (1200×700, DPR 1,5, PySide6) : pan XY 11,8 → 5,6 ms/image, zoom 14,4 → 7,1 ms ; 3 et 6 événements de zoom par image : 9,4 → 6,5 et 12,2 → 6,6 ms. |
+| T4.13 | `ImageItem` avec `autoDownsample` : saccades du zoom (image re-décimée en entier à chaque changement de facteur) ; moyenne par tranches espacées dans `downsample`, identique au bit près, et images décimées des facteurs récents gardées en cache | `functions.downsample`, `ImageItem._downsampledImage` | Zoom sur une image 4000×4000 float32 (1200×700, DPR 1,5) : pire image 68 → 24 ms, p90 40 → 9 ms au 2e passage ; uint16 : pire image 77 → 47 ms. |
+| T4.14 | `autoReduce` désactivé pour les courbes dessinées par OpenGL (`useOpenGL`) : la carte graphique dessine toutes les données plus vite qu'elles ne sont décimées | `PlotDataItem._drawnWithOpenGL` | OpenGL (RTX 5080 Laptop), 10 courbes × 1e5 : pan XY 3,8 → 2,5 ms/image, zoom 4,7 → 2,6 ms. |
 
 **Statut de la phase 4** (détails dans les messages de commit) :
 - ☑ T4.1 (option `useDeviceCache`), T4.5 (copie ARGB32 en cache), T4.6 (cache de `np.arange`).
@@ -1076,6 +1079,30 @@ Tâches à petit gain ou à arbitrage nécessaire. Ne pas les démarrer avant la
   aléatoires (DPR 1 à 3, échelles négatives, clips rectangle et région, opacité, couleurs
   translucides, ARGB32 prémultiplié et RGB32) contre `drawLines`, plus les vérifications de
   T4.10. Les lignes verticales restent ~2,7 ns/pixel (un pixel par rangée).
+- ☑ T4.12 (PR #12) : avec `autoReduce` et la méthode `'peak'`, le facteur de décimation vise
+  `devicePixelRatioF()` blocs par pixel de largeur de vue, soit un bloc min/max par pixel
+  physique : même enveloppe, 3 à 5 fois moins de points dessinés. Export image : la résolution
+  de l'export (`resolutionScale`, recalcul dans `setExportMode`) ; export vectoriel et
+  `autoDownsample` explicite : `autoDownsampleFactor`, inchangé. Rendu : aucune différence
+  visible sur un agrandissement ; pixels différents des données complètes 0,13 % → 0,42 % sur
+  une vue partielle (changement de rendu accepté avec `autoReduce`, qui est une approximation).
+  `viewRangeChanged` passe par `_requestDisplayUpdate` : les changements de vue d'une même
+  image (rafale de molette ou de pavé tactile) calculent les données affichées une seule fois.
+  Limite : un changement de rapport de pixels (fenêtre déplacée vers un autre écran) n'est pris
+  en compte qu'au changement de vue suivant.
+- ☑ T4.13 : `downsample` additionne `n` tranches espacées au lieu de `reshape(...).mean()` quand
+  le résultat est identique au bit près (moins de 8 valeurs par bloc, sommées dans l'ordre comme
+  numpy ; entiers sommés exactement en float64) et plus rapide (float32 sur tout axe ; autres types
+  le long de l'axe contigu ; float64 jusqu'à 3 valeurs) : 2 à 5 fois plus rapide le long de l'axe
+  contigu. `ImageItem` garde les images décimées des derniers facteurs (au plus la taille de
+  l'image, aucune au-delà du quart), vidées par `setImage` et `updateImage`. Saccades restantes :
+  première visite d'un facteur, 15 à 25 ms en float32 ; images entières peu couvertes par le
+  cache (moyennes en float64, 4 fois plus grandes qu'une image uint16).
+- ☑ T4.14 : `_drawnWithOpenGL` (viewport `GraphicsViewGLWidget`, ni symbole, ni `stepMode`,
+  remplissage dessiné par `paintGL`, hors export) désactive `autoReduce`. Mesures OpenGL avec
+  synchronisation (`frameSwapped` puis `glFinish`) : `repaint()` ne rend pas une image par appel
+  sur un viewport OpenGL. Le rendu OpenGL diffère du raster (~2,5 % des pixels) et dépend du
+  matériel.
 
 ---
 
