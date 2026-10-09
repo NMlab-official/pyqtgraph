@@ -1371,9 +1371,13 @@ class PlotCurveItem(GraphicsObject):
             Arguments of ``QPainter.drawLines``.
         """
         x, y = self._getPolylineVertices()
-        segments = arrayToLineSegments(x[start:stop], y[start:stop], connect='all',
-                                       finiteCheck=False)
-        return segments.drawargs()
+        # The segments are kept on the item, and their buffer reused: with PySide,
+        # drawargs() holds only a pointer to that buffer, which must stay alive until
+        # QPainter.drawLines has run (a local array was freed before the call).
+        self._sliceSegments = arrayToLineSegments(
+            x[start:stop], y[start:stop], connect='all', finiteCheck=False,
+            out=self._sliceSegments)
+        return self._sliceSegments.drawargs()
 
     def _getClosingSegments(self):
         # this is only used for fillOutline
@@ -2017,6 +2021,8 @@ class PlotCurveItem(GraphicsObject):
         self._indexBuffer = None
         self._lineSegments = None
         self._lineSegmentsRendered = False
+        # buffer of the segments of a vertex slice, see _getVertexSliceSegments
+        self._sliceSegments = None
         self.path = None
         self.fillPath = None
         self._fillPathList = None

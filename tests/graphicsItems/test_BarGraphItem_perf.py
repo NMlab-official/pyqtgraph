@@ -11,6 +11,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QT_LIB, QtCore, QtGui, QtWidgets, internals
+from tests.perf_helpers import show_and_wait
 
 app = pg.mkQApp()
 
@@ -210,9 +211,7 @@ def test_pixel_identical_in_plot_widget():
         pw.resize(400, 300)
         pw.addItem(item)
         pw.setRange(xRange=(1000.3, 1040.3), yRange=(-1, 2), padding=0)
-        pw.show()
-        for _ in range(3):
-            app.processEvents()
+        show_and_wait(pw)
         image = pw.grab().toImage()
         pw.close()
         return pg.functions.ndarray_from_qimage(image).copy()

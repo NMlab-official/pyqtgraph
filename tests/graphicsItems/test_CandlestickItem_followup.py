@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import pyqtgraph as pg
+from tests.perf_helpers import show_and_wait
 
 app = pg.mkQApp()
 
@@ -179,9 +180,7 @@ def test_autoVisible_y_fits_visible_candles_when_panning():
     pw.resize(400, 300)
     item = pg.CandlestickItem(**data)
     pw.addItem(item)
-    pw.show()
-    for _ in range(3):
-        app.processEvents()
+    show_and_wait(pw)
     pw.setAutoVisible(y=True)
     vb = pw.getViewBox()
     pw.setXRange(data['x'][100], data['x'][160], padding=0)
@@ -209,9 +208,7 @@ def test_autoVisible_y_with_linked_volume_plot():
                                  pen=None))
     for plot in (price, bars):
         plot.setAutoVisible(y=True)
-    win.show()
-    for _ in range(3):
-        app.processEvents()
+    show_and_wait(win)
 
     def check() -> None:
         assertFits(price.vb, *visibleYRange(data, candles.width, price.vb))

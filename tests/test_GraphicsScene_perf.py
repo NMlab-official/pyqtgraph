@@ -7,7 +7,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -111,8 +111,7 @@ def mixed_scene():
     p2.plot(x, np.cos(x), pen='y', fillLevel=0, brush=(50, 50, 200, 100))
     p2.addItem(pg.BarGraphItem(x=x[::6], height=np.cos(x[::6]), width=0.4))
     p2.addLegend().addItem(pg.PlotDataItem(pen='r'), 'legend entry')
-    win.show()
-    process_events(5)
+    show_and_wait(win)
     # points of interest: a grid over the whole view, plus item positions
     points = [QtCore.QPointF(px, py) for px in range(3, 420, 23) for py in range(3, 360, 19)]
     vb = p1.getViewBox()
@@ -160,8 +159,7 @@ def test_itemsNearEvent_many_overlapping_items():
     x = np.linspace(0, 1, 20)
     for k in range(40):
         pw.plot(x, x + k * 1e-3, pen='w')
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     scene = pw.scene()
     vb = pw.getViewBox()
     try:
@@ -204,8 +202,7 @@ class _PaintLog(QtCore.QObject):
 
 def viewport_paints_per_update(widget, update, n=20, warmup=3):
     """Mean number of viewport paint events per update, events processed after each."""
-    widget.show()
-    process_events(5)
+    show_and_wait(widget)
     for i in range(warmup):
         update(i)
         process_events()
@@ -279,8 +276,7 @@ def test_linked_plots_streaming_paints_once():
 def test_requested_prepare_runs_before_the_paint():
     pw = pg.PlotWidget(size=(300, 200))
     curve = pw.plot(np.arange(10.0))
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     scene = pw.scene()
     log = []
     scene.sigPrepareForPaint.connect(lambda: log.append('prepare'))
@@ -309,8 +305,7 @@ def test_requested_prepare_runs_before_the_paint():
 def test_autorange_is_applied_before_the_paint():
     pw = pg.PlotWidget(size=(300, 200))
     curve = pw.plot(np.arange(10.0))
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     vb = pw.getViewBox()
     ranges = []
     paintLog = _PaintLog([])
@@ -336,8 +331,7 @@ def test_autorange_is_applied_before_the_paint():
 def test_hidden_view_defers_the_prepare():
     pw = pg.PlotWidget(size=(300, 200))
     curve = pw.plot(np.arange(10.0))
-    pw.show()
-    process_events(5)
+    show_and_wait(pw)
     pw.hide()
     vb = pw.getViewBox()
     before = vb.viewRange()
@@ -349,8 +343,7 @@ def test_hidden_view_defers_the_prepare():
         # as before, a hidden plot does not auto-range until it is painted again
         assert calls == []
         assert vb.viewRange() == before
-        pw.show()
-        process_events(5)
+        show_and_wait(pw)
         assert vb.viewRange()[1][1] >= 90
     finally:
         pw.close()
@@ -371,8 +364,7 @@ def test_single_paint_renders_like_a_full_repaint():
     curves.append(p2.plot(rng.random(100), fillLevel=0, brush=(50, 50, 200, 100)))
     text = pg.TextItem('label', anchor=(0, 0.5))
     p1.addItem(text)
-    win.show()
-    process_events(5)
+    show_and_wait(win)
 
     def image(qimage):
         qimage = qimage.convertToFormat(pg.QtGui.QImage.Format.Format_ARGB32)

@@ -14,6 +14,7 @@ import pyqtgraph as pg
 from pyqtgraph.exporters import CSVExporter
 from pyqtgraph.graphicsItems import BarGraphItem as barModule
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from tests.perf_helpers import show_and_wait
 
 app = pg.mkQApp()
 
@@ -542,9 +543,7 @@ def test_autorange_follows_appended_bars():
     pw.resize(400, 300)
     item = pg.BarGraphItem(x=np.arange(100.), height=np.ones(100), width=0.8)
     pw.addItem(item)
-    pw.show()
-    for _ in range(3):
-        app.processEvents()
+    show_and_wait(pw)
     (_, xmax), (_, ymax) = pw.viewRange()
     assert xmax < 110 and ymax < 1.5
     item.appendData(x=[150.], height=[8.])
@@ -671,9 +670,7 @@ def test_autorange_includes_bars_with_nan():
     heights[50] = np.nan
     item = pg.BarGraphItem(x=np.arange(100.) + 1000, height=heights, width=0.8)
     pw.addItem(item)
-    pw.show()
-    for _ in range(3):
-        app.processEvents()
+    show_and_wait(pw)
     (xmin, xmax), (ymin, ymax) = pw.viewRange()
     assert 990 < xmin <= 999.6 and 1099.4 <= xmax < 1110
     assert -10 < ymin <= 0 and 100 <= ymax < 110

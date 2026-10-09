@@ -10,7 +10,7 @@ import pytest
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui
-from tests.perf_helpers import count_calls, process_events
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -28,7 +28,7 @@ LINE_SPECS = [
 ]
 
 
-def _make_view(specs=LINE_SPECS, xRange=(0, 10), yRange=(0, 10)):
+def _make_view(specs=LINE_SPECS, xRange=(0, 10), yRange=(0, 10), lineClass=pg.InfiniteLine):
     """Return ``(widget, viewbox, lines)`` with the lines added to a shown ViewBox."""
     widget = pg.GraphicsLayoutWidget()
     widget.resize(320, 240)
@@ -36,14 +36,13 @@ def _make_view(specs=LINE_SPECS, xRange=(0, 10), yRange=(0, 10)):
     vb.setRange(xRange=xRange, yRange=yRange, padding=0)
     lines = []
     for spec in specs:
-        line = pg.InfiniteLine(**spec)
+        line = lineClass(**spec)
         vb.addItem(line)
         lines.append(line)
     for line in lines:
         if line.movable:
             line.setMouseHover(True)  # drawn with its (wider) hover pen
-    widget.show()
-    process_events()
+    show_and_wait(widget)
     return widget, vb, lines
 
 
@@ -92,32 +91,37 @@ def _view_changes(widget, vb):
         yield
 
 
-def test_boundingRect_never_calls_prepareGeometryChange(monkeypatch):
-    depth = 0
+class _TracingLine(pg.InfiniteLine):
+    """InfiniteLine recording whether prepareGeometryChange runs inside boundingRect."""
+
+    # Overriding in a subclass rather than patching pg.InfiniteLine: PySide6 caches
+    # the Python override of a C++ virtual per object, and restoring a patched
+    # virtual can leave a dangling override behind (a crash in a later test).
     calls = {'inside': 0, 'outside': 0, 'boundingRect': 0}
-    original_bounding_rect = pg.InfiniteLine.boundingRect
-    original_prepare = pg.InfiniteLine.prepareGeometryChange
+    depth = 0
 
     def boundingRect(self):
-        nonlocal depth
-        depth += 1
-        calls['boundingRect'] += 1
+        cls = _TracingLine
+        cls.depth += 1
+        cls.calls['boundingRect'] += 1
         try:
-            return original_bounding_rect(self)
+            return super().boundingRect()
         finally:
-            depth -= 1
+            cls.depth -= 1
 
     def prepareGeometryChange(self):
-        calls['inside' if depth else 'outside'] += 1
-        original_prepare(self)
+        _TracingLine.calls['inside' if _TracingLine.depth else 'outside'] += 1
+        super().prepareGeometryChange()
 
-    monkeypatch.setattr(pg.InfiniteLine, 'boundingRect', boundingRect)
-    monkeypatch.setattr(pg.InfiniteLine, 'prepareGeometryChange', prepareGeometryChange)
-    widget, vb, lines = _make_view()
+
+def test_boundingRect_never_calls_prepareGeometryChange():
+    _TracingLine.calls = {'inside': 0, 'outside': 0, 'boundingRect': 0}
+    widget, vb, lines = _make_view(lineClass=_TracingLine)
     for _ in _view_changes(widget, vb):
         lines[0].setPos(lines[0].value() + 0.5)
         lines[2].setPos((lines[2].pos().x() + 0.25, 5))
     widget.close()
+    calls = _TracingLine.calls
     assert calls['boundingRect'] > 0
     assert calls['outside'] > 0
     assert calls['inside'] == 0
