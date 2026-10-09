@@ -1,6 +1,7 @@
 import os
 import pathlib
 import warnings
+from collections import OrderedDict
 from collections.abc import Callable
 
 import numpy as np
@@ -124,6 +125,8 @@ class ImageItem(GraphicsObject):
         self._nanPolicy = 'propagate'
         self._colorMap = None # This is only set if a color map is assigned directly
         self._lastDownsample = (1, 1)
+        # downsampled images by (xds, yds, axes, nanPolicy), least recently used first
+        self._downsampleCache: OrderedDict[tuple, np.ndarray] = OrderedDict()
         self._processingBuffer = None
         self._displayBuffer = None
         self._renderRequired = True
@@ -567,6 +570,7 @@ class ImageItem(GraphicsObject):
         """
         self.image = None
         self._convertedQImage = None
+        self._downsampleCache.clear()
         self.prepareGeometryChange()
         self.informViewBoundsChanged()
         self.update()
@@ -641,6 +645,8 @@ class ImageItem(GraphicsObject):
         profile = debug.Profiler()
 
         gotNewData = False
+        # new data, or data changed in place (updateImage): downsample it again
+        self._downsampleCache.clear()
         if image is None:
             if self.image is None:
                 return
@@ -837,8 +843,7 @@ class ImageItem(GraphicsObject):
 
             axes = [1, 0] if self.axisOrder == 'row-major' else [0, 1]
             nan_policy = self._nanPolicy if self._imageHasNans else 'propagate'
-            image = fn.downsample(image, xds, axis=axes[0], nanPolicy=nan_policy)
-            image = fn.downsample(image, yds, axis=axes[1], nanPolicy=nan_policy)
+            image = self._downsampledImage(xds, yds, axes, nan_policy)
             self._lastDownsample = (xds, yds)
 
             # changes in view transform cause changes in downsampling factors,
@@ -1269,6 +1274,55 @@ class ImageItem(GraphicsObject):
             height = 0.
 
         return br.width() / width, br.height() / height
+
+    def _downsampledImage(
+        self,
+        xds: int,
+        yds: int,
+        axes: list[int],
+        nanPolicy: str
+    ) -> np.ndarray:
+        """
+        Get the image downsampled by the given factors, from the cache if possible.
+
+        Zooming changes the factors back and forth: the downsampled images of the
+        recent factors are kept, within as many bytes as the image itself, so that
+        returning to a factor does not average the whole image again. A downsampled
+        image larger than a quarter of the image is not kept: it would evict several
+        smaller ones, which cost as much to compute again. The cache is
+        emptied by :meth:`setImage` and :meth:`updateImage`, which must be called
+        after the image data is changed in place.
+
+        Parameters
+        ----------
+        xds, yds : int
+            Downsampling factors along the x and y axes of the image.
+        axes : list of int
+            Array axes of the x and y axes, see ``axisOrder``.
+        nanPolicy : str
+            ``'propagate'`` or ``'omit'``, see :func:`~pyqtgraph.functions.downsample`.
+
+        Returns
+        -------
+        np.ndarray
+            The downsampled image, to be treated as read-only.
+        """
+        key = (xds, yds, tuple(axes), nanPolicy)
+        cache = self._downsampleCache
+        image = cache.get(key)
+        if image is not None:
+            cache.move_to_end(key)
+            return image
+        image = fn.downsample(self.image, xds, axis=axes[0], nanPolicy=nanPolicy)
+        image = fn.downsample(image, yds, axis=axes[1], nanPolicy=nanPolicy)
+        budget = self.image.nbytes
+        if image is not self.image and image.nbytes <= budget // 4:
+            cache[key] = image
+            total = sum(cached.nbytes for cached in cache.values())
+            while total > budget:
+                _, dropped = cache.popitem(last=False)
+                total -= dropped.nbytes
+        return image
 
     def viewTransformChanged(self):
         if self.autoDownsample:

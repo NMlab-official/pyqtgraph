@@ -510,3 +510,61 @@ def test_other_formats_are_not_converted():
         _paint_item(item, _TRANSFORMS[0])
     assert item.qimage.format() != Format.Format_Indexed8
     assert item._convertedQImage is None
+
+
+# --------------------------------------------------------------------------------------
+# Downsampled images kept for the recent downsampling factors
+# --------------------------------------------------------------------------------------
+
+def _downsampling_item(monkeypatch, factors):
+    data = np.random.default_rng(0).random((400, 300)).astype(np.float32)
+    item = pg.ImageItem(data, axisOrder='row-major', levels=(0, 1), autoDownsample=True)
+    factors = iter(factors)
+    monkeypatch.setattr(item, '_computeDownsampleFactors', lambda: next(factors))
+    return item, data
+
+
+def _cache_key(xds, yds):
+    return (xds, yds, (1, 0), 'propagate')
+
+
+def test_downsampled_images_are_reused(monkeypatch):
+    item, data = _downsampling_item(monkeypatch, [(2, 3), (3, 4), (2, 3), (3, 4)])
+    with count_calls(fn, 'downsample') as calls:
+        for _ in range(4):
+            item.render()
+    # two factors, both axes, averaged once each
+    assert calls.count == 4
+    expected = fn.downsample(fn.downsample(data, 3, axis=1), 4, axis=0)
+    np.testing.assert_array_equal(item._downsampleCache[_cache_key(3, 4)], expected)
+    # the last render used the cached image
+    assert (item.qimage.height(), item.qimage.width()) == expected.shape
+
+
+def test_downsampled_images_dropped_by_data_changes(monkeypatch):
+    item, data = _downsampling_item(monkeypatch, [(2, 3)] * 3)
+    item.render()
+    data[:] = 1 - data  # changed in place, then announced
+    item.updateImage()
+    assert not item._downsampleCache
+    item.render()
+    expected = fn.downsample(fn.downsample(data, 2, axis=1), 3, axis=0)
+    np.testing.assert_array_equal(item._downsampleCache[_cache_key(2, 3)], expected)
+    item.setImage(data.copy())
+    assert not item._downsampleCache
+    item.render()
+    item.clear()
+    assert not item._downsampleCache
+
+
+def test_downsample_cache_is_bounded(monkeypatch):
+    factors = [(1, 2), (2, 2), (2, 3), (3, 3), (3, 4), (4, 4), (4, 5), (5, 5)]
+    item, data = _downsampling_item(monkeypatch, factors)
+    for _ in factors:
+        item.render()
+    cache = item._downsampleCache
+    # at most the size of the image; none larger than a quarter of it
+    assert sum(image.nbytes for image in cache.values()) <= data.nbytes
+    assert all(image.nbytes <= data.nbytes // 4 for image in cache.values())
+    assert _cache_key(1, 2) not in cache
+    assert _cache_key(5, 5) in cache

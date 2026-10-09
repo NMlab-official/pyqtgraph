@@ -1869,6 +1869,8 @@ def downsample(data, n, axis=0, xvals='subsample', *, nanPolicy='propagate'):
     if n <= 1:
         return data
     nPts = int(data.shape[axis] / n)
+    if nanPolicy == 'propagate' and _downsampleBySlicesIsExact(data, n, axis, nPts):
+        return _downsampleBySlices(data, n, axis, nPts)
     s = list(data.shape)
     s[axis] = nPts
     s.insert(axis+1, n)
@@ -1882,6 +1884,78 @@ def downsample(data, n, axis=0, xvals='subsample', *, nanPolicy='propagate'):
     else:
         raise ValueError(f"Keyword argument {nanPolicy=} must be one of {'propagate', 'omit'}.")
     return d2
+
+
+def _downsampleBySlicesIsExact(data: np.ndarray, n: int, axis: int, nPts: int) -> bool:
+    """
+    Test whether :func:`_downsampleBySlices` applies, and gives the result of
+    ``mean`` bit for bit, faster.
+
+    ``mean`` over blocks of fewer than 8 values adds them in index order (numpy's
+    pairwise summation only splits longer runs), as the slices do. Integer data is
+    summed exactly in float64, in any order. Over the axis contiguous in memory,
+    ``mean`` reduces runs of `n` values at a time, which is slow; over other axes it is
+    already efficient except for float32, and float64 sums of more than 3 slices are
+    slower than ``mean``.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Data to downsample.
+    n : int
+        Number of values averaged together, at least 2.
+    axis : int
+        Axis along which the values are averaged.
+    nPts : int
+        Number of averaged values along `axis`.
+
+    Returns
+    -------
+    bool
+        ``True`` if :func:`_downsampleBySlices` should be used.
+    """
+    if type(data) is not np.ndarray or nPts == 0:
+        return False
+    dtype = data.dtype
+    if dtype == np.float32:
+        return n < 8
+    if data.strides[axis] != data.itemsize:
+        return False
+    if dtype == np.float64:
+        return n <= 3
+    # integer sums of fewer than 2**21 values of at most 32 bits are exact in float64
+    return dtype.kind in 'iub' and dtype.itemsize <= 4 and n < 8
+
+
+def _downsampleBySlices(data: np.ndarray, n: int, axis: int, nPts: int) -> np.ndarray:
+    """
+    Average blocks of `n` values along `axis` by adding `n` strided slices.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Data to downsample.
+    n : int
+        Number of values averaged together.
+    axis : int
+        Axis along which the values are averaged.
+    nPts : int
+        Number of averaged values along `axis`; trailing values are dropped.
+
+    Returns
+    -------
+    np.ndarray
+        The averages, of the dtype of ``data.mean()``: float64 for integer data.
+    """
+    sl = [slice(None)] * data.ndim
+    sl[axis] = slice(0, nPts * n, n)
+    acc = data[tuple(sl)].astype(np.float64 if data.dtype.kind in 'iub' else data.dtype)
+    for i in range(1, n):
+        sl[axis] = slice(i, nPts * n, n)
+        acc += data[tuple(sl)]
+    acc /= n
+    return acc
+
 
 def _compute_backfill_indices(isfinite):
     # the presence of inf/nans result in an empty QPainterPath being generated
