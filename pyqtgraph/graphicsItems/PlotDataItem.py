@@ -1783,6 +1783,8 @@ class PlotDataItem(GraphicsObject):
                 #self.opts[k] = kwargs[k]
             #scatterArgs[v] = self.opts[k]
 
+        # True if x is generated as the index of the y values
+        implicit_x = False
         if y is None or len(y) == 0:  # empty data is represented as None
             yData = None
         else:  # actual data is represented by ndarray

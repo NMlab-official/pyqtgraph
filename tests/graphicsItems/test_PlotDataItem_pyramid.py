@@ -5,6 +5,7 @@ reduction (``autoReduce``) of :class:`~pyqtgraph.PlotDataItem`.
 The tests compare results with direct computations and check cache states; they never
 assert durations (see ``benchmarks/scenarios.py``, scenario S14, for the timings).
 """
+import importlib.util
 import math
 
 import numpy as np
@@ -17,11 +18,12 @@ from tests.perf_helpers import process_events, show_and_wait
 
 app = pg.mkQApp()
 
-try:
-    import numba  # noqa: F401
-    HAVE_NUMBA = True
-except ImportError:
-    HAVE_NUMBA = False
+HAVE_NUMBA = importlib.util.find_spec('numba') is not None
+
+# Data size of the tests of the pyramid life cycle: large enough for blocks of more than
+# 64 values (the lowered threshold) at 60 % of the data in view, whatever the width of
+# the view (about 370 pixels, depending on the platform and the screen).
+N_CYCLE = 1_000_000
 
 
 @pytest.fixture(params=[False, pytest.param(True, marks=pytest.mark.skipif(
@@ -229,7 +231,7 @@ def _zoom(plot_widget, item, *ranges):
 
 
 def test_pyramid_built_when_the_factor_changes(plot_widget, low_thresholds):
-    n = 200_000
+    n = N_CYCLE
     item = plot_widget.plot(np.random.default_rng(3).normal(size=n), autoDownsample=True)
     plot_widget.getPlotItem().enableAutoRange(False)
     _zoom(plot_widget, item, (0, n))
@@ -250,7 +252,7 @@ def test_pyramid_built_when_the_factor_changes(plot_widget, low_thresholds):
 
 def test_pyramid_dropped_by_set_data(plot_widget, low_thresholds):
     rng = np.random.default_rng(4)
-    n = 200_000
+    n = N_CYCLE
     item = plot_widget.plot(rng.normal(size=n), autoDownsample=True)
     plot_widget.getPlotItem().enableAutoRange(False)
     _zoom(plot_widget, item, (0, n), (0, 0.8 * n))
@@ -275,7 +277,7 @@ def test_pyramid_dropped_by_set_data(plot_widget, low_thresholds):
 
 
 def test_pyramid_follows_the_mapping(plot_widget, low_thresholds):
-    n = 200_000
+    n = N_CYCLE
     y = np.random.default_rng(5).uniform(1.0, 100.0, n)
     item = plot_widget.plot(y, autoDownsample=True)
     plot_widget.getPlotItem().enableAutoRange(False)
@@ -295,7 +297,7 @@ def test_pyramid_follows_the_mapping(plot_widget, low_thresholds):
 
 def test_pyramid_extended_by_append_data(plot_widget, low_thresholds):
     rng = np.random.default_rng(6)
-    n = 200_000
+    n = N_CYCLE
     y = rng.normal(size=n + 5000)
     item = plot_widget.plot(y[:n], autoDownsample=True)
     plot_widget.getPlotItem().enableAutoRange(False)
@@ -313,7 +315,7 @@ def test_pyramid_extended_by_append_data(plot_widget, low_thresholds):
 
 
 def test_pyramid_dropped_by_clear(plot_widget, low_thresholds):
-    n = 200_000
+    n = N_CYCLE
     item = plot_widget.plot(np.random.default_rng(7).normal(size=n), autoDownsample=True)
     plot_widget.getPlotItem().enableAutoRange(False)
     _zoom(plot_widget, item, (0, n), (0, 0.8 * n))
