@@ -83,3 +83,21 @@ def test_view_change_keeps_data_bounds_cache():
         assert curve.boundingRect() != rect_before
     finally:
         pw.close()
+
+
+def test_paint_changes_no_flag(monkeypatch):
+    # The curve asks Qt for the exposed rectangle from its construction: a flag
+    # changed by paint(), while the scene paints, disturbs its changed signal.
+    flag = pg.QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption
+    pw = pg.PlotWidget(size=(300, 200))
+    curve = pg.PlotCurveItem(np.arange(100.0), np.sin(np.arange(100.0) / 10))
+    flagged = bool(curve.flags() & flag)
+    changed = []
+    monkeypatch.setattr(curve, 'setFlag', lambda *args: changed.append(args))
+    pw.addItem(curve)
+    try:
+        show_and_wait(pw)
+        assert flagged
+        assert changed == []
+    finally:
+        pw.close()

@@ -334,6 +334,12 @@ class PlotCurveItem(GraphicsObject):
         ==============  =======================================================
         """
         GraphicsObject.__init__(self, kwargs.get('parent', None))
+        # Qt fills option.exposedRect with the area to repaint instead of the whole
+        # bounding rectangle (see _getExposedVertexRange). Set here, never from
+        # paint(): a flag changed while the scene paints disturbs its bookkeeping,
+        # and its changed signal then reports no area for the next update.
+        self.setFlag(
+            QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption)
         self.clear()
 
         ## this is disastrous for performance.
@@ -1657,13 +1663,6 @@ class PlotCurveItem(GraphicsObject):
         profiler = debug.Profiler()
         if self.xData is None or len(self.xData) == 0:
             return
-
-        extendedStyleOption = (
-            QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption)
-        if not self.flags() & extendedStyleOption:
-            # from the next paint on, Qt sets opt.exposedRect to the area to repaint
-            # instead of the whole bounding rectangle (see _getExposedVertexRange)
-            self.setFlag(extendedStyleOption)
 
         # opengl fill mode supports filling to a fillLevel
         # for connect="all" and connect="finite" only.
