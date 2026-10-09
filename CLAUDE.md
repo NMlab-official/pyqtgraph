@@ -29,7 +29,7 @@ tox -e py313-pyqt6                             # matrice liaisons × Python (voi
 PYQTGRAPH_AUDIT=1 python -m pytest tests/graphicsItems/test_ImageItem.py
 
 # Benchmarks
-python benchmarks/scenarios.py                 # scénarios S01..S14 (force offscreen)
+python benchmarks/scenarios.py                 # scénarios S01..S15 (offscreen par défaut)
 python benchmarks/scenarios.py S05 S06 --full  # sélection ; --full ajoute les tailles 1e7, --numba
 asv run                                        # benchmarks asv de benchmarks/*.py (setup / time_*)
 
@@ -117,7 +117,7 @@ python -m pyqtgraph.examples  # application de démonstration
 ## PERFORMANCE_PLAN.md
 
 Plan de travail en français destiné aux agents : tableau de bord des tâches T0.x à T4.x (statut à
-mettre à jour à chaque tâche), scénarios S01..S14 de `benchmarks/scenarios.py`, règles communes
+mettre à jour à chaque tâche), scénarios S01..S15 de `benchmarks/scenarios.py`, règles communes
 (§1) et pistes écartées à ne pas proposer (§8). Points clés :
 
 - Correctif minimal, périmètre de la fiche uniquement ; aucun changement visible d'API, de valeur
