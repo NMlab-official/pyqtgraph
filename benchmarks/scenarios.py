@@ -1,8 +1,9 @@
 """
-Reproducible end-to-end performance scenarios (S01 to S13).
+Reproducible end-to-end performance scenarios (S01 to S14).
 
 The scenario identifiers S01 to S12 match ``PERFORMANCE_PLAN.md`` at the root of the
-repository; S13 covers the CandlestickItem added by its task T3.2. Every scenario
+repository; S13 covers the CandlestickItem added by its task T3.2, S14 the pan and
+zoom of a long line with 'peak' downsampling (min/max pyramid). Every scenario
 prints one line per variant with the median duration and, where relevant, call
 counters (paints per update, ``setData`` calls, ...).
 
@@ -1151,6 +1152,172 @@ def s13_candlesticks(full: bool) -> list[Result]:
     return _candle_item_results(data, n) + _candle_layout_results(data, n, 500_000)
 
 
+class _TimeAccumulator:
+    """
+    Accumulate the time spent in a method of a class while active.
+
+    Parameters
+    ----------
+    cls : type
+        Class whose method is wrapped. The method must not be a Qt virtual method
+        (see :class:`CallCounter` for PySide6).
+    name : str
+        Method name.
+    """
+
+    def __init__(self, cls: type, name: str) -> None:
+        self._cls = cls
+        self._name = name
+        self._orig = cls.__dict__.get(name)
+        self._seconds = 0.0
+        self._depth = 0
+
+    @property
+    def ms(self) -> float:
+        """float: Accumulated time in milliseconds, nested calls counted once."""
+        return self._seconds * 1e3
+
+    def __enter__(self) -> _TimeAccumulator:
+        orig = getattr(self._cls, self._name)
+        acc = self
+
+        def wrapper(*args, **kwargs):
+            acc._depth += 1
+            t0 = time.perf_counter()
+            try:
+                return orig(*args, **kwargs)
+            finally:
+                acc._depth -= 1
+                if acc._depth == 0:
+                    acc._seconds += time.perf_counter() - t0
+
+        self._wrapper = wrapper
+        setattr(self._cls, self._name, wrapper)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        _retired_wrappers.append(self._wrapper)
+        if self._orig is None:
+            delattr(self._cls, self._name)
+        else:
+            setattr(self._cls, self._name, self._orig)
+
+
+class _PaintEvents(QtCore.QObject):
+    """
+    Event filter counting the paint events of a widget, with any Qt binding.
+
+    Parameters
+    ----------
+    widget : QtWidgets.QWidget
+        Widget whose paint events are counted, e.g. the viewport of a PlotWidget.
+    """
+
+    def __init__(self, widget: QtWidgets.QWidget) -> None:
+        super().__init__()
+        self.count = 0
+        widget.installEventFilter(self)
+
+    def eventFilter(self, obj: QtCore.QObject, ev: QtCore.QEvent) -> bool:
+        """
+        Count ``ev`` if it is a paint event; never filter it out.
+
+        Parameters
+        ----------
+        obj : QtCore.QObject
+            The object receiving the event.
+        ev : QtCore.QEvent
+            The event.
+
+        Returns
+        -------
+        bool
+            Always False: the event is delivered normally.
+        """
+        if ev.type() == QtCore.QEvent.Type.Paint:
+            self.count += 1
+        return False
+
+
+def s14_pan_zoom_x(full: bool) -> list[Result]:
+    """
+    S14: horizontal pan and zoom steps over a long line with 'peak' downsampling.
+
+    The line (a random walk, uniform x) is shown in a 1000x600 PlotWidget with the
+    default options, with the automatic 'peak' downsampling, with and without
+    clipToView, and with the automatic data reduction (``autoReduce=10``) when the
+    installed pyqtgraph has it.
+    Half of the data is visible at first (all of it for ``zoom x full``). A pan step
+    moves the view by 1 % of its width; a zoom step scales the x range by 0.9 or
+    1/0.9 around the view center (10 steps in, then 10 steps out, so the range stays
+    bounded). The automatic downsampling factor changes with every zoom step. The y
+    range is fixed.
+
+    Parameters
+    ----------
+    full : bool
+        Include 1e7 points.
+
+    Returns
+    -------
+    list of Result
+        One result per (size, mode, action): the duration of a step including its
+        paint, with the time spent computing the displayed data and the paints per
+        step as counters.
+    """
+    results = []
+    sizes = [1_000_000, 10_000_000] if full else [1_000_000]
+    rng = np.random.default_rng(0)
+    modes = {
+        'default': {},
+        'autoDownsample': {'autoDownsample': True, 'downsampleMethod': 'peak'},
+        'clip+autoDownsample': {'autoDownsample': True, 'downsampleMethod': 'peak',
+                                'clipToView': True},
+    }
+    if 'autoReduce' in pg.PlotDataItem().opts:
+        modes['autoReduce'] = {'autoReduce': 10.0}
+    for n in sizes:
+        x = np.arange(n, dtype=np.float64)
+        y = np.cumsum(rng.standard_normal(n))
+        for mode, kwargs in modes.items():
+            for action in ('pan x', 'zoom x', 'zoom x full'):
+                pw = _plot_widget()
+                item = pw.plot(x, y, pen='y', **kwargs)
+                pw.getPlotItem().enableAutoRange(False)
+                if action == 'zoom x full':
+                    pw.setXRange(0, n, padding=0)
+                else:
+                    pw.setXRange(0.25 * n, 0.75 * n, padding=0)
+                pw.setYRange(float(y.min()), float(y.max()), padding=0)
+                _process(5)
+                vb = pw.getViewBox()
+                state = {'i': 0}
+
+                def step() -> None:
+                    i = state['i'] = state['i'] + 1
+                    if action == 'pan x':
+                        span = vb.viewRange()[0][1] - vb.viewRange()[0][0]
+                        sign = 1.0 if (i // 20) % 2 == 0 else -1.0
+                        vb.translateBy(x=sign * 0.01 * span)
+                    else:
+                        scale = 0.9 if (i // 10) % 2 == 0 else 1 / 0.9
+                        vb.scaleBy(x=scale, center=vb.viewRect().center())
+                    _process(2)
+
+                step()
+                paints = _PaintEvents(pw.viewport())
+                with _TimeAccumulator(pg.PlotDataItem, '_getDisplayDataset') as data:
+                    ms, steps = _timed(step, repeat=40, warmup=2)
+                pw.viewport().removeEventFilter(paints)
+                results.append(Result(f'S14[{n:.0e},{mode},{action}]', ms, 'ms/step',
+                                      {'data ms/step': data.ms / steps,
+                                       'paints/step': paints.count / steps,
+                                       'points': len(item.getData()[0])}))
+                pw.close()
+                del item
+    return results
+
+
 SCENARIOS: dict[str, Callable[[bool], list[Result]]] = {
     'S01': s01_streaming_line,
     'S02': s02_pan_y,
@@ -1165,6 +1332,7 @@ SCENARIOS: dict[str, Callable[[bool], list[Result]]] = {
     'S11': s11_legend,
     'S12': s12_non_uniform,
     'S13': s13_candlesticks,
+    'S14': s14_pan_zoom_x,
 }
 
 
@@ -1211,15 +1379,20 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('scenarios', nargs='*', help='scenario ids (S01 ... S13)')
+    parser.add_argument('scenarios', nargs='*', help='scenario ids (S01 ... S14)')
     parser.add_argument('--full', action='store_true', help='include the largest sizes')
+    parser.add_argument('--numba', action='store_true',
+                        help="set the 'useNumba' configuration option")
     args = parser.parse_args(argv)
     unknown = [s for s in args.scenarios if s.upper() not in SCENARIOS]
     if unknown:
         parser.error(f'unknown scenario(s): {", ".join(unknown)}')
     _app()
+    if args.numba:
+        pg.setConfigOption('useNumba', True)
     print(f'pyqtgraph {pg.__version__}, {pg.Qt.QT_LIB} {QtCore.qVersion()}, '
-          f'numpy {np.__version__}, platform {QtGui.QGuiApplication.platformName() or "?"}')
+          f'numpy {np.__version__}, platform {QtGui.QGuiApplication.platformName() or "?"}'
+          f', useNumba={pg.getConfigOption("useNumba")}')
     run(args.scenarios, full=args.full)
     return 0
 

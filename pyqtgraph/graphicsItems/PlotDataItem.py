@@ -11,6 +11,7 @@ from .. import debug as debug
 from .. import functions as fn
 from .. import getConfigOption
 from ..Qt import QtCore, QtGui, QtWidgets
+from ._MinMaxPyramid import MinMaxPyramid
 from .GraphicsObject import GraphicsObject
 from .PlotCurveItem import PlotCurveItem, _arangeBuffer
 from .ScatterPlotItem import ScatterPlotItem
@@ -53,6 +54,7 @@ class OptimizationKeywordArgs(TypedDict):
     downsampleMethod: str
     autoDownsample: bool
     clipToView: bool
+    autoReduce: float | None
     dynamicRangeLimit: float | None
     dynamicRangeHyst: float
     skipFiniteCheck: bool
@@ -115,6 +117,8 @@ class PlotDataset:
         # (xmin, xmax, ymin, ymax) of the finite values, as float (NaN for an axis
         # without finite value). None if not computed yet.
         self._bounds: tuple[float, float, float, float] | None = None
+        # True if the x values never decrease, see xIncreasing. None if not known yet.
+        self._xIncreasing: bool | None = None
 
         if isinstance(x, np.ndarray) and x.dtype.kind in 'iu':
             self.xAllFinite = True
@@ -180,9 +184,13 @@ class PlotDataset:
             The dataset of the extended data.
         """
         dataset = PlotDataset(x, y, self.xAllFinite, self.yAllFinite)
+        n = len(self.x)
+        if self._xIncreasing is not None:
+            # the order of the new values and of the first of them with the last
+            # current one decides
+            dataset._xIncreasing = self._xIncreasing and _isNonDecreasing(x[n - 1:])
         if self._bounds is None:
             return dataset
-        n = len(self.x)
         xmin, xmax, x_finite = self._getArrayBounds(x[n:], None)
         ymin, ymax, y_finite = self._getArrayBounds(y[n:], None)
         # fmin and fmax ignore NaN, the bound of an axis without finite values
@@ -257,6 +265,22 @@ class PlotDataset:
             return None
         return self._bounds[:2], self._bounds[2:]
 
+    def xIncreasing(self) -> bool:
+        """
+        Test whether the `x` values are sorted in increasing order.
+
+        Equal consecutive values are allowed. A ``NaN`` value makes the result
+        ``False``. The result is cached: the test is made once per dataset, in chunks.
+
+        Returns
+        -------
+        bool
+            ``True`` if no `x` value is smaller than the previous one.
+        """
+        if self._xIncreasing is None:
+            self._xIncreasing = _isNonDecreasing(self.x)
+        return self._xIncreasing
+
     def dataRect(self) -> QtCore.QRectF | None:
         """
         Get the bounding rectangle for the finite subset of data.
@@ -320,23 +344,38 @@ class _PeakBlockCache:
     blocks, which grows as further blocks are requested, e.g. while panning or while
     data is appended.
 
+    With a :class:`~pyqtgraph.graphicsItems._MinMaxPyramid.MinMaxPyramid` of the
+    data, large ranges of large blocks are computed from the pyramid, in time
+    proportional to the number of blocks instead of the number of values (see
+    :meth:`MinMaxPyramid.efficientBlockSize` and :attr:`PYRAMID_MIN_VALUES`). The
+    results are identical.
+
     Parameters
     ----------
     y : np.ndarray
         The data.
     ds : int
         Number of values per block.
+    pyramid : MinMaxPyramid or None, default None
+        Min/max pyramid of `y`, shared by the caches of all block sizes.
     """
 
-    def __init__(self, y: np.ndarray, ds: int) -> None:
+    # Smallest number of values covered by a range of blocks computed from the
+    # pyramid: below it, the fixed cost of a pyramid query exceeds the direct one.
+    PYRAMID_MIN_VALUES = 1 << 18
+
+    def __init__(self, y: np.ndarray, ds: int, pyramid: MinMaxPyramid | None = None) -> None:
         self.y = y
         self.ds = ds
+        self.pyramid = pyramid
         # computed range of blocks [_lo, _hi)
         self._lo = 0
         self._hi = 0
         self._max = np.empty(0, dtype=y.dtype)
         self._min = np.empty(0, dtype=y.dtype)
         self.computedBlocks = 0  # total number of block extremes computed
+        self.pyramidBlocks = 0  # number of those computed from the pyramid
+        self.directValues = 0  # number of values read to compute the others
 
     def extend(self, y: np.ndarray) -> None:
         """
@@ -348,6 +387,8 @@ class _PeakBlockCache:
             The extended data. Its leading values must be equal to the current data.
         """
         self.y = y
+        if self.pyramid is not None:
+            self.pyramid.extend(y)
 
     def blocks(self, first: int, end: int) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -403,9 +444,18 @@ class _PeakBlockCache:
         if end <= first:
             return
         ds = self.ds
-        blocks = self.y[first * ds:end * ds].reshape(end - first, ds)
-        np.max(blocks, axis=1, out=self._max[first:end])
-        np.min(blocks, axis=1, out=self._min[first:end])
+        if (
+            self.pyramid is not None
+            and ds >= MinMaxPyramid.efficientBlockSize()
+            and (end - first) * ds >= self.PYRAMID_MIN_VALUES
+        ):
+            self.pyramid.blocks(first, end, ds, self._max[first:end], self._min[first:end])
+            self.pyramidBlocks += end - first
+        else:
+            blocks = self.y[first * ds:end * ds].reshape(end - first, ds)
+            np.max(blocks, axis=1, out=self._max[first:end])
+            np.min(blocks, axis=1, out=self._min[first:end])
+            self.directValues += (end - first) * ds
         self.computedBlocks += end - first
 
 
@@ -660,6 +710,15 @@ class PlotDataItem(GraphicsObject):
                             Clip the data to only the visible range on the x-axis.
                             See :meth:`setClipToView` for more information.
 
+        autoReduce          ``float`` or ``None``, default inherited from
+                            ``pyqtgraph.getConfigOption('autoReduce')`` (``None``)
+
+                            Number of data points per pixel of view width above which
+                            the data is clipped to the view and downsampled
+                            automatically, if its `x` values increase. ``None``
+                            disables it. See :meth:`setAutoReduce` for more
+                            information.
+
         dynamicRangeLimit   ``float``, default ``1e6``
 
                             Limit off-screen y positions of data points. ``None``
@@ -805,8 +864,12 @@ class PlotDataItem(GraphicsObject):
         self._styleDirty = True
         # extremes of the blocks of the 'peak' downsampling
         self._peakCache: _PeakBlockCache | None = None
+        # values of the current mapped y read by the replaced caches of other factors
+        self._peakScanned = 0
         # (ds, start, end) of the current display data, see _displaySelection
         self._displayKey: tuple[int, int, int] | None = None
+        # True if the current display data is clipped to the view by autoReduce only
+        self._autoReduceClipped = False
         # growth buffers of appendData, and the views of them in use
         self._appendBuffers: tuple[np.ndarray, np.ndarray] | None = None
         # True if the x values were generated as the index of the y values
@@ -849,6 +912,7 @@ class PlotDataItem(GraphicsObject):
             'downsampleMethod': 'peak',
             'autoDownsampleFactor': 5.,  # draw ~5 samples per pixel
             'clipToView': False,
+            'autoReduce': getConfigOption('autoReduce'),
             'dynamicRangeLimit': 1e6,
             'dynamicRangeHyst': 3.0,
             'data': None,
@@ -1383,6 +1447,104 @@ class PlotDataItem(GraphicsObject):
         self._datasetDisplay = None  # invalidate display data
         self.updateItems(styleUpdate=False)
 
+    def setAutoReduce(self, density: float | None) -> None:
+        """
+        Clip and downsample dense data automatically.
+
+        When the data holds more than ``density`` points per pixel of view width, and
+        its `x` values increase (after the data mappings, e.g. log mode), the
+        displayed data is clipped to the visible x range, as with
+        :meth:`setClipToView`. If the visible range still holds more than
+        ``density`` points per pixel, the data is also downsampled with the
+        automatic factor of :meth:`setDownsampling` (``auto=True``) and the current
+        downsampling method, ``'peak'`` by default. Below these thresholds, the
+        display follows the other options. The thresholds are tested whenever the
+        view range or size changes.
+
+        This brings the performance of clipping and 'peak' downsampling to dense
+        plots without changing their appearance noticeably:
+
+        * The 'peak' method draws the maximum and the minimum of each block of
+          points, so that the envelope of the curve is kept.
+        * The bounds reported to the view for its auto-range (:meth:`dataBounds`
+          without `orthoRange`) are those of all the data, as without clipping.
+        * As with :meth:`setClipToView`, the data is not clipped while the x-axis
+          auto-range of the view is enabled; it is still downsampled if needed.
+
+        Checking that the `x` values increase costs one pass over the data per
+        :meth:`setData` once the threshold is exceeded (none when `x` is omitted,
+        only the new points with :meth:`appendData`). Data whose `x` values do not
+        increase is never reduced by this option.
+
+        The default for new items is the ``autoReduce`` configuration option
+        (``None`` unless set with :func:`~pyqtgraph.setConfigOptions`). Explicit
+        :meth:`setClipToView` and :meth:`setDownsampling` settings still apply.
+
+        Parameters
+        ----------
+        density : float or None
+            Number of points per pixel above which the data is reduced, e.g. ``10``;
+            ``None`` disables the automatic reduction.
+
+        Raises
+        ------
+        ValueError
+            Raised if `density` is not ``None`` nor a positive number.
+        """
+        _checkAutoReduce(density)
+        if self.opts['autoReduce'] == density:
+            return
+        self.opts['autoReduce'] = density
+        self._datasetDisplay = None  # invalidate display data
+        self._adsLastValue = 1       # reset auto-downsample value
+        self.updateItems(styleUpdate=False)
+
+    def _viewDependent(self) -> bool:
+        """
+        Test whether the displayed data may depend on the view range.
+
+        Returns
+        -------
+        bool
+            ``True`` with `clipToView`, `autoDownsample` or `autoReduce`.
+        """
+        return bool(
+            self.opts['clipToView']
+            or self.opts['autoDownsample']
+            or self.opts['autoReduce'] is not None
+        )
+
+    def _autoReduceActive(self, x: np.ndarray, view: QtCore.QObject | None) -> bool:
+        """
+        Test whether the automatic reduction (`autoReduce`) applies to the data.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Mapped `x` data, which must be that of the mapped dataset.
+        view : QObject or None
+            The view of the item, see :meth:`getViewBox`.
+
+        Returns
+        -------
+        bool
+            ``True`` if the item is in a :class:`~pyqtgraph.ViewBox`, its data holds
+            more than `autoReduce` points per pixel of view width, and its `x` values
+            increase.
+        """
+        density = self.opts['autoReduce']
+        mapped = self._datasetMapped
+        if (
+            density is None
+            or mapped is None
+            or mapped.x is not x
+            or view is None
+            or not (hasattr(view, 'implements') and view.implements('ViewBox'))
+        ):
+            return False
+        width = view.width()
+        return bool(width > 0 and len(x) > density * width and mapped.xIncreasing())
+
     def _applyPlotDefaults(
         self,
         ds: int,
@@ -1584,6 +1746,9 @@ class PlotDataItem(GraphicsObject):
         if 'skipFiniteCheck' in kwargs:
             self.opts['skipFiniteCheck'] = kwargs['skipFiniteCheck']
 
+        if 'autoReduce' in kwargs:
+            _checkAutoReduce(kwargs['autoReduce'])
+
         # if symbol pen/brush are given with no previously set symbol,
         # then assume symbol is 'o'
         if (
@@ -1643,6 +1808,8 @@ class PlotDataItem(GraphicsObject):
         else:
             self._dataset = PlotDataset( xData, yData )
             self._implicitX = implicit_x
+            if implicit_x:
+                self._dataset._xIncreasing = True  # x is the index of the points
         # invalidate mapped data , will be generated in getData() / _getDisplayDataset()
         self._datasetMapped  = None
         # invalidate display data, will be generated in getData() / _getDisplayDataset()
@@ -1806,10 +1973,10 @@ class PlotDataItem(GraphicsObject):
         """
         Update the curve and scatter plot now, or before the next paint.
 
-        When the displayed data depends on the view range (`clipToView` or
-        `autoDownsample`), a data update is deferred: a view change in the same frame,
-        e.g. ``setXRange`` in a streaming loop, then does not compute the displayed
-        data twice. The deferred update is applied by a queued call, which the event
+        When the displayed data depends on the view range (`clipToView`,
+        `autoDownsample` or `autoReduce`), a data update is deferred: a view change in
+        the same frame, e.g. ``setXRange`` in a streaming loop, then does not compute
+        the displayed data twice. The deferred update is applied by a queued call, which the event
         loop delivers before paint events (these have a low priority), so that the
         regions changed by the update are painted in the same pass. It is also
         applied when the scene is about to be rendered
@@ -1827,7 +1994,7 @@ class PlotDataItem(GraphicsObject):
         scene = self.scene()
         if (
             styleUpdate
-            or not (self.opts['clipToView'] or self.opts['autoDownsample'])
+            or not self._viewDependent()
             or scene is None
             or not hasattr(scene, 'sigPrepareForPaint')
         ):
@@ -2046,8 +2213,7 @@ class PlotDataItem(GraphicsObject):
         # Return cached processed dataset if available and still valid:
         if (
             self._datasetDisplay is not None and
-            not (self.property('xViewRangeWasChanged') and self.opts['clipToView']) and
-            not (self.property('xViewRangeWasChanged') and self.opts['autoDownsample']) and
+            not (self.property('xViewRangeWasChanged') and self._viewDependent()) and
             not (self.property('yViewRangeWasChanged') and self.opts['dynamicRangeLimit'] is not None)
         ):
             return self._datasetDisplay
@@ -2103,8 +2269,10 @@ class PlotDataItem(GraphicsObject):
 
         view_range = self._displayViewRange()
         ds, visible = self._displayReduction(x, view_range)
-        if self.opts['autoDownsample']:
+        if self.opts['autoDownsample'] or self.opts['autoReduce'] is not None:
             self._adsLastValue = ds
+        # clipped although clipToView is not set: by autoReduce
+        self._autoReduceClipped = visible is not None and not self.opts['clipToView']
         # downsampling is expensive; it is applied after clipping.
         start, end = self._displaySelection(len(y), ds, visible)
         self._displayKey = (ds, start, end)
@@ -2228,9 +2396,11 @@ class PlotDataItem(GraphicsObject):
         if not isinstance(ds, int):
             ds = 1
 
+        # automatic reduction of dense data, see setAutoReduce
+        auto_reduce = self._autoReduceActive(x, view)
         # indices of the first visible point and of the first point right of the view
         visible = None
-        if self.opts['clipToView']:
+        if self.opts['clipToView'] or auto_reduce:
             if (
                 view is None
                 # while the item is being parented, the view can be the GraphicsView
@@ -2248,7 +2418,12 @@ class PlotDataItem(GraphicsObject):
                     bisect.bisect_left(x, view_range.right())
                 )
 
-        if self.opts['autoDownsample']:
+        auto = self.opts['autoDownsample']
+        if auto_reduce and not auto:
+            # downsample while the visible points are still too dense
+            count = len(x) if visible is None else visible[1] - visible[0]
+            auto = count > self.opts['autoReduce'] * view.width()
+        if auto:
             ds = self._autoDownsampleFactor(x, view_range, visible, ds)
             # use the last computed value if our new value is not too different.
             # this guards against an infinite cycle where the plot never stabilizes.
@@ -2359,7 +2534,26 @@ class PlotDataItem(GraphicsObject):
         """
         cache = self._peakCache
         if cache is None or cache.ds != ds or cache.y is not y:
-            cache = self._peakCache = _PeakBlockCache(y, ds)
+            pyramid = None
+            if cache is not None and cache.y is y:
+                # The factor changed for the same data (zoom, resize). Once the blocks
+                # computed from the data for other factors have read 1.5 times its
+                # size (a few times less than building a min/max pyramid of it), the
+                # blocks of further factors are computed from a pyramid, built once: a
+                # single change, e.g. the first auto-range, does not build it. A data or
+                # mapping change creates a new y array, which drops the pyramid with
+                # the cache.
+                pyramid = cache.pyramid
+                self._peakScanned += cache.directValues
+                if (
+                    pyramid is None
+                    and self._peakScanned >= 1.5 * len(y)
+                    and self._pyramidUseful(y, ds)
+                ):
+                    pyramid = MinMaxPyramid(y)
+            else:
+                self._peakScanned = 0
+            cache = self._peakCache = _PeakBlockCache(y, ds, pyramid)
         block_max, block_min = cache.blocks(first_block, end_block)
         n = len(y)
         num = end_block - first_block
@@ -2388,6 +2582,31 @@ class PlotDataItem(GraphicsObject):
                 c[num * 2 + 1] = connect[end:].all()
             connect = c
         return x_out.reshape(total * 2), y_out.reshape(total * 2), connect
+
+    @staticmethod
+    def _pyramidUseful(y: np.ndarray, ds: int) -> bool:
+        """
+        Test whether a min/max pyramid of the data speeds up the 'peak' downsampling.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Mapped `y` data.
+        ds : int
+            Current downsampling factor.
+
+        Returns
+        -------
+        bool
+            ``True`` if blocks of `ds` values of `y` are large enough to be computed
+            from a pyramid, and its dtype is supported.
+        """
+        return (
+            ds >= MinMaxPyramid.efficientBlockSize()
+            and len(y) >= _PeakBlockCache.PYRAMID_MIN_VALUES
+            and y.ndim == 1
+            and y.dtype.kind in 'fiub'
+        )
 
     def _autoDownsampleFactor(
         self,
@@ -2614,6 +2833,18 @@ class PlotDataItem(GraphicsObject):
                     (i for i in [bounds2[1], bounds[1]] if i is not None), default=None
                 )
             )
+        if (
+            self._autoReduceClipped
+            and frac >= 1.0
+            and orthoRange is None
+            and bounds[0] is not None
+            and self._datasetMapped is not None
+        ):
+            # autoReduce does not change the auto-range: report the bounds of all the
+            # (mapped) data, cached by its dataset, as without clipping
+            full = self._datasetMapped._finiteBounds()
+            if full is not None:
+                bounds = (min(bounds[0], full[ax][0]), max(bounds[1], full[ax][1]))
         return bounds
 
     def pixelPadding(self) -> int:
@@ -2646,7 +2877,9 @@ class PlotDataItem(GraphicsObject):
         self._dataset = self._datasetMapped = self._datasetDisplay = None
         self._sentDisplayData = None
         self._drlClipActive = False
+        self._autoReduceClipped = False
         self._peakCache = None
+        self._peakScanned = 0
         self._appendBuffers = None
         self._implicitX = False
         self._indexBuffer = None
@@ -2685,13 +2918,14 @@ class PlotDataItem(GraphicsObject):
 
         View range changes are handled by :meth:`viewRangeChanged`, as soon as the
         range changes. A view resized without a change of range, however, changes the
-        size of a pixel only, which the automatic downsampling factor depends on: the
-        displayed data is then recomputed if the factor changes. The view transform is
+        size of a pixel only, which the automatic downsampling factor and the
+        thresholds of `autoReduce` depend on: the displayed data is then recomputed if
+        the factor or the selected points change. The view transform is
         updated before the scene is painted, so this happens in the same paint.
         """
         super().viewTransformChanged()  # invalidates the viewRect() cache
         if (
-            self.opts['autoDownsample']
+            (self.opts['autoDownsample'] or self.opts['autoReduce'] is not None)
             and self._dataset is not None
             and self._displayChangedByView()
         ):
@@ -2710,8 +2944,9 @@ class PlotDataItem(GraphicsObject):
         """
         Update the displayed data after a change of the view range, if needed.
 
-        A horizontal change requires new display data with `clipToView` or
-        `autoDownsample`, if the visible points or the downsampling factor change. A
+        A horizontal change requires new display data with `clipToView`,
+        `autoDownsample` or `autoReduce`, if the visible points or the downsampling
+        factor change. A
         vertical change requires it only while the dynamic range limiter clips the
         data, or when the new range requires clipping.
 
@@ -2729,7 +2964,7 @@ class PlotDataItem(GraphicsObject):
         update_needed = False
         if (
             (changed is None or changed[0])
-            and (self.opts['clipToView'] or self.opts['autoDownsample'])
+            and self._viewDependent()
             and self._displayChangedByView()
         ):
             # the visible points or the downsampling factor changed
@@ -2763,6 +2998,52 @@ class PlotDataItem(GraphicsObject):
         x = np.fft.rfftfreq(n, d)
         y = np.abs(f)
         return x, y
+
+
+def _checkAutoReduce(density: float | None) -> None:
+    """
+    Validate a value of the `autoReduce` option.
+
+    Parameters
+    ----------
+    density : float or None
+        Number of points per pixel, or ``None``.
+
+    Raises
+    ------
+    ValueError
+        Raised if `density` is not ``None`` nor a positive finite number.
+    """
+    if density is not None and not 0 < density < math.inf:
+        raise ValueError(f'autoReduce must be None or a positive number, not {density!r}')
+
+
+def _isNonDecreasing(arr: np.ndarray, chunk: int = 1 << 20) -> bool:
+    """
+    Test whether the values of an array never decrease.
+
+    The array is compared in chunks, so that no full-size temporary array is created,
+    and the test stops at the first chunk with a decreasing value.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        One-dimensional numeric array.
+    chunk : int, default 2**20
+        Number of values compared at once.
+
+    Returns
+    -------
+    bool
+        ``True`` if each value is greater than or equal to the previous one, which is
+        never the case next to a ``NaN``.
+    """
+    n = len(arr)
+    for start in range(0, n - 1, chunk):
+        stop = min(start + chunk, n - 1)
+        if not np.all(arr[start + 1:stop + 1] >= arr[start:stop]):
+            return False
+    return True
 
 
 def _finiteIndexRange(arr: np.ndarray) -> tuple[int, int] | None:
