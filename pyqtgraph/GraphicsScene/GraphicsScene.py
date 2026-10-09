@@ -679,13 +679,26 @@ class GraphicsScene(QtWidgets.QGraphicsScene):
             return value
 
         def isUntransformable(item):
-            # True if the item or an ancestor ignores the transformations
-            value = untransformable.get(item)
-            if value is None:
-                parent = item.parentItem()
-                value = bool(itemFlags(item) & GraphicsItemFlag.ItemIgnoresTransformations)
-                value = value or (parent is not None and isUntransformable(parent))
-                untransformable[item] = value
+            # True if the item or an ancestor ignores the transformations. A loop up
+            # the ancestors, not a recursion: a nested function calling itself refers
+            # to itself through its closure, a reference cycle that would keep these
+            # dictionaries, and the items they hold, alive until a garbage collection.
+            walked = []
+            value = False
+            while item is not None:
+                known = untransformable.get(item)
+                if known is not None:
+                    value = known
+                    break
+                walked.append(item)
+                if itemFlags(item) & GraphicsItemFlag.ItemIgnoresTransformations:
+                    value = True
+                    break
+                item = item.parentItem()
+            # the walked items but the last have no flag: each takes the value of
+            # the first ancestor known or flagged
+            for walkedItem in walked:
+                untransformable[walkedItem] = value
             return value
 
         def intersectsPoint(item):
