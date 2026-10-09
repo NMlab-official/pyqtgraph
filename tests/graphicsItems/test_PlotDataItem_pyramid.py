@@ -14,7 +14,7 @@ import pytest
 import pyqtgraph as pg
 from pyqtgraph.graphicsItems import PlotDataItem as pdi_module
 from pyqtgraph.graphicsItems._MinMaxPyramid import MinMaxPyramid
-from tests.perf_helpers import process_events, show_and_wait
+from tests.perf_helpers import count_calls, process_events, show_and_wait
 
 app = pg.mkQApp()
 
@@ -255,7 +255,8 @@ def test_pyramid_dropped_by_set_data(plot_widget, low_thresholds):
     n = N_CYCLE
     item = plot_widget.plot(rng.normal(size=n), autoDownsample=True)
     plot_widget.getPlotItem().enableAutoRange(False)
-    _zoom(plot_widget, item, (0, n), (0, 0.8 * n))
+    # three factors, hence two factor changes, whatever the initial view
+    _zoom(plot_widget, item, (0, n), (0, 0.9 * n), (0, 0.8 * n))
     old = item._peakCache.pyramid
     assert old is not None
     y = rng.normal(size=n)
@@ -281,7 +282,8 @@ def test_pyramid_follows_the_mapping(plot_widget, low_thresholds):
     y = np.random.default_rng(5).uniform(1.0, 100.0, n)
     item = plot_widget.plot(y, autoDownsample=True)
     plot_widget.getPlotItem().enableAutoRange(False)
-    _zoom(plot_widget, item, (0, n), (0, 0.8 * n))
+    # three factors, hence two factor changes, whatever the initial view
+    _zoom(plot_widget, item, (0, n), (0, 0.9 * n), (0, 0.8 * n))
     assert item._peakCache.pyramid.y is item._dataset.y
     item.setLogMode(False, True)
     _zoom(plot_widget, item, (0, 0.7 * n), (0, 0.9 * n), (0, 0.8 * n))
@@ -301,7 +303,8 @@ def test_pyramid_extended_by_append_data(plot_widget, low_thresholds):
     y = rng.normal(size=n + 5000)
     item = plot_widget.plot(y[:n], autoDownsample=True)
     plot_widget.getPlotItem().enableAutoRange(False)
-    _zoom(plot_widget, item, (0, n), (0, 0.8 * n))
+    # three factors, hence two factor changes, whatever the initial view
+    _zoom(plot_widget, item, (0, n), (0, 0.9 * n), (0, 0.8 * n))
     pyramid = item._peakCache.pyramid
     assert pyramid is not None
     item.appendData(y[n:])
@@ -318,7 +321,8 @@ def test_pyramid_dropped_by_clear(plot_widget, low_thresholds):
     n = N_CYCLE
     item = plot_widget.plot(np.random.default_rng(7).normal(size=n), autoDownsample=True)
     plot_widget.getPlotItem().enableAutoRange(False)
-    _zoom(plot_widget, item, (0, n), (0, 0.8 * n))
+    # three factors, hence two factor changes, whatever the initial view
+    _zoom(plot_widget, item, (0, n), (0, 0.9 * n), (0, 0.8 * n))
     assert item._peakCache.pyramid is not None
     item.clear()
     assert item._peakCache is None
@@ -419,6 +423,9 @@ def test_auto_reduce_matches_clip_and_peak(plot_widget, use_setter):
     else:
         item = plot_widget.plot(x, y, autoReduce=10)
     reference = plot_widget.plot(x, y, clipToView=True, autoDownsample=True)
+    # autoReduce draws one 'peak' block per device pixel
+    reference.opts['autoDownsampleFactor'] = item._autoReduceBlocksPerPixel(
+        plot_widget.getViewBox())
     plot_widget.getPlotItem().enableAutoRange(False)
     for lo, hi in ((2e5, 4e5), (2.1e5, 4.1e5), (0, 1e6), (5e5, 5.5e5)):
         plot_widget.setXRange(lo, hi, padding=0)
@@ -428,6 +435,58 @@ def test_auto_reduce_matches_clip_and_peak(plot_widget, use_setter):
         assert len(xd) < 0.1 * len(x)
         np.testing.assert_array_equal(xd, xr)
         np.testing.assert_array_equal(yd, yr)
+
+
+def _reduced_view(plot_widget, **kwargs):
+    x, y = _dense_line()
+    item = plot_widget.plot(x, y, **kwargs)
+    plot_widget.getPlotItem().enableAutoRange(False)
+    plot_widget.setXRange(2e5, 4e5, padding=0)
+    process_events()
+    return item
+
+
+def test_auto_reduce_draws_one_block_per_device_pixel(plot_widget):
+    item = _reduced_view(plot_widget, autoReduce=2)
+    vb = plot_widget.getViewBox()
+    expected = vb.width() * max(1.0, vb.getViewWidget().devicePixelRatioF())
+    # two points ('peak') per block, a few more blocks at the edges of the view
+    blocks = len(item.getData()[0]) // 2
+    assert 0.95 * expected <= blocks <= 1.1 * expected + 4
+    # explicit auto-downsampling keeps autoDownsampleFactor samples per pixel
+    explicit = _reduced_view(plot_widget, clipToView=True, autoDownsample=True)
+    samples = explicit.opts['autoDownsampleFactor']
+    assert len(explicit.getData()[0]) // 2 >= 0.95 * vb.width() * samples
+
+
+def test_auto_reduce_follows_the_export_resolution(plot_widget):
+    item = _reduced_view(plot_widget, autoReduce=2)
+    vb = plot_widget.getViewBox()
+    screen = len(item.getData()[0])
+    try:
+        # image export at 4 times the size of the view
+        item.setExportMode(True, {'resolutionScale': 4.0})
+        image = len(item.getData()[0])
+        assert image // 2 >= 0.95 * 4.0 * vb.width()
+        # vector export: no resolution, autoDownsampleFactor samples per pixel
+        item.setExportMode(True, {})
+        vector = len(item.getData()[0])
+        assert vector // 2 >= 0.95 * item.opts['autoDownsampleFactor'] * vb.width()
+    finally:
+        item.setExportMode(False)
+    assert len(item.getData()[0]) == screen
+
+
+def test_view_changes_of_a_frame_compute_the_display_once(plot_widget):
+    item = _reduced_view(plot_widget, autoReduce=2)
+    with count_calls(pg.PlotDataItem, 'updateItems') as updates:
+        # e.g. a burst of wheel events before the next paint
+        for k in range(1, 6):
+            plot_widget.setXRange(2e5 - k * 1e3, 4e5 + k * 1e3, padding=0)
+        process_events()
+    assert updates.count == 1
+    xd, _ = item.getData()
+    assert xd[0] <= 1.95e5 and xd[-1] >= 4.05e5
 
 
 def test_auto_reduce_below_the_threshold_keeps_the_data(plot_widget):

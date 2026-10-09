@@ -1457,7 +1457,10 @@ class PlotDataItem(GraphicsObject):
         :meth:`setClipToView`. If the visible range still holds more than
         ``density`` points per pixel, the data is also downsampled with the
         automatic factor of :meth:`setDownsampling` (``auto=True``) and the current
-        downsampling method, ``'peak'`` by default. Below these thresholds, the
+        downsampling method, ``'peak'`` by default. With ``'peak'``, the factor gives
+        one block of points per device pixel (per pixel of the image when exporting
+        to an image), which draws the same envelope as more blocks; the other methods
+        use ``autoDownsampleFactor`` samples per pixel. Below these thresholds, the
         display follows the other options. The thresholds are tested whenever the
         view range or size changes.
 
@@ -1976,17 +1979,17 @@ class PlotDataItem(GraphicsObject):
         Update the curve and scatter plot now, or before the next paint.
 
         When the displayed data depends on the view range (`clipToView`,
-        `autoDownsample` or `autoReduce`), a data update is deferred: a view change in
-        the same frame, e.g. ``setXRange`` in a streaming loop, then does not compute
-        the displayed data twice. The deferred update is applied by a queued call, which the event
-        loop delivers before paint events (these have a low priority), so that the
-        regions changed by the update are painted in the same pass. It is also
+        `autoDownsample` or `autoReduce`), a data update, or an update required by a
+        view change, is deferred: the data and view changes of a frame, e.g.
+        ``setXRange`` in a streaming loop or a burst of wheel events, then compute the
+        displayed data once. The deferred update is applied by a queued call, which the
+        event loop delivers before paint events (these have a low priority), so that
+        the regions changed by the update are painted in the same pass. It is also
         applied when the scene is about to be rendered
         (``GraphicsScene.sigPrepareForPaint``, e.g. for a synchronous ``grab`` or an
         export), and on demand by :meth:`getData`, :meth:`dataBounds`,
-        :meth:`pixelPadding`, :meth:`updateItems`, a view change requiring new display
-        data, and the :attr:`curve` and :attr:`scatter` properties. Style updates are
-        never deferred.
+        :meth:`pixelPadding`, :meth:`updateItems`, and the :attr:`curve` and
+        :attr:`scatter` properties. Style updates are never deferred.
 
         Parameters
         ----------
@@ -2421,12 +2424,15 @@ class PlotDataItem(GraphicsObject):
                 )
 
         auto = self.opts['autoDownsample']
+        samples = self.opts['autoDownsampleFactor']
         if auto_reduce and not auto:
             # downsample while the visible points are still too dense
             count = len(x) if visible is None else visible[1] - visible[0]
             auto = count > self.opts['autoReduce'] * view.width()
+            if self.opts['downsampleMethod'] == 'peak':
+                samples = self._autoReduceBlocksPerPixel(view)
         if auto:
-            ds = self._autoDownsampleFactor(x, view_range, visible, ds)
+            ds = self._autoDownsampleFactor(x, view_range, visible, ds, samples)
             # use the last computed value if our new value is not too different.
             # this guards against an infinite cycle where the plot never stabilizes.
             if math.isclose(ds, self._adsLastValue, rel_tol=0.01):
@@ -2615,16 +2621,18 @@ class PlotDataItem(GraphicsObject):
         x: np.ndarray,
         view_range: QtCore.QRectF | None,
         visible: tuple[int, int] | None,
-        default: int
+        default: int,
+        samples: float | None = None
     ) -> int:
         """
         Compute the automatic downsampling factor for the current view.
 
-        The factor is chosen such that about ``autoDownsampleFactor`` samples are drawn
-        per pixel. The sample spacing is estimated from the visible points when the
-        data is clipped to the view, which stays accurate for data with gaps (e.g.
-        market data without nights and week-ends). Otherwise, it is estimated from the
-        first and last finite `x` values, without copying the data.
+        The factor is chosen such that about `samples` samples are drawn per pixel,
+        ``autoDownsampleFactor`` by default. The sample spacing is estimated from the
+        visible points when the data is clipped to the view, which stays accurate for
+        data with gaps (e.g. market data without nights and week-ends). Otherwise, it
+        is estimated from the first and last finite `x` values, without copying the
+        data.
 
         Parameters
         ----------
@@ -2637,6 +2645,9 @@ class PlotDataItem(GraphicsObject):
             or ``None`` if the data is not clipped to the view.
         default : int
             Factor returned when no estimate is possible.
+        samples : float or None, default None
+            Number of samples per pixel of view width; ``None`` uses the
+            ``autoDownsampleFactor`` option.
 
         Returns
         -------
@@ -2662,12 +2673,60 @@ class PlotDataItem(GraphicsObject):
             dx = (float(x[last]) - float(x[first])) / (last - first)
         if dx == 0.0:
             return default
+        if samples is None:
+            samples = self.opts['autoDownsampleFactor']
         # autoDownsampleFactor _should_ be > 1.0
-        ds_float = max(
-            1.0,
-            abs(view_range.width() / dx / (width * self.opts['autoDownsampleFactor']))
-        )
+        ds_float = max(1.0, abs(view_range.width() / dx / (width * samples)))
         return int(ds_float) if math.isfinite(ds_float) else default
+
+    def _autoReduceBlocksPerPixel(self, view: QtCore.QObject) -> float:
+        """
+        Get the number of 'peak' blocks per pixel of view width for `autoReduce`.
+
+        One block per device pixel draws the envelope of the data: its minimum and its
+        maximum over the pixel column. More blocks only cost drawing time, so
+        `autoReduce` uses one block per device pixel instead of the
+        ``autoDownsampleFactor`` samples per pixel of explicit auto-downsampling. When
+        exporting to an image, the resolution of the export is used instead; vector
+        exports (no ``resolutionScale``) keep ``autoDownsampleFactor``.
+
+        Parameters
+        ----------
+        view : :class:`~pyqtgraph.ViewBox`
+            The view of the item.
+
+        Returns
+        -------
+        float
+            Number of blocks per pixel of view width, at least 1.
+        """
+        if self._exportOpts is not False:
+            scale = self._exportOpts.get('resolutionScale')
+            if scale is None:
+                return self.opts['autoDownsampleFactor']
+            return max(1.0, float(scale))
+        widget = view.getViewWidget()
+        return 1.0 if widget is None else max(1.0, widget.devicePixelRatioF())
+
+    def setExportMode(self, export: bool, opts: dict | None = None) -> None:
+        """
+        Inform the item that it is drawn for an export, or that the export ended.
+
+        With `autoReduce`, the downsampling factor depends on the export resolution
+        (see :meth:`_autoReduceBlocksPerPixel`): the displayed data is computed again
+        for the export, and again for the screen when it ends.
+
+        Parameters
+        ----------
+        export : bool
+            ``True`` when the export starts, ``False`` when it ends.
+        opts : dict or None, default None
+            Export options, see :meth:`GraphicsItem.setExportMode`.
+        """
+        super().setExportMode(export, opts)
+        if self.opts['autoReduce'] is not None and self._dataset is not None:
+            self._datasetDisplay = None  # invalidate display data
+            self.updateItems(styleUpdate=False)
 
     def _displayViewRange(self) -> QtCore.QRectF | None:
         """
@@ -2980,7 +3039,10 @@ class PlotDataItem(GraphicsObject):
             self.setProperty('yViewRangeWasChanged', True)
             update_needed = True
         if update_needed:
-            self.updateItems(styleUpdate=False)
+            # deferred to the next paint when the display depends on the view: the
+            # view changes of a frame (e.g. a burst of wheel events) then compute the
+            # displayed data once
+            self._requestDisplayUpdate(styleUpdate=False)
 
     @staticmethod
     def _fourierTransform(x, y):
