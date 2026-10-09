@@ -802,8 +802,8 @@ def test_auto_downsample_follows_view_resize(plot_widget, clip):
 
 def test_pan_without_factor_change_does_not_update(plot_widget):
     n = 200_000
-    item = plot_widget.plot(np.random.default_rng(0).normal(size=n), autoDownsample=True,
-                            autoReduce=None)
+    plot_widget.plot(np.random.default_rng(0).normal(size=n), autoDownsample=True,
+                     autoReduce=None)
     plot_widget.setRange(xRange=(0, n // 2), yRange=(-5, 5), padding=0)
     process_events()
     vb = plot_widget.getViewBox()
