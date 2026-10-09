@@ -39,6 +39,8 @@ CONFIG_OPTIONS = {
                                  # change in the future.
     'useCupy': False,  # When True, attempt to use cupy ( currently only with ImageItem and related functions )
     'useNumba': False, # When True, use numba
+    'autoReduce': None,  # PlotDataItem: points per pixel above which dense increasing-x data is
+                         # clipped to the view and downsampled automatically; None disables it
     'segmentedLineMode': 'auto',  # segmented line mode, controls if lines are plotted in segments or continuous
                                   # 'auto': whether lines are plotted in segments is automatically decided using pen properties and whether anti-aliasing is enabled
                                   # 'on' or True: lines are always plotted in segments
@@ -53,6 +55,8 @@ def setConfigOption(opt, value):
         raise ValueError('imageAxisOrder must be either "row-major" or "col-major"')
     if opt == 'segmentedLineMode' and value not in ('auto', 'on', 'off'):
         raise ValueError('segmentedLineMode must be "auto", "on" or "off"')
+    if opt == 'autoReduce' and value is not None and not 0 < value < float('inf'):
+        raise ValueError('autoReduce must be None or a positive number')
     CONFIG_OPTIONS[opt] = value
 
 def setConfigOptions(**opts):
