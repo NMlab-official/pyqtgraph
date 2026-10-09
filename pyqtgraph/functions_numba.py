@@ -1,3 +1,5 @@
+import math
+
 import numba
 import numpy as np
 
@@ -35,9 +37,9 @@ def _minmax_nan(data, start, stop):
     lo = hi
     for i in range(start + 1, stop):
         v = data[i]
-        if v > hi or v != v:
+        if v > hi or math.isnan(v):
             hi = v
-        if v < lo or v != v:
+        if v < lo or math.isnan(v):
             lo = v
     return hi, lo
 
@@ -59,7 +61,7 @@ def minmax_cells(data, width, out_max, out_min):
             if v < lo:
                 lo = v
             check += v - v
-        if check != check:
+        if math.isnan(check):
             hi, lo = _minmax_nan(data, start, start + width)
         out_max[j] = hi
         out_min[j] = lo
@@ -83,7 +85,7 @@ def peak_block_ends(data, first, ds, width, out_max, out_min):
                 hi = v
             if v < lo:
                 lo = v
-            if v != v:
+            if math.isnan(v):
                 nan_found = True
                 nan_value = v
         for i in range(stop // width * width, stop):
@@ -92,7 +94,7 @@ def peak_block_ends(data, first, ds, width, out_max, out_min):
                 hi = v
             if v < lo:
                 lo = v
-            if v != v:
+            if math.isnan(v):
                 nan_found = True
                 nan_value = v
         if nan_found:
