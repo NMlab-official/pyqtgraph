@@ -82,7 +82,8 @@ def test_dynamic_range_limit_engages_and_releases_with_zoom(plot_widget):
 
 
 def test_unchanged_display_data_is_not_resent(plot_widget):
-    item = plot_widget.plot(np.arange(100.0), np.arange(100.0) ** 2)
+    # without autoReduce, the data does not depend on the view: no deferred update
+    item = plot_widget.plot(np.arange(100.0), np.arange(100.0) ** 2, autoReduce=None)
     process_events()
     with count_calls(pg.PlotCurveItem, 'setData') as curve_calls:
         # no clipping, no downsampling: the displayed arrays are unchanged
@@ -431,7 +432,7 @@ def test_append_data_is_amortized_constant():
 
 
 def test_peak_blocks_are_not_recomputed_while_streaming(plot_widget):
-    item = plot_widget.plot(downsample=10, downsampleMethod='peak')
+    item = plot_widget.plot(downsample=10, downsampleMethod='peak', autoReduce=None)
     item.setData(np.random.default_rng(0).normal(size=100_000))
     process_events()
     cache = item._peakCache
@@ -451,7 +452,8 @@ def test_peak_blocks_do_not_move_with_the_view(plot_widget):
     rng = np.random.default_rng(0)
     x = np.arange(100_000.0)
     y = rng.normal(size=100_000)
-    item = plot_widget.plot(x, y, downsample=10, downsampleMethod='peak', clipToView=True)
+    item = plot_widget.plot(x, y, downsample=10, downsampleMethod='peak', clipToView=True,
+                            autoReduce=None)
     shown = []
     for offset in (0.0, 3.3, 6.6):  # shifts by a fraction of a block
         plot_widget.setXRange(50_000.0 + offset, 60_000.0 + offset, padding=0)
@@ -753,7 +755,8 @@ def test_streaming_peaks_show_the_newest_points(append):
 def test_clipped_peaks_show_the_newest_points(plot_widget):
     x = np.arange(100_000.0)
     y = np.sin(x / 100.0)
-    item = plot_widget.plot(x[:90_007], y[:90_007], downsample=10, clipToView=True)
+    item = plot_widget.plot(x[:90_007], y[:90_007], downsample=10, clipToView=True,
+                            autoReduce=None)
     plot_widget.setXRange(80_000.0, 90_006.0, padding=0)
     process_events()
     x_disp, y_disp = item.getData()
@@ -799,7 +802,8 @@ def test_auto_downsample_follows_view_resize(plot_widget, clip):
 
 def test_pan_without_factor_change_does_not_update(plot_widget):
     n = 200_000
-    item = plot_widget.plot(np.random.default_rng(0).normal(size=n), autoDownsample=True)
+    item = plot_widget.plot(np.random.default_rng(0).normal(size=n), autoDownsample=True,
+                            autoReduce=None)
     plot_widget.setRange(xRange=(0, n // 2), yRange=(-5, 5), padding=0)
     process_events()
     vb = plot_widget.getViewBox()
