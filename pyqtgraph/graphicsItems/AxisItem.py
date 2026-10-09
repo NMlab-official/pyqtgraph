@@ -4,6 +4,7 @@ from bisect import bisect_left
 from collections import OrderedDict
 from collections.abc import Hashable
 from math import ceil, copysign, floor, frexp, isfinite, log10, sqrt
+from operator import lshift, rshift
 
 import numpy as np
 
@@ -234,11 +235,10 @@ def _pinnedFont(font: QtGui.QFont) -> QtGui.QFont:
         The copy.
     """
     data = QtCore.QByteArray()
-    stream = QtCore.QDataStream(data, QtCore.QIODevice.OpenModeFlag.WriteOnly)
-    stream << font
+    # QDataStream's << and >> operators, called as functions: they write and read
+    lshift(QtCore.QDataStream(data, QtCore.QIODevice.OpenModeFlag.WriteOnly), font)
     pinned = QtGui.QFont()
-    stream = QtCore.QDataStream(data, QtCore.QIODevice.OpenModeFlag.ReadOnly)
-    stream >> pinned
+    rshift(QtCore.QDataStream(data, QtCore.QIODevice.OpenModeFlag.ReadOnly), pinned)
     return pinned
 
 
