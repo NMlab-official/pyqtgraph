@@ -2,6 +2,8 @@
 Deterministic performance tests of GraphicsScene.itemsNearEvent: a single scene query,
 and results identical to the former two-query implementation.
 """
+import gc
+
 import numpy as np
 import pytest
 
@@ -151,6 +153,21 @@ def test_itemsNearEvent_matches_reference_other_modes(mixed_scene, selMode):
         for hoverable in (True, False):
             expected = reference_itemsNearEvent(scene, event, selMode, hoverable=hoverable)
             assert scene.itemsNearEvent(event, selMode, hoverable=hoverable) == expected, point
+
+
+def test_itemsNearEvent_leaves_no_reference_cycle(mixed_scene):
+    # The point query memoizes in nested functions: one calling itself would refer to
+    # itself through its closure, a cycle keeping the memoized items alive until a
+    # garbage collection.
+    scene, points = mixed_scene
+    gc.collect()
+    gc.disable()
+    try:
+        for point in points:
+            scene.itemsNearEvent(_Event(point))
+        assert gc.collect() == 0
+    finally:
+        gc.enable()
 
 
 def test_itemsNearEvent_many_overlapping_items():
