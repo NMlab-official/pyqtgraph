@@ -92,6 +92,8 @@ def test_evalFunc():
 
 def test_SpinBox_reformats_unchanged_integer_value():
     sb = pg.SpinBox(int=True)
+    # '2.5' is parsed with '.' as the decimal point, whatever the system locale
+    sb.setLocale(englishLocale)
     sb.setValue(10)
 
     sb.lineEdit().setText('2.5')
