@@ -427,7 +427,8 @@ def test_view_partial_repaint():
     pw.resize(400, 300)
     pw.show()
     x, y = random_walk(100_000)
-    curve = pw.plot(x, y, pen='w').curve
+    # full-resolution curve: autoReduce would clip and downsample it
+    curve = pw.plot(x, y, pen='w', autoReduce=None).curve
     line = pg.InfiniteLine(pos=30_000, angle=90, pen='r')
     pw.addItem(line, ignoreBounds=True)
     process_events(5)
@@ -621,7 +622,9 @@ def test_view_partial_repaint_filled():
     pw.resize(400, 300)
     pw.show()
     x, y = random_walk(100_000)
-    curve = pw.plot(x, y, pen='w', fillLevel=0.0, brush=(80, 120, 250, 100)).curve
+    # full-resolution curve: autoReduce would clip and downsample it
+    curve = pw.plot(x, y, pen='w', fillLevel=0.0, brush=(80, 120, 250, 100),
+                    autoReduce=None).curve
     line = pg.InfiniteLine(pos=30_000, angle=90, pen='r')
     pw.addItem(line, ignoreBounds=True)
     process_events(5)
